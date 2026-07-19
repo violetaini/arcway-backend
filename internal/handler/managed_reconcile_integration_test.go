@@ -1,0 +1,389 @@
+package handler
+
+import (
+	"context"
+	"encoding/json"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"miaomiaowux/internal/storage"
+)
+
+type managedFakeAgent struct {
+	mu         sync.Mutex
+	calls      []string
+	limiter    WSLimiterConfigPayload
+	limiterHit chan struct{}
+	limiterACK chan struct{}
+	limiterOK  *bool
+	inboundTag string
+	token      string
+	addRequest struct {
+		Action   string                 `json:"action"`
+		Tag      string                 `json:"tag"`
+		Client   map[string]interface{} `json:"client"`
+		NotAfter *time.Time             `json:"not_after"`
+	}
+	snapshotHit chan struct{}
+}
+
+func (a *managedFakeAgent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	token := a.token
+	if token == "" {
+		token = "agent-token"
+	}
+	if r.Header.Get("Authorization") != "Bearer "+token {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	switch {
+	case r.Method == http.MethodGet && r.URL.Path == "/api/child/inbounds":
+		tag := a.inboundTag
+		if tag == "" {
+			tag = "vless-in"
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"inbounds": []map[string]interface{}{{
+				"tag": tag, "protocol": "vless", "settings": map[string]interface{}{"clients": []interface{}{}},
+			}},
+		})
+	case r.Method == http.MethodPost && r.URL.Path == "/api/child/limiter":
+		a.mu.Lock()
+		a.calls = append(a.calls, "limiter")
+		err := json.NewDecoder(r.Body).Decode(&a.limiter)
+		a.mu.Unlock()
+		if err != nil {
+			http.Error(w, "invalid limiter payload", http.StatusBadRequest)
+			return
+		}
+		if a.limiterHit != nil {
+			select {
+			case a.limiterHit <- struct{}{}:
+			default:
+			}
+		}
+		if a.limiterACK != nil {
+			select {
+			case <-a.limiterACK:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		success := true
+		if a.limiterOK != nil {
+			success = *a.limiterOK
+		}
+		_ = json.NewEncoder(w).Encode(map[string]bool{"success": success})
+	case r.Method == http.MethodPost && r.URL.Path == "/api/child/inbounds":
+		a.mu.Lock()
+		a.calls = append(a.calls, "add-client")
+		err := json.NewDecoder(r.Body).Decode(&a.addRequest)
+		a.mu.Unlock()
+		if err != nil {
+			http.Error(w, "invalid inbound payload", http.StatusBadRequest)
+			return
+		}
+		_, _ = w.Write([]byte(`{"success":true}`))
+	case r.Method == http.MethodGet && r.URL.Path == "/api/child/xray/config":
+		// A successful inbound mutation schedules a background snapshot refresh.
+		// No config is needed for this test; signaling lets it finish before cleanup.
+		_, _ = w.Write([]byte(`{"success":false}`))
+		select {
+		case a.snapshotHit <- struct{}{}:
+		default:
+		}
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func managedReadyAgentCapabilities() AgentCapabilities {
+	return AgentCapabilities{
+		ManagedClientsV1: true, ClientExpiry: true,
+		LimiterReplace: true, LimiterReplaceAck: true,
+	}
+}
+
+func managedRemoteWithCapabilities(repo *storage.TrafficRepository, serverID int64, capabilities AgentCapabilities) *RemoteManageHandler {
+	wsHandler := NewRemoteWSHandler(repo, nil)
+	wsHandler.conns.Store(serverID, &RemoteWSConnection{ServerID: serverID, Capabilities: capabilities})
+	return NewRemoteManageHandler(repo, wsHandler)
+}
+
+func TestManagedReconcileProvisionsLimiterBeforeExpiringClient(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	repo := newManagedSecurityTestRepo(t)
+	createManagedSecurityTestUser(t, repo, "owner", storage.RoleAdmin)
+	createManagedSecurityTestUser(t, repo, "alice", storage.RoleUser)
+
+	fakeAgent := &managedFakeAgent{
+		snapshotHit: make(chan struct{}, 1),
+		limiterHit:  make(chan struct{}, 1),
+		limiterACK:  make(chan struct{}),
+	}
+	agentServer := httptest.NewServer(fakeAgent)
+	t.Cleanup(agentServer.Close)
+	agentURL, err := url.Parse(agentServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, portText, err := net.SplitHostPort(agentURL.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := net.LookupPort("tcp", portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := &storage.RemoteServer{
+		Name: "edge-reconcile", Token: "agent-token", Status: storage.RemoteServerStatusConnected,
+		IPAddress: host, ListenPort: port, XrayMode: "embedded",
+	}
+	if err := repo.CreateRemoteServer(ctx, server); err != nil {
+		t.Fatalf("create remote server: %v", err)
+	}
+	node, err := repo.CreateNode(ctx, storage.Node{
+		Username: "owner", NodeName: "managed-vless", Protocol: "vless", Enabled: true,
+		OriginalServer: server.Name, InboundTag: "vless-in",
+		ClashConfig: `{"name":"managed-vless","type":"vless","server":"203.0.113.40","port":443,"uuid":"owner-uuid"}`,
+	})
+	if err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+	offer, err := repo.CreateSelfServiceNodeOffer(ctx, node.ID, server.ID, "owner")
+	if err != nil {
+		t.Fatalf("create offer: %v", err)
+	}
+	now := time.Now().UTC()
+	expires := now.Add(2 * time.Hour).Truncate(time.Second)
+	if _, err := repo.CreateUserServerGrant(ctx, storage.UserServerGrant{
+		Username: "alice", ServerID: server.ID, Enabled: true,
+		StartsAt: now.Add(-time.Hour), ExpiresAt: &expires, MaxActiveNodes: 1,
+		SpeedLimitMbps: 25, ConnectionLimit: 3, BillingMode: storage.ManagedBillingBoth,
+		ResetPolicy: storage.ManagedResetNone, ResetDay: 1, BillingTimezone: "Asia/Shanghai", CreatedBy: "owner",
+	}); err != nil {
+		t.Fatalf("create grant: %v", err)
+	}
+	activation, err := repo.ActivateUserNodeSelection(ctx, "alice", offer.ID, "alice", now)
+	if err != nil {
+		t.Fatalf("activate selection: %v", err)
+	}
+
+	remoteManage := managedRemoteWithCapabilities(repo, server.ID, managedReadyAgentCapabilities())
+	handler := NewManagedNodesHandler(repo, remoteManage, NewLimiterConfigPusher(repo, nil))
+	reconcileResult := make(chan error, 1)
+	go func() {
+		reconcileResult <- handler.reconcileSource(ctx, activation.Source)
+	}()
+	select {
+	case <-fakeAgent.limiterHit:
+	case <-time.After(time.Second):
+		t.Fatal("limiter request did not reach Agent")
+	}
+	fakeAgent.mu.Lock()
+	callsBeforeACK := append([]string(nil), fakeAgent.calls...)
+	fakeAgent.mu.Unlock()
+	if len(callsBeforeACK) != 1 || callsBeforeACK[0] != "limiter" {
+		t.Fatalf("client was mutated before limiter ACK: %v", callsBeforeACK)
+	}
+	close(fakeAgent.limiterACK)
+	if err := <-reconcileResult; err != nil {
+		t.Fatalf("reconcile managed source: %v", err)
+	}
+
+	fakeAgent.mu.Lock()
+	calls := append([]string(nil), fakeAgent.calls...)
+	limiter := fakeAgent.limiter
+	addRequest := fakeAgent.addRequest
+	fakeAgent.mu.Unlock()
+	if len(calls) < 2 || calls[0] != "limiter" || calls[1] != "add-client" {
+		t.Fatalf("agent mutation order=%v, want limiter then add-client", calls)
+	}
+	for _, call := range calls[2:] {
+		if call != "limiter" {
+			t.Fatalf("unexpected mutation after add-client: %v", calls)
+		}
+	}
+	if limiter.InboundTag != "vless-in" || len(limiter.Users) != 1 {
+		t.Fatalf("unexpected limiter snapshot: %#v", limiter)
+	}
+	if limiter.Users[0].SpeedLimit != 3_125_000 || limiter.Users[0].DeviceLimit != 3 {
+		t.Fatalf("grant limiter not applied: %#v", limiter.Users[0])
+	}
+	if addRequest.Action != "add-client" || addRequest.Tag != "vless-in" || addRequest.NotAfter == nil || !addRequest.NotAfter.Equal(expires) {
+		t.Fatalf("unexpected add-client request: %#v", addRequest)
+	}
+	if email, _ := addRequest.Client["email"].(string); email == "" || limiter.Users[0].Email != email {
+		t.Fatalf("credential and limiter identities differ: client=%#v limiter=%#v", addRequest.Client, limiter.Users[0])
+	}
+
+	applied, err := repo.GetUserInboundAccessSource(ctx, activation.Source.ID)
+	if err != nil {
+		t.Fatalf("reload access source: %v", err)
+	}
+	if applied.ObservedState != storage.ManagedObservedActive || applied.AppliedGeneration != applied.Generation || applied.LastError != "" {
+		t.Fatalf("source was not marked active: %#v", applied)
+	}
+	ids, err := effectiveManagedNodeIDs(ctx, repo, "alice")
+	if err != nil || len(ids) != 1 || ids[0] != node.ID {
+		t.Fatalf("provisioned node is not effective: ids=%v err=%v", ids, err)
+	}
+
+	select {
+	case <-fakeAgent.snapshotHit:
+	case <-time.After(time.Second):
+		t.Fatal("background xray snapshot refresh did not finish")
+	}
+}
+
+func TestManagedReconcileReloadsStaleGenerationBeforeRemoteMutation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	repo := newManagedSecurityTestRepo(t)
+	createManagedSecurityTestUser(t, repo, "owner", storage.RoleAdmin)
+	createManagedSecurityTestUser(t, repo, "alice", storage.RoleUser)
+
+	fakeAgent := &managedFakeAgent{snapshotHit: make(chan struct{}, 1)}
+	agentServer := httptest.NewServer(fakeAgent)
+	t.Cleanup(agentServer.Close)
+	agentURL, err := url.Parse(agentServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, portText, err := net.SplitHostPort(agentURL.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := net.LookupPort("tcp", portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := &storage.RemoteServer{
+		Name: "edge-stale", Token: "agent-token", Status: storage.RemoteServerStatusConnected,
+		IPAddress: host, ListenPort: port, XrayMode: "embedded",
+	}
+	if err := repo.CreateRemoteServer(ctx, server); err != nil {
+		t.Fatalf("create remote server: %v", err)
+	}
+	node, err := repo.CreateNode(ctx, storage.Node{
+		Username: "owner", NodeName: "stale-vless", Protocol: "vless", Enabled: true,
+		OriginalServer: server.Name, InboundTag: "vless-in",
+		ClashConfig: `{"name":"stale-vless","type":"vless","server":"203.0.113.41","port":443,"uuid":"owner-uuid"}`,
+	})
+	if err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+	offer, err := repo.CreateSelfServiceNodeOffer(ctx, node.ID, server.ID, "owner")
+	if err != nil {
+		t.Fatalf("create offer: %v", err)
+	}
+	now := time.Now().UTC()
+	expires := now.Add(time.Hour)
+	if _, err := repo.CreateUserServerGrant(ctx, storage.UserServerGrant{
+		Username: "alice", ServerID: server.ID, Enabled: true, StartsAt: now.Add(-time.Hour),
+		ExpiresAt: &expires, MaxActiveNodes: 1, BillingMode: storage.ManagedBillingDownload,
+		ResetPolicy: storage.ManagedResetNone, ResetDay: 1, BillingTimezone: "Asia/Shanghai", CreatedBy: "owner",
+	}); err != nil {
+		t.Fatalf("create grant: %v", err)
+	}
+	activation, err := repo.ActivateUserNodeSelection(ctx, "alice", offer.ID, "alice", now)
+	if err != nil {
+		t.Fatalf("activate selection: %v", err)
+	}
+	latest, err := repo.SetUserInboundAccessSourceState(ctx, activation.Source.ID, activation.Source.Generation,
+		storage.ManagedDesiredInactive, storage.ManagedSuspendAdminDisabled, "owner", &expires)
+	if err != nil {
+		t.Fatalf("revoke source: %v", err)
+	}
+
+	handler := NewManagedNodesHandler(repo, NewRemoteManageHandler(repo, nil), NewLimiterConfigPusher(repo, nil))
+	if err := handler.reconcileSource(ctx, activation.Source); err != nil {
+		t.Fatalf("reconcile stale source snapshot: %v", err)
+	}
+	fakeAgent.mu.Lock()
+	calls := append([]string(nil), fakeAgent.calls...)
+	fakeAgent.mu.Unlock()
+	for _, call := range calls {
+		if call == "add-client" {
+			t.Fatalf("stale active generation reached agent: %v", calls)
+		}
+	}
+	applied, err := repo.GetUserInboundAccessSource(ctx, activation.Source.ID)
+	if err != nil {
+		t.Fatalf("reload source: %v", err)
+	}
+	if applied.Generation != latest.Generation || applied.AppliedGeneration != latest.Generation ||
+		applied.DesiredState != storage.ManagedDesiredInactive || applied.ObservedState != storage.ManagedObservedInactive {
+		t.Fatalf("latest revoke was not applied: %#v", applied)
+	}
+}
+
+func TestManagedReconcileDoesNotAddClientWithoutLimiterACK(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	fixture := newManagedUserHTTPFixture(t, "alice")
+	servers, err := fixture.repo.ListRemoteServers(ctx)
+	if err != nil || len(servers) != 1 {
+		t.Fatalf("resolve fixture server: servers=%v err=%v", servers, err)
+	}
+
+	ack := false
+	fakeAgent := &managedFakeAgent{
+		limiterOK:   &ack,
+		inboundTag:  fixture.offer.InboundTag,
+		snapshotHit: make(chan struct{}, 1),
+		token:       servers[0].Token,
+	}
+	agentServer := httptest.NewServer(fakeAgent)
+	t.Cleanup(agentServer.Close)
+	agentURL, err := url.Parse(agentServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, portText, err := net.SplitHostPort(agentURL.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := net.LookupPort("tcp", portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := fixture.repo.UpdateRemoteServerHeartbeat(ctx, servers[0].Token, host, ""); err != nil {
+		t.Fatalf("point fixture server at fake Agent: %v", err)
+	}
+	if err := fixture.repo.UpdateRemoteServerListenPort(ctx, servers[0].ID, port); err != nil {
+		t.Fatalf("update fake Agent port: %v", err)
+	}
+
+	remote := managedRemoteWithCapabilities(fixture.repo, servers[0].ID, managedReadyAgentCapabilities())
+	handler := NewManagedNodesHandler(fixture.repo, remote, NewLimiterConfigPusher(fixture.repo, nil))
+	err = handler.reconcileSource(ctx, fixture.activation.Source)
+	if err == nil || !strings.Contains(err.Error(), "not acknowledged") {
+		t.Fatalf("reconcile error=%v, want missing limiter ACK", err)
+	}
+
+	fakeAgent.mu.Lock()
+	calls := append([]string(nil), fakeAgent.calls...)
+	fakeAgent.mu.Unlock()
+	if len(calls) != 1 || calls[0] != "limiter" {
+		t.Fatalf("Agent mutations without limiter ACK=%v, want limiter only", calls)
+	}
+	source, err := fixture.repo.GetUserInboundAccessSource(ctx, fixture.activation.Source.ID)
+	if err != nil {
+		t.Fatalf("reload source: %v", err)
+	}
+	if source.ObservedState == storage.ManagedObservedActive || source.LastError == "" {
+		t.Fatalf("source did not remain pending after missing ACK: %#v", source)
+	}
+}

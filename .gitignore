@@ -1,0 +1,43 @@
+# Local configuration and runtime data
+.env
+.env.*
+!.env.example
+data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.log
+
+# Build and test output
+build/
+release/
+server
+*.exe
+*.test
+*.out
+coverage/
+test-results/
+cmd/server/__debug_bin*
+
+# Files owned by the standalone frontend repository
+frontend/
+node_modules/
+artifacts/
+screenshots/
+docs/change-records/
+deploy/original-reference.*
+token_invalid.yaml
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+
+# internal/web/dist is intentionally versioned: Go embeds it at compile time.

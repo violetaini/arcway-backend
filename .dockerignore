@@ -1,0 +1,33 @@
+.git/
+.github/
+
+build/
+release/
+server
+*.exe
+*.test
+*.out
+cmd/server/__debug_bin*
+
+data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.log
+
+frontend/
+node_modules/
+artifacts/
+screenshots/
+coverage/
+test-results/
+
+.env
+.env.*
+.idea/
+.vscode/
+.DS_Store
+
+# Do not exclude internal/web/dist, rule_templates, subscribes, or templates:
+# all contain files needed during the Go/Docker build.

@@ -1,0 +1,132 @@
+package web
+
+import (
+	"bytes"
+	"embed"
+	"io/fs"
+	"net/http"
+	"path"
+	"strings"
+	"sync"
+	"time"
+)
+
+//go:embed dist/*
+var embeddedFiles embed.FS
+
+// themePlaceholder 是 index.html 内联脚本里的默认主题占位符,serveIndex 时替换成管理员设置的值。
+// 无 cookie 的用户首屏据此决定初始主题(flat / pixel),避免像素↔扁平的加载闪烁。
+const themePlaceholder = "__MMW_DEFAULT_THEME__"
+
+var (
+	initOnce    sync.Once
+	staticFS    fs.FS
+	staticFiles http.Handler
+	indexBytes  []byte
+	indexMod    time.Time
+
+	themeMu      sync.RWMutex
+	servedIndex  []byte // indexBytes 替换占位符后的实际下发内容
+	currentTheme = "pixel"
+)
+
+// SetDefaultTheme 更新首屏注入的默认主题(flat / pixel),供无 mmw-theme-style cookie 的用户决定初始主题。
+// 由 main.go 启动时按 DB 设置调用一次,并在管理员改主题时同步调用。
+func SetDefaultTheme(theme string) {
+	initOnce.Do(initialize)
+	if theme != "flat" && theme != "pixel" && theme != "anime" {
+		theme = "pixel"
+	}
+	themeMu.Lock()
+	defer themeMu.Unlock()
+	currentTheme = theme
+	servedIndex = bytes.ReplaceAll(indexBytes, []byte(themePlaceholder), []byte(theme))
+	indexMod = time.Now() // 内容变了 → 刷新 modtime,避免 If-Modified-Since 命中旧 index
+}
+
+func initialize() {
+	sub, err := fs.Sub(embeddedFiles, "dist")
+	if err != nil {
+		panic(err)
+	}
+
+	staticFS = sub
+	staticFiles = http.FileServer(http.FS(sub))
+
+	indexBytes, err = fs.ReadFile(sub, "index.html")
+	if err != nil {
+		panic(err)
+	}
+	// 默认先按 pixel 替换占位符;main.go 启动后会用 DB 里的值再 SetDefaultTheme 一次。
+	servedIndex = bytes.ReplaceAll(indexBytes, []byte(themePlaceholder), []byte(currentTheme))
+
+	if info, err := fs.Stat(sub, "index.html"); err == nil {
+		indexMod = info.ModTime()
+	} else {
+		indexMod = time.Now()
+	}
+}
+
+// 返回一个为嵌入式前端 SPA 提供服务的 HTTP 处理程序。
+func Handler() http.Handler {
+	initOnce.Do(initialize)
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/traffic/") {
+			http.NotFound(w, r)
+			return
+		}
+
+		cleaned := path.Clean(r.URL.Path)
+		if cleaned == "." {
+			cleaned = "/"
+		}
+
+		if cleaned == "/" {
+			serveIndex(w, r)
+			return
+		}
+
+		resource := strings.TrimPrefix(cleaned, "/")
+		if resource == "" {
+			serveIndex(w, r)
+			return
+		}
+
+		if fileExists(resource) {
+			staticFiles.ServeHTTP(w, r)
+			return
+		}
+
+		serveIndex(w, r)
+	})
+}
+
+func serveIndex(w http.ResponseWriter, r *http.Request) {
+	initOnce.Do(initialize)
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// index.html 引用的是带内容哈希的 JS 资源,本身不能被浏览器长缓存,
+	// 否则发布新版本后浏览器仍加载旧 bundle(导致动态菜单等新功能不生效)。
+	w.Header().Set("Cache-Control", "no-cache, must-revalidate")
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	themeMu.RLock()
+	content := servedIndex
+	mod := indexMod
+	themeMu.RUnlock()
+	http.ServeContent(w, r, "index.html", mod, bytes.NewReader(content))
+}
+
+func fileExists(name string) bool {
+	initOnce.Do(initialize)
+
+	info, err := fs.Stat(staticFS, name)
+	if err != nil {
+		return false
+	}
+	return !info.IsDir()
+}

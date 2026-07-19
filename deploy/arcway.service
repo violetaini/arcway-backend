@@ -1,0 +1,21 @@
+[Unit]
+Description=Arcway control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/arcway
+EnvironmentFile=/etc/arcway/arcway.env
+ExecStart=/opt/arcway/bin/arcway
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=15s
+KillSignal=SIGTERM
+LimitNOFILE=1048576
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
