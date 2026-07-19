@@ -12,7 +12,7 @@ data/
 # Build and test output
 build/
 release/
-server
+/server
 *.exe
 *.test
 *.out

@@ -3,7 +3,7 @@
 
 build/
 release/
-server
+/server
 *.exe
 *.test
 *.out
