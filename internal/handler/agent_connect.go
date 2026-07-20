@@ -1892,14 +1892,20 @@ if [ "$CONFIGURED_GUARD_AGENT_URL" != "http://127.0.0.1:${ARCWAY_AGENT_PORT}" ];
 fi
 
 umask 077
-FIREWALL_LOCK_FILE=/run/arcway-agent-firewall.flock
+FIREWALL_RUNTIME_DIR=/var/lib/arcway-expiry-guard
+if [ ! -d "$FIREWALL_RUNTIME_DIR" ]; then
+    echo "ERROR: Arcway firewall runtime directory is unavailable" >&2
+    exit 1
+fi
+chmod 0700 "$FIREWALL_RUNTIME_DIR"
+FIREWALL_LOCK_FILE="$FIREWALL_RUNTIME_DIR/firewall.flock"
 exec 8>"$FIREWALL_LOCK_FILE"
 chmod 0600 "$FIREWALL_LOCK_FILE"
 if ! flock -w 30 8; then
     echo "ERROR: timed out waiting for the Arcway firewall lock" >&2
     exit 1
 fi
-RULESET="/run/arcway-agent-firewall.$$.nft"
+RULESET=$(mktemp "$FIREWALL_RUNTIME_DIR/arcway-agent-firewall.nft.XXXXXX")
 cleanup() {
     rm -f "$RULESET"
 }

@@ -198,10 +198,13 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 		"/etc/arcway-port-firewall.env",
 		"/usr/local/sbin/arcway-agent-firewall",
 		"ExecStartPre=/usr/local/sbin/arcway-agent-firewall",
-		"FIREWALL_LOCK_FILE=/run/arcway-agent-firewall.flock",
+		"FIREWALL_RUNTIME_DIR=/var/lib/arcway-expiry-guard",
+		"chmod 0700 \"$FIREWALL_RUNTIME_DIR\"",
+		"FIREWALL_LOCK_FILE=\"$FIREWALL_RUNTIME_DIR/firewall.flock\"",
 		"exec 8>\"$FIREWALL_LOCK_FILE\"",
 		"chmod 0600 \"$FIREWALL_LOCK_FILE\"",
 		"flock -w 30 8",
+		"RULESET=$(mktemp \"$FIREWALL_RUNTIME_DIR/arcway-agent-firewall.nft.XXXXXX\")",
 		"table inet arcway",
 		"nft -c -f \"$RULESET\"",
 		"nft -f \"$RULESET\"",
@@ -257,6 +260,9 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 		`rm -rf "$LOCK_DIR"`,
 		`rm -f "$FIREWALL_LOCK_FILE"`,
 		`rm -rf "$FIREWALL_LOCK_FILE"`,
+		`FIREWALL_LOCK_FILE=/run/`,
+		`RULESET="/run/`,
+		`/run/arcway-agent-firewall`,
 	} {
 		if strings.Contains(script, staleLock) {
 			t.Fatalf("install script retains the stale directory-lock implementation: %q", staleLock)
@@ -272,6 +278,11 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 	if downloadIndex < 0 || dependencyIndex < 0 || backupIndex < 0 || mutationIndex < 0 ||
 		downloadIndex > dependencyIndex || dependencyIndex > backupIndex || backupIndex > mutationIndex {
 		t.Fatal("install script mutates the running node before downloads and integrity checks complete")
+	}
+	runtimeDirIndex := strings.Index(script, "mkdir -p /var/lib/arcway-expiry-guard")
+	firstFirewallRunIndex := strings.Index(script, "if ! /usr/local/sbin/arcway-agent-firewall; then")
+	if runtimeDirIndex < 0 || firstFirewallRunIndex < runtimeDirIndex {
+		t.Fatal("install script invokes the firewall helper before creating its writable runtime directory")
 	}
 	readyIndex := strings.Index(script, `if [ "$management_ready" != "1" ]`)
 	legacyCleanupIndex := strings.Index(script, `cleanup_legacy_firewall()`)
@@ -362,7 +373,7 @@ func TestRemoteInstallFirewallHelperSerializesWithKernelLock(t *testing.T) {
 	if !found {
 		t.Fatal("generated installer has an unterminated firewall helper")
 	}
-	lockStart := strings.Index(helper, "umask 077\nFIREWALL_LOCK_FILE=")
+	lockStart := strings.Index(helper, "umask 077\nFIREWALL_RUNTIME_DIR=")
 	if lockStart < 0 {
 		t.Fatal("generated firewall helper has no kernel-lock block")
 	}
@@ -371,10 +382,11 @@ func TestRemoteInstallFirewallHelperSerializesWithKernelLock(t *testing.T) {
 		t.Fatal("generated firewall helper kernel-lock block is unterminated")
 	}
 	lockBlock := helper[lockStart : lockStart+lockEndOffset]
-	lockFile := filepath.Join(t.TempDir(), "firewall.flock")
+	runtimeDir := t.TempDir()
+	lockFile := filepath.Join(runtimeDir, "firewall.flock")
 	lockBlock = strings.Replace(lockBlock,
-		"FIREWALL_LOCK_FILE=/run/arcway-agent-firewall.flock",
-		"FIREWALL_LOCK_FILE="+shellSingleQuote(lockFile), 1)
+		"FIREWALL_RUNTIME_DIR=/var/lib/arcway-expiry-guard",
+		"FIREWALL_RUNTIME_DIR="+shellSingleQuote(runtimeDir), 1)
 
 	if err := os.WriteFile(lockFile, []byte("stale\n"), 0644); err != nil {
 		t.Fatal(err)
