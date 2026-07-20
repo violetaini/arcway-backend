@@ -162,6 +162,7 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 		"/api/remote/install-finalize",
 		"CURL_AUTH_HEADER_FILE=\"$DOWNLOAD_DIR/curl-auth.header\"",
 		"printf 'Authorization: Bearer %s\\n' \"$TOKEN\"",
+		"printf 'User-Agent: %s\\n' 'miaomiaowux/0.1' >> \"$CURL_AUTH_HEADER_FILE\"",
 		"chmod 0600 \"$CURL_AUTH_HEADER_FILE\"",
 		"start_install_renewal",
 		"assert_install_lease",

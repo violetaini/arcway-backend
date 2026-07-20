@@ -731,6 +731,7 @@ PANEL_SOURCE_IPS=` + shellSingleQuote(strings.Join(panelSourceIPs, " ")) + `
 # Keep the long-lived node token out of curl argv (/proc/*/cmdline). curl reads
 # these root-only files directly; the enclosing 0700 directory is deleted on exit.
 printf 'Authorization: Bearer %s\n' "$TOKEN" > "$CURL_AUTH_HEADER_FILE"
+printf 'User-Agent: %s\n' ` + shellSingleQuote(version.AgentUserAgent) + ` >> "$CURL_AUTH_HEADER_FILE"
 printf 'X-Arcway-Install-Nonce: %s\n' "$INSTALL_NONCE" > "$CURL_INSTALL_NONCE_HEADER_FILE"
 printf 'X-Arcway-Install-Policy-SHA256: %s\n' "$INSTALL_POLICY_SHA256" > "$CURL_INSTALL_POLICY_HEADER_FILE"
 chmod 0600 "$CURL_AUTH_HEADER_FILE" "$CURL_INSTALL_NONCE_HEADER_FILE" "$CURL_INSTALL_POLICY_HEADER_FILE"
