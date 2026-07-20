@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -197,6 +198,10 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 		"/etc/arcway-port-firewall.env",
 		"/usr/local/sbin/arcway-agent-firewall",
 		"ExecStartPre=/usr/local/sbin/arcway-agent-firewall",
+		"FIREWALL_LOCK_FILE=/run/arcway-agent-firewall.flock",
+		"exec 8>\"$FIREWALL_LOCK_FILE\"",
+		"chmod 0600 \"$FIREWALL_LOCK_FILE\"",
+		"flock -w 30 8",
 		"table inet arcway",
 		"nft -c -f \"$RULESET\"",
 		"nft -f \"$RULESET\"",
@@ -205,6 +210,7 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 		"tcp dport { %s, %s } drop",
 		"mmw-agent listen_port drifted from the protected Arcway port",
 		"/etc/systemd/system/arcway-expiry-guard.service",
+		"chmod 0644 /etc/systemd/system/mmw-agent.service /etc/systemd/system/arcway-expiry-guard.service",
 		"/etc/init.d/arcway-expiry-guard",
 		"/usr/local/bin/arcway-expiry-guard-supervisor.sh",
 		"/usr/local/sbin/arcway-agent-firewall || return 1",
@@ -243,6 +249,18 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 	}
 	if strings.Contains(script, "has_external_ipv6") {
 		t.Fatal("install script makes IPv6 protection depend on address timing")
+	}
+	for _, staleLock := range []string{
+		`LOCK_DIR=/run/arcway-agent-firewall.lock`,
+		`LOCK_OWNER=`,
+		`kill -0 "$LOCK_OWNER"`,
+		`rm -rf "$LOCK_DIR"`,
+		`rm -f "$FIREWALL_LOCK_FILE"`,
+		`rm -rf "$FIREWALL_LOCK_FILE"`,
+	} {
+		if strings.Contains(script, staleLock) {
+			t.Fatalf("install script retains the stale directory-lock implementation: %q", staleLock)
+		}
 	}
 	if strings.Index(script, "nft -c -f \"$RULESET\"") > strings.Index(script, "nft -f \"$RULESET\"") {
 		t.Fatal("install script applies the firewall before validating its transaction")
@@ -313,6 +331,126 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("generated firewall helper failed sh -n: %v\n%s", err, output)
 		}
+	}
+}
+
+func TestRemoteInstallFirewallHelperSerializesWithKernelLock(t *testing.T) {
+	if _, err := exec.LookPath("flock"); err != nil {
+		t.Skip("flock is unavailable")
+	}
+	shell, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("sh is unavailable")
+	}
+
+	t.Setenv(panelSourceIPsEnv, "203.0.113.10")
+	handler, token := newExpiryGuardAssetHandler(t)
+	request := httptest.NewRequest(http.MethodGet, "https://panel.example/api/remote/install.sh", nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	handler.GetRemoteInstallScript(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	const helperStart = "cat > /usr/local/sbin/arcway-agent-firewall << 'EOF'\n"
+	_, helperTail, found := strings.Cut(response.Body.String(), helperStart)
+	if !found {
+		t.Fatal("generated installer is missing the firewall helper body")
+	}
+	helper, _, found := strings.Cut(helperTail, "\nEOF\n")
+	if !found {
+		t.Fatal("generated installer has an unterminated firewall helper")
+	}
+	lockStart := strings.Index(helper, "umask 077\nFIREWALL_LOCK_FILE=")
+	if lockStart < 0 {
+		t.Fatal("generated firewall helper has no kernel-lock block")
+	}
+	lockEndOffset := strings.Index(helper[lockStart:], "\nRULESET=")
+	if lockEndOffset < 0 {
+		t.Fatal("generated firewall helper kernel-lock block is unterminated")
+	}
+	lockBlock := helper[lockStart : lockStart+lockEndOffset]
+	lockFile := filepath.Join(t.TempDir(), "firewall.flock")
+	lockBlock = strings.Replace(lockBlock,
+		"FIREWALL_LOCK_FILE=/run/arcway-agent-firewall.flock",
+		"FIREWALL_LOCK_FILE="+shellSingleQuote(lockFile), 1)
+
+	if err := os.WriteFile(lockFile, []byte("stale\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(lockFile, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command(shell, "-c", lockBlock).CombinedOutput(); err != nil {
+		t.Fatalf("firewall helper did not acquire an existing regular lock file: %v\n%s", err, output)
+	}
+	info, err := os.Stat(lockFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0600 {
+		t.Fatalf("firewall lock mode=%#o want=0600", got)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	holder := exec.CommandContext(ctx, shell, "-c",
+		"exec 7>"+shellSingleQuote(lockFile)+"; flock -x 7; printf 'ready\\n'; read release")
+	holderInput, err := holder.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	holderOutput, err := holder.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := holder.Start(); err != nil {
+		t.Fatal(err)
+	}
+	holderFinished := false
+	defer func() {
+		if holderFinished {
+			return
+		}
+		_ = holderInput.Close()
+		_ = holder.Process.Kill()
+		_ = holder.Wait()
+	}()
+	ready, err := bufio.NewReader(holderOutput).ReadString('\n')
+	if err != nil || ready != "ready\n" {
+		t.Fatalf("lock holder did not acquire the test lock: ready=%q err=%v", ready, err)
+	}
+
+	contender := exec.CommandContext(ctx, shell, "-c", lockBlock)
+	if err := contender.Start(); err != nil {
+		t.Fatal(err)
+	}
+	contenderDone := make(chan error, 1)
+	go func() { contenderDone <- contender.Wait() }()
+	select {
+	case err := <-contenderDone:
+		t.Fatalf("firewall helper bypassed a held kernel lock: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if _, err := holderInput.Write([]byte("release\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := holderInput.Close(); err != nil {
+		t.Fatal(err)
+	}
+	holderErr := holder.Wait()
+	holderFinished = true
+	if holderErr != nil {
+		t.Fatalf("lock holder failed: %v", holderErr)
+	}
+	select {
+	case err := <-contenderDone:
+		if err != nil {
+			t.Fatalf("firewall helper did not acquire the released kernel lock: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("firewall helper did not acquire the released kernel lock")
 	}
 }
 

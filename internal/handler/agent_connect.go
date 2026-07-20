@@ -1891,31 +1891,17 @@ if [ "$CONFIGURED_GUARD_AGENT_URL" != "http://127.0.0.1:${ARCWAY_AGENT_PORT}" ];
     exit 1
 fi
 
-LOCK_DIR=/run/arcway-agent-firewall.lock
-LOCK_ATTEMPTS=0
-until mkdir "$LOCK_DIR" 2>/dev/null; do
-    LOCK_OWNER=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
-    case "$LOCK_OWNER" in
-        ''|*[!0-9]*) ;;
-        *)
-            if ! kill -0 "$LOCK_OWNER" 2>/dev/null; then
-                rm -rf "$LOCK_DIR"
-                continue
-            fi
-            ;;
-    esac
-    LOCK_ATTEMPTS=$((LOCK_ATTEMPTS + 1))
-    if [ "$LOCK_ATTEMPTS" -ge 30 ]; then
-        echo "ERROR: timed out waiting for the Arcway firewall lock" >&2
-        exit 1
-    fi
-    sleep 1
-done
-printf '%s\n' "$$" > "$LOCK_DIR/pid"
+umask 077
+FIREWALL_LOCK_FILE=/run/arcway-agent-firewall.flock
+exec 8>"$FIREWALL_LOCK_FILE"
+chmod 0600 "$FIREWALL_LOCK_FILE"
+if ! flock -w 30 8; then
+    echo "ERROR: timed out waiting for the Arcway firewall lock" >&2
+    exit 1
+fi
 RULESET="/run/arcway-agent-firewall.$$.nft"
 cleanup() {
     rm -f "$RULESET"
-    rm -rf "$LOCK_DIR"
 }
 trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
@@ -2173,6 +2159,7 @@ ReadWritePaths=/var/lib/arcway-expiry-guard
 [Install]
 WantedBy=multi-user.target
 EOF
+    chmod 0644 /etc/systemd/system/mmw-agent.service /etc/systemd/system/arcway-expiry-guard.service
     systemctl daemon-reload
 elif [ "$HAS_OPENRC" = "1" ]; then
     cat > /etc/init.d/mmw-agent << 'EOF'
