@@ -199,6 +199,9 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 		"/etc/arcway-port-firewall.env",
 		"/usr/local/sbin/arcway-agent-firewall",
 		"ExecStartPre=/usr/local/sbin/arcway-agent-firewall",
+		"ExecStartPre=/usr/local/sbin/arcway-agent-firewall --nft-only",
+		"Requires=mmw-agent.service",
+		"depend() { need net mmw-agent; }",
 		"FIREWALL_RUNTIME_DIR=/var/lib/arcway-expiry-guard",
 		"chmod 0700 \"$FIREWALL_RUNTIME_DIR\"",
 		"FIREWALL_LOCK_FILE=\"$FIREWALL_RUNTIME_DIR/firewall.flock\"",
@@ -209,6 +212,15 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 		"table inet arcway",
 		"nft -c -f \"$RULESET\"",
 		"nft -f \"$RULESET\"",
+		"FIREWALL_MODE=${1:-full}",
+		"HOST_FILTER_CHAIN=ARCWAY_PANEL_IN",
+		"ensure_host_filter_chain()",
+		"ensure_host_filter_chain iptables ipv4 || exit 1",
+		"ensure_host_filter_chain ip6tables ipv6 || exit 1",
+		"-I INPUT 1 -m comment --comment \"$HOST_FILTER_COMMENT\" -j \"$HOST_FILTER_CHAIN\"",
+		"OLD_FIREWALL_USES_HOST_CHAIN=0",
+		"host firewall chain ARCWAY_PANEL_IN is not owned",
+		"is installed but cannot inspect the host INPUT filter",
 		"ip saddr %s tcp dport { %s, %s } accept",
 		"ip6 saddr %s tcp dport { %s, %s } accept",
 		"tcp dport { %s, %s } drop",
@@ -247,6 +259,9 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 	}
 	if strings.Contains(script, "ufw allow \"${GUARD_PORT}/tcp\"") {
 		t.Fatal("install script exposes the expiry guard to all IPv4 sources")
+	}
+	if strings.Contains(script, "-m multiport") {
+		t.Fatal("install script depends on the optional xtables multiport module")
 	}
 	if strings.Contains(script, "MASTER_HOST=") || strings.Contains(script, "getent ahosts") {
 		t.Fatal("install script derives trusted panel sources from ingress DNS")
@@ -343,6 +358,187 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("generated firewall helper failed sh -n: %v\n%s", err, output)
 		}
+	}
+}
+
+func TestRemoteInstallHostFilterSurvivesLaterDefaultDrop(t *testing.T) {
+	t.Setenv(panelSourceIPsEnv, "203.0.113.10, 2001:db8::10")
+	handler, token := newExpiryGuardAssetHandler(t)
+	request := httptest.NewRequest(http.MethodGet, "https://panel.example/api/remote/install.sh", nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	handler.GetRemoteInstallScript(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	script := response.Body.String()
+	const helperStart = "cat > /usr/local/sbin/arcway-agent-firewall << 'EOF'\n"
+	_, helperTail, found := strings.Cut(script, helperStart)
+	if !found {
+		t.Fatal("generated installer is missing the firewall helper body")
+	}
+	helper, _, found := strings.Cut(helperTail, "\nEOF\n")
+	if !found {
+		t.Fatal("generated installer has an unterminated firewall helper")
+	}
+	for _, expected := range []string{
+		`HOST_FILTER_CHAIN=ARCWAY_PANEL_IN`,
+		`HOST_FILTER_COMMENT=arcway-managed`,
+		`remove_host_filter_chain()`,
+		`-s "$HOST_PANEL_IP" -p tcp --dport "$HOST_MANAGEMENT_PORT"`,
+		`-m comment --comment "$HOST_FILTER_COMMENT" -j ACCEPT || return 1`,
+		`-I INPUT 1 -m comment --comment "$HOST_FILTER_COMMENT" -j "$HOST_FILTER_CHAIN" || return 1`,
+	} {
+		if !strings.Contains(helper, expected) {
+			t.Errorf("firewall helper missing %q", expected)
+		}
+	}
+	if strings.Contains(helper, "-m multiport") {
+		t.Fatal("host compatibility filter uses the optional multiport matcher")
+	}
+	nftApply := strings.Index(helper, `nft -f "$RULESET"`)
+	nftOnlyExit := strings.Index(helper, `if [ "$FIREWALL_MODE" = "--nft-only" ]`)
+	hostFilter := strings.Index(helper, `ensure_host_filter_chain()`)
+	if nftApply < 0 || nftOnlyExit < nftApply || hostFilter < nftOnlyExit {
+		t.Fatal("firewall helper does not apply nft before its sandbox-safe exit and host INPUT integration")
+	}
+
+	const agentUnitStart = "cat > /etc/systemd/system/mmw-agent.service << EOF\n"
+	_, agentTail, found := strings.Cut(script, agentUnitStart)
+	if !found {
+		t.Fatal("generated installer is missing the Agent unit")
+	}
+	agentUnit, _, found := strings.Cut(agentTail, "\nEOF\n")
+	if !found || !strings.Contains(agentUnit, "ExecStartPre=/usr/local/sbin/arcway-agent-firewall\n") {
+		t.Fatal("Agent unit does not apply the full host firewall before startup")
+	}
+
+	const guardUnitStart = "cat > /etc/systemd/system/arcway-expiry-guard.service << EOF\n"
+	_, guardTail, found := strings.Cut(script, guardUnitStart)
+	if !found {
+		t.Fatal("generated installer is missing the Guard unit")
+	}
+	guardUnit, _, found := strings.Cut(guardTail, "\nEOF\n")
+	if !found || !strings.Contains(guardUnit, "Requires=mmw-agent.service") ||
+		!strings.Contains(guardUnit, "ExecStartPre=/usr/local/sbin/arcway-agent-firewall --nft-only") {
+		t.Fatal("sandboxed Guard unit does not rely on the Agent's full firewall setup")
+	}
+	if strings.Contains(guardUnit, "ExecStartPre=/usr/local/sbin/arcway-agent-firewall\n") {
+		t.Fatal("sandboxed Guard unit invokes the xtables-writing firewall mode")
+	}
+
+	collisionCheck := strings.Index(script, "is not owned by the installed Arcway helper")
+	transactionBegin := strings.Index(script, `retry_remote_install_post "/api/remote/install-begin"`)
+	if collisionCheck < 0 || transactionBegin < collisionCheck {
+		t.Fatal("reserved host firewall chain collision is not rejected before the install transaction")
+	}
+	rollbackOwnership := strings.Index(script, `if [ "$OLD_FIREWALL_USES_HOST_CHAIN" != "1" ]`)
+	rollbackDelete := strings.Index(script, `-X ARCWAY_PANEL_IN`)
+	if rollbackOwnership < 0 || rollbackDelete < rollbackOwnership {
+		t.Fatal("rollback does not remove a host filter chain unsupported by the restored helper")
+	}
+}
+
+func TestRemoteInstallFirewallHelperReconcilesHostInputChain(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires an isolated Linux network namespace")
+	}
+	unshare, err := exec.LookPath("unshare")
+	if err != nil {
+		t.Skip("unshare is unavailable")
+	}
+	for _, tool := range []string{"nft", "iptables", "ip6tables", "flock"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s is unavailable", tool)
+		}
+	}
+	if err := exec.Command(unshare, "-n", "true").Run(); err != nil {
+		t.Skipf("network namespace creation is unavailable: %v", err)
+	}
+
+	t.Setenv(panelSourceIPsEnv, "203.0.113.10")
+	handler, token := newExpiryGuardAssetHandler(t)
+	request := httptest.NewRequest(http.MethodGet, "https://panel.example/api/remote/install.sh", nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	handler.GetRemoteInstallScript(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	const helperStart = "cat > /usr/local/sbin/arcway-agent-firewall << 'EOF'\n"
+	_, helperTail, found := strings.Cut(response.Body.String(), helperStart)
+	if !found {
+		t.Fatal("generated installer is missing the firewall helper body")
+	}
+	helper, _, found := strings.Cut(helperTail, "\nEOF\n")
+	if !found {
+		t.Fatal("generated installer has an unterminated firewall helper")
+	}
+
+	testRoot := t.TempDir()
+	configPath := filepath.Join(testRoot, "config.yaml")
+	guardEnvPath := filepath.Join(testRoot, "guard.env")
+	runtimeDir := filepath.Join(testRoot, "runtime")
+	helperPath := filepath.Join(testRoot, "arcway-agent-firewall")
+	mockBin := filepath.Join(testRoot, "mock-bin")
+	failureLog := filepath.Join(testRoot, "xtables-failure.log")
+	if err := os.Mkdir(runtimeDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(mockBin, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mockBin, "iptables"), []byte("#!/bin/sh\nexit 42\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte("listen_port: \"23889\"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(guardEnvPath, []byte("ARCWAY_GUARD_LISTEN=:23890\nARCWAY_AGENT_URL=http://127.0.0.1:23889\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	helper = strings.ReplaceAll(helper, "/etc/mmw-agent/config.yaml", configPath)
+	helper = strings.ReplaceAll(helper, "/etc/arcway-expiry-guard.env", guardEnvPath)
+	helper = strings.ReplaceAll(helper, "FIREWALL_RUNTIME_DIR=/var/lib/arcway-expiry-guard", "FIREWALL_RUNTIME_DIR="+runtimeDir)
+	if err := os.WriteFile(helperPath, []byte(helper), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	harness := `set -eu
+iptables -w 5 -t filter -P INPUT DROP
+ip6tables -w 5 -t filter -P INPUT DROP
+export ARCWAY_AGENT_PORT=23889 ARCWAY_GUARD_PORT=23890 ARCWAY_PANEL_IPS=203.0.113.10
+if PATH=` + shellSingleQuote(mockBin) + `:/usr/sbin:/usr/bin:/bin ` + shellSingleQuote(helperPath) + ` >` + shellSingleQuote(failureLog) + ` 2>&1; then
+    exit 1
+fi
+grep -F -- 'iptables is installed but cannot inspect the host INPUT filter' ` + shellSingleQuote(failureLog) + ` >/dev/null
+! iptables -w 5 -t filter -S ARCWAY_PANEL_IN >/dev/null 2>&1
+` + shellSingleQuote(helperPath) + `
+` + shellSingleQuote(helperPath) + `
+INPUT_RULES=$(iptables -w 5 -t filter -S INPUT)
+CHAIN_RULES=$(iptables -w 5 -t filter -S ARCWAY_PANEL_IN)
+[ "$(printf '%s\n' "$INPUT_RULES" | awk '/arcway-managed/ && /ARCWAY_PANEL_IN/ { count++ } END { print count+0 }')" -eq 1 ]
+[ "$(printf '%s\n' "$CHAIN_RULES" | awk '/203[.]0[.]113[.]10/ && /--dport 23889/ && /-j ACCEPT/ { count++ } END { print count+0 }')" -eq 1 ]
+[ "$(printf '%s\n' "$CHAIN_RULES" | awk '/203[.]0[.]113[.]10/ && /--dport 23890/ && /-j ACCEPT/ { count++ } END { print count+0 }')" -eq 1 ]
+ARCWAY_PANEL_IPS=198.51.100.20 ` + shellSingleQuote(helperPath) + `
+CHAIN_RULES=$(iptables -w 5 -t filter -S ARCWAY_PANEL_IN)
+! printf '%s\n' "$CHAIN_RULES" | grep -F -- '203.0.113.10' >/dev/null
+[ "$(printf '%s\n' "$CHAIN_RULES" | awk '/198[.]51[.]100[.]20/ && /-j ACCEPT/ { count++ } END { print count+0 }')" -eq 2 ]
+HOST_FILTER_BEFORE=$(iptables -w 5 -t filter -S ARCWAY_PANEL_IN)
+ARCWAY_PANEL_IPS=192.0.2.30 ` + shellSingleQuote(helperPath) + ` --nft-only
+HOST_FILTER_AFTER=$(iptables -w 5 -t filter -S ARCWAY_PANEL_IN)
+[ "$HOST_FILTER_BEFORE" = "$HOST_FILTER_AFTER" ]
+nft list chain inet arcway input >/dev/null
+ARCWAY_PANEL_IPS=2001:db8::10 ` + shellSingleQuote(helperPath) + `
+! iptables -w 5 -t filter -S ARCWAY_PANEL_IN >/dev/null 2>&1
+IPV6_CHAIN_RULES=$(ip6tables -w 5 -t filter -S ARCWAY_PANEL_IN)
+[ "$(printf '%s\n' "$IPV6_CHAIN_RULES" | awk '/2001:db8::10/ && /-j ACCEPT/ { count++ } END { print count+0 }')" -eq 2 ]
+`
+	command := exec.Command(unshare, "-n", "sh", "-c", harness)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("firewall helper host-chain integration failed: %v\n%s", err, output)
 	}
 }
 

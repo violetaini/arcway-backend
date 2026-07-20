@@ -877,6 +877,27 @@ for PANEL_SOURCE_IP in $PANEL_SOURCE_IPS; do
             ;;
     esac
 done
+for HOST_FILTER_SPEC in iptables:ip ip6tables:ip6; do
+    HOST_FILTER_TOOL=${HOST_FILTER_SPEC%%:*}
+    HOST_FILTER_NFT_FAMILY=${HOST_FILTER_SPEC#*:}
+    if command -v "$HOST_FILTER_TOOL" >/dev/null 2>&1; then
+        if ! "$HOST_FILTER_TOOL" -w 5 -t filter -S INPUT >/dev/null 2>&1; then
+            echo "ERROR: $HOST_FILTER_TOOL is installed but cannot inspect the host INPUT filter" >&2
+            exit 1
+        fi
+        if "$HOST_FILTER_TOOL" -w 5 -t filter -S ARCWAY_PANEL_IN >/dev/null 2>&1; then
+            if [ ! -x /usr/local/sbin/arcway-agent-firewall ] || \
+                ! grep -q 'HOST_FILTER_CHAIN=ARCWAY_PANEL_IN' /usr/local/sbin/arcway-agent-firewall 2>/dev/null || \
+                ! "$HOST_FILTER_TOOL" -w 5 -t filter -S ARCWAY_PANEL_IN | grep -F -- '--comment arcway-managed' >/dev/null 2>&1; then
+                echo "ERROR: reserved $HOST_FILTER_NFT_FAMILY host firewall chain ARCWAY_PANEL_IN is not owned by the installed Arcway helper" >&2
+                exit 1
+            fi
+        fi
+    elif nft list chain "$HOST_FILTER_NFT_FAMILY" filter ARCWAY_PANEL_IN >/dev/null 2>&1; then
+        echo "ERROR: $HOST_FILTER_TOOL cannot manage the existing Arcway host INPUT chain" >&2
+        exit 1
+    fi
+done
 
 retry_remote_install_post() {
     local callback_path="$1" max_time="$2" include_policy="$3"
@@ -1332,10 +1353,12 @@ discover_tracked_symlink_targets() {
 discover_tracked_symlink_targets
 OLD_FIREWALL_PRESENT=0
 OLD_FIREWALL_USES_NFT=0
+OLD_FIREWALL_USES_HOST_CHAIN=0
 OLD_UFW_ACTIVE=0
 if [ -x /usr/local/sbin/arcway-agent-firewall ]; then
     OLD_FIREWALL_PRESENT=1
     grep -q 'table inet arcway' /usr/local/sbin/arcway-agent-firewall 2>/dev/null && OLD_FIREWALL_USES_NFT=1 || true
+    grep -q 'HOST_FILTER_CHAIN=ARCWAY_PANEL_IN' /usr/local/sbin/arcway-agent-firewall 2>/dev/null && OLD_FIREWALL_USES_HOST_CHAIN=1 || true
 fi
 if command -v ufw >/dev/null 2>&1; then
     if LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active' || grep -q '^ENABLED=yes' /etc/ufw/ufw.conf 2>/dev/null; then
@@ -1552,6 +1575,38 @@ rollback_install() {
                 "$LEGACY_TOOL" -w 5 -D ARCWAY_PORTS -s "$LEGACY_IP" -p tcp --dport "$LEGACY_PORT" -j ACCEPT >/dev/null 2>&1 || true
             fi
         done < "$LEGACY_COMPAT_RULES_FILE"
+    fi
+
+    # The new helper inserts an exact-source accept chain into the host's own
+    # INPUT filter. Remove that chain when rolling back to a helper version
+    # that did not own it; otherwise a failed first upgrade would leave live
+    # firewall state that the restored installation cannot maintain.
+    if [ "$OLD_FIREWALL_USES_HOST_CHAIN" != "1" ]; then
+        for HOST_FILTER_SPEC in iptables:ip ip6tables:ip6; do
+            HOST_FILTER_TOOL=${HOST_FILTER_SPEC%%:*}
+            HOST_FILTER_NFT_FAMILY=${HOST_FILTER_SPEC#*:}
+            if ! command -v "$HOST_FILTER_TOOL" >/dev/null 2>&1; then
+                if nft list chain "$HOST_FILTER_NFT_FAMILY" filter ARCWAY_PANEL_IN >/dev/null 2>&1; then
+                    ROLLBACK_FAILED=1
+                fi
+                continue
+            fi
+            if ! "$HOST_FILTER_TOOL" -w 5 -t filter -S INPUT >/dev/null 2>&1; then
+                ROLLBACK_FAILED=1
+                continue
+            fi
+            if "$HOST_FILTER_TOOL" -w 5 -t filter -S ARCWAY_PANEL_IN >/dev/null 2>&1; then
+                if ! "$HOST_FILTER_TOOL" -w 5 -t filter -S ARCWAY_PANEL_IN | grep -F -- '--comment arcway-managed' >/dev/null 2>&1; then
+                    ROLLBACK_FAILED=1
+                    continue
+                fi
+                while "$HOST_FILTER_TOOL" -w 5 -t filter -C INPUT -m comment --comment arcway-managed -j ARCWAY_PANEL_IN >/dev/null 2>&1; do
+                    "$HOST_FILTER_TOOL" -w 5 -t filter -D INPUT -m comment --comment arcway-managed -j ARCWAY_PANEL_IN >/dev/null 2>&1 || { ROLLBACK_FAILED=1; break; }
+                done
+                "$HOST_FILTER_TOOL" -w 5 -t filter -F ARCWAY_PANEL_IN >/dev/null 2>&1 || ROLLBACK_FAILED=1
+                "$HOST_FILTER_TOOL" -w 5 -t filter -X ARCWAY_PANEL_IN >/dev/null 2>&1 || ROLLBACK_FAILED=1
+            fi
+        done
     fi
 
     FIREWALL_SAFE=1
@@ -1861,6 +1916,11 @@ chmod 0600 /etc/arcway-port-firewall.env
 cat > /usr/local/sbin/arcway-agent-firewall << 'EOF'
 #!/bin/sh
 set -eu
+FIREWALL_MODE=${1:-full}
+case "$FIREWALL_MODE" in
+    full|--nft-only) ;;
+    *) echo "ERROR: unsupported Arcway firewall mode: $FIREWALL_MODE" >&2; exit 2 ;;
+esac
 : "${ARCWAY_AGENT_PORT:?missing ARCWAY_AGENT_PORT}"
 : "${ARCWAY_GUARD_PORT:?missing ARCWAY_GUARD_PORT}"
 : "${ARCWAY_PANEL_IPS:?missing ARCWAY_PANEL_IPS}"
@@ -1935,6 +1995,134 @@ trap 'exit 130' HUP INT TERM
 nft -c -f "$RULESET"
 nft -f "$RULESET"
 nft list chain inet arcway input >/dev/null
+
+# The Guard service runs with ProtectSystem=strict. Its pre-start may safely
+# refresh the nft table, but the full host-chain update needs the global
+# /run/xtables.lock and is therefore performed by the required Agent service.
+if [ "$FIREWALL_MODE" = "--nft-only" ]; then
+    exit 0
+fi
+
+# An accept verdict in an early nft base chain is not final: a later host INPUT
+# chain (UFW, firewalld, or a panel firewall) can still drop the packet. Keep
+# the independent nft table as the authoritative deny boundary, and also put
+# the same exact-source accepts at the front of the host's IPv4/IPv6 INPUT
+# filter so trusted panel traffic survives a later default-drop policy.
+HOST_FILTER_CHAIN=ARCWAY_PANEL_IN
+HOST_FILTER_COMMENT=arcway-managed
+host_filter_tool_ready() {
+    command -v "$1" >/dev/null 2>&1 && "$1" -w 5 -t filter -S INPUT >/dev/null 2>&1
+}
+ensure_host_filter_chain() {
+    HOST_FILTER_TOOL="$1"
+    HOST_FILTER_FAMILY="$2"
+    if ! host_filter_tool_ready "$HOST_FILTER_TOOL"; then
+        echo "ERROR: $HOST_FILTER_TOOL cannot manage the host INPUT filter" >&2
+        return 1
+    fi
+    if "$HOST_FILTER_TOOL" -w 5 -t filter -S "$HOST_FILTER_CHAIN" >/dev/null 2>&1; then
+        if ! "$HOST_FILTER_TOOL" -w 5 -t filter -S "$HOST_FILTER_CHAIN" | grep -F -- "--comment $HOST_FILTER_COMMENT" >/dev/null 2>&1; then
+            echo "ERROR: host firewall chain $HOST_FILTER_CHAIN exists but is not owned by Arcway" >&2
+            return 1
+        fi
+    else
+        if ! "$HOST_FILTER_TOOL" -w 5 -t filter -N "$HOST_FILTER_CHAIN"; then
+            return 1
+        fi
+        if ! "$HOST_FILTER_TOOL" -w 5 -t filter -A "$HOST_FILTER_CHAIN" -m comment --comment "$HOST_FILTER_COMMENT" -j RETURN; then
+            "$HOST_FILTER_TOOL" -w 5 -t filter -X "$HOST_FILTER_CHAIN" >/dev/null 2>&1 || true
+            return 1
+        fi
+    fi
+    "$HOST_FILTER_TOOL" -w 5 -t filter -F "$HOST_FILTER_CHAIN" || return 1
+    for HOST_PANEL_IP in $ARCWAY_PANEL_IPS; do
+        case "$HOST_PANEL_IP" in
+            *:*) [ "$HOST_FILTER_FAMILY" = "ipv6" ] || continue ;;
+            *) [ "$HOST_FILTER_FAMILY" = "ipv4" ] || continue ;;
+        esac
+        for HOST_MANAGEMENT_PORT in "$ARCWAY_AGENT_PORT" "$ARCWAY_GUARD_PORT"; do
+            "$HOST_FILTER_TOOL" -w 5 -t filter -A "$HOST_FILTER_CHAIN" \
+                -s "$HOST_PANEL_IP" -p tcp --dport "$HOST_MANAGEMENT_PORT" \
+                -m comment --comment "$HOST_FILTER_COMMENT" -j ACCEPT || return 1
+        done
+    done
+    "$HOST_FILTER_TOOL" -w 5 -t filter -A "$HOST_FILTER_CHAIN" -m comment --comment "$HOST_FILTER_COMMENT" -j RETURN || return 1
+    while "$HOST_FILTER_TOOL" -w 5 -t filter -C INPUT -m comment --comment "$HOST_FILTER_COMMENT" -j "$HOST_FILTER_CHAIN" >/dev/null 2>&1; do
+        "$HOST_FILTER_TOOL" -w 5 -t filter -D INPUT -m comment --comment "$HOST_FILTER_COMMENT" -j "$HOST_FILTER_CHAIN" || return 1
+    done
+    "$HOST_FILTER_TOOL" -w 5 -t filter -I INPUT 1 -m comment --comment "$HOST_FILTER_COMMENT" -j "$HOST_FILTER_CHAIN" || return 1
+    "$HOST_FILTER_TOOL" -w 5 -t filter -C INPUT -m comment --comment "$HOST_FILTER_COMMENT" -j "$HOST_FILTER_CHAIN" || return 1
+}
+
+remove_host_filter_chain() {
+    HOST_FILTER_TOOL="$1"
+    HOST_FILTER_NFT_FAMILY="$2"
+    if command -v "$HOST_FILTER_TOOL" >/dev/null 2>&1; then
+        if ! host_filter_tool_ready "$HOST_FILTER_TOOL"; then
+            echo "ERROR: $HOST_FILTER_TOOL is installed but cannot inspect the host INPUT filter" >&2
+            return 1
+        fi
+    else
+        if nft list chain "$HOST_FILTER_NFT_FAMILY" filter "$HOST_FILTER_CHAIN" >/dev/null 2>&1; then
+            echo "ERROR: $HOST_FILTER_TOOL cannot remove the obsolete Arcway host INPUT chain" >&2
+            return 1
+        fi
+        return 0
+    fi
+    if ! "$HOST_FILTER_TOOL" -w 5 -t filter -S "$HOST_FILTER_CHAIN" >/dev/null 2>&1; then
+        return 0
+    fi
+    if ! "$HOST_FILTER_TOOL" -w 5 -t filter -S "$HOST_FILTER_CHAIN" | grep -F -- "--comment $HOST_FILTER_COMMENT" >/dev/null 2>&1; then
+        echo "ERROR: host firewall chain $HOST_FILTER_CHAIN exists but is not owned by Arcway" >&2
+        return 1
+    fi
+    while "$HOST_FILTER_TOOL" -w 5 -t filter -C INPUT -m comment --comment "$HOST_FILTER_COMMENT" -j "$HOST_FILTER_CHAIN" >/dev/null 2>&1; do
+        "$HOST_FILTER_TOOL" -w 5 -t filter -D INPUT -m comment --comment "$HOST_FILTER_COMMENT" -j "$HOST_FILTER_CHAIN" || return 1
+    done
+    "$HOST_FILTER_TOOL" -w 5 -t filter -F "$HOST_FILTER_CHAIN" || return 1
+    "$HOST_FILTER_TOOL" -w 5 -t filter -X "$HOST_FILTER_CHAIN" || return 1
+}
+
+HOST_FILTER_NEEDS_V4=0
+HOST_FILTER_NEEDS_V6=0
+for HOST_PANEL_IP in $ARCWAY_PANEL_IPS; do
+    case "$HOST_PANEL_IP" in
+        *:*) HOST_FILTER_NEEDS_V6=1 ;;
+        *) HOST_FILTER_NEEDS_V4=1 ;;
+    esac
+done
+if [ "$HOST_FILTER_NEEDS_V4" = "1" ]; then
+    if command -v iptables >/dev/null 2>&1; then
+        if ! host_filter_tool_ready iptables; then
+            echo "ERROR: iptables is installed but cannot inspect the host INPUT filter" >&2
+            exit 1
+        fi
+        ensure_host_filter_chain iptables ipv4 || exit 1
+    elif nft list chain ip filter "$HOST_FILTER_CHAIN" >/dev/null 2>&1; then
+        echo "ERROR: iptables cannot manage the existing Arcway IPv4 host INPUT chain" >&2
+        exit 1
+    else
+        echo "WARNING: iptables is unavailable; relying on nft policy and panel readiness for IPv4" >&2
+    fi
+else
+    remove_host_filter_chain iptables ip || exit 1
+fi
+if [ "$HOST_FILTER_NEEDS_V6" = "1" ]; then
+    if command -v ip6tables >/dev/null 2>&1; then
+        if ! host_filter_tool_ready ip6tables; then
+            echo "ERROR: ip6tables is installed but cannot inspect the host INPUT filter" >&2
+            exit 1
+        fi
+        ensure_host_filter_chain ip6tables ipv6 || exit 1
+    elif nft list chain ip6 filter "$HOST_FILTER_CHAIN" >/dev/null 2>&1; then
+        echo "ERROR: ip6tables cannot manage the existing Arcway IPv6 host INPUT chain" >&2
+        exit 1
+    else
+        echo "WARNING: ip6tables is unavailable; relying on nft policy and panel readiness for IPv6" >&2
+    fi
+else
+    remove_host_filter_chain ip6tables ip6 || exit 1
+fi
 EOF
 chmod 0755 /usr/local/sbin/arcway-agent-firewall
 set -a
@@ -2129,7 +2317,8 @@ if [ "$HAS_SYSTEMD" = "1" ]; then
     cat > /etc/systemd/system/mmw-agent.service << EOF
 [Unit]
 Description=MMW Agent Remote Server
-After=network.target
+After=network-online.target ufw.service firewalld.service
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -2148,12 +2337,13 @@ EOF
 Description=Arcway Managed Client Expiry Guard
 After=network-online.target mmw-agent.service
 Wants=network-online.target
+Requires=mmw-agent.service
 
 [Service]
 Type=simple
 EnvironmentFile=/etc/arcway-port-firewall.env
 EnvironmentFile=/etc/arcway-expiry-guard.env
-ExecStartPre=/usr/local/sbin/arcway-agent-firewall
+ExecStartPre=/usr/local/sbin/arcway-agent-firewall --nft-only
 ExecStart=/usr/local/bin/arcway-expiry-guard
 Restart=always
 RestartSec=5
@@ -2205,7 +2395,7 @@ start_pre() {
     . /etc/arcway-expiry-guard.env || return 1
     set +a
 }
-depend() { need net; after mmw-agent; }
+depend() { need net mmw-agent; }
 EOF
     chmod +x /etc/init.d/arcway-expiry-guard
 else
