@@ -164,6 +164,7 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 		"chmod 0600 \"$CURL_AUTH_HEADER_FILE\"",
 		"start_install_renewal",
 		"assert_install_lease",
+		"disabled UFW status is unavailable; auditing its persisted rules directly",
 		"snapshot_quiesced_mutable_state()",
 		"if ! snapshot_quiesced_mutable_state; then",
 		`if [ "$PREPARE_ATTEMPTED" = "1" ] && ! quiesce_remote_installation; then`,
@@ -312,6 +313,201 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("generated firewall helper failed sh -n: %v\n%s", err, output)
 		}
+	}
+}
+
+func TestRemoteInstallRenewalWorkersReapSleepChildren(t *testing.T) {
+	if _, err := os.Stat("/proc/self/task"); err != nil {
+		t.Skip("requires Linux procfs process ancestry")
+	}
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is unavailable")
+	}
+
+	t.Setenv(panelSourceIPsEnv, "203.0.113.10")
+	handler, token := newExpiryGuardAssetHandler(t)
+	request := httptest.NewRequest(http.MethodGet, "https://panel.example/api/remote/install.sh", nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	handler.GetRemoteInstallScript(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	script := response.Body.String()
+	start := strings.Index(script, "INSTALL_RENEW_PID=\"\"")
+	if start < 0 {
+		t.Fatal("generated installer has no renewal worker block")
+	}
+	endOffset := strings.Index(script[start:], "\n# Start the durable panel-side transaction")
+	if endOffset < 0 {
+		t.Fatal("generated installer renewal worker block is unterminated")
+	}
+	workerBlock := script[start : start+endOffset]
+
+	harness := `
+set -Eeuo pipefail
+DOWNLOAD_DIR=$(mktemp -d)
+RENEW_CHILD=""
+HARD_STOP_CHILD=""
+cleanup_test_jobs() {
+    for pid in "${RENEW_CHILD:-}" "${HARD_STOP_CHILD:-}" "${INSTALL_RENEW_PID:-}" "${INSTALL_HARD_STOP_PID:-}"; do
+        [ -z "$pid" ] || kill "$pid" >/dev/null 2>&1 || true
+    done
+    rm -rf "$DOWNLOAD_DIR"
+}
+trap cleanup_test_jobs EXIT
+retry_remote_install_post() { return 0; }
+` + workerBlock + `
+wait_for_worker_child() {
+    local parent_pid="$1" children="" attempt=0
+    while [ "$attempt" -lt 100 ]; do
+        children=$(cat "/proc/$parent_pid/task/$parent_pid/children" 2>/dev/null || true)
+        set -- $children
+        if [ "$#" -gt 0 ]; then
+            printf '%s\n' "$1"
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        sleep 0.01
+    done
+    return 1
+}
+start_install_renewal
+RENEW_CHILD=$(wait_for_worker_child "$INSTALL_RENEW_PID")
+HARD_STOP_CHILD=$(wait_for_worker_child "$INSTALL_HARD_STOP_PID")
+stop_install_renewal
+survivors=0
+for pid in "$RENEW_CHILD" "$HARD_STOP_CHILD"; do
+    if kill -0 "$pid" >/dev/null 2>&1; then
+        survivors=$((survivors + 1))
+    fi
+done
+if [ "$survivors" -ne 0 ]; then
+    echo "renewal workers left $survivors sleep child process(es) behind" >&2
+    exit 1
+fi
+`
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, bash, "-c", harness)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("renewal worker cleanup failed: %v\n%s", err, output)
+	}
+}
+
+func TestRemoteInstallRollbackAcceptsConfirmedInactiveService(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is unavailable")
+	}
+
+	t.Setenv(panelSourceIPsEnv, "203.0.113.10")
+	handler, token := newExpiryGuardAssetHandler(t)
+	request := httptest.NewRequest(http.MethodGet, "https://panel.example/api/remote/install.sh", nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	handler.GetRemoteInstallScript(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	script := response.Body.String()
+	start := strings.Index(script, "restore_systemd_service_state() {")
+	if start < 0 {
+		t.Fatal("generated installer has no systemd restore helper")
+	}
+	endOffset := strings.Index(script[start:], "\nrollback_install() {")
+	if endOffset < 0 {
+		t.Fatal("generated installer systemd restore helper is unterminated")
+	}
+	restoreHelper := script[start : start+endOffset]
+
+	binDir := t.TempDir()
+	fakeSystemctl := `#!/bin/sh
+case "$1" in
+    disable|enable|unmask|start|stop) exit 0 ;;
+    is-enabled) printf '%s\n' disabled; exit 0 ;;
+    is-active) [ "${FAKE_SYSTEMD_ACTIVE:-0}" = 1 ] && exit 0 || exit 3 ;;
+    *) exit 2 ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(binDir, "systemctl"), []byte(fakeSystemctl), 0755); err != nil {
+		t.Fatal(err)
+	}
+	harness := restoreHelper + `
+restore_systemd_service_state mmw-agent disabled 0
+if FAKE_SYSTEMD_ACTIVE=1 restore_systemd_service_state mmw-agent disabled 0; then
+    echo "restore accepted a service that remained active" >&2
+    exit 1
+fi
+`
+	command := exec.Command(bash, "-c", harness)
+	command.Env = append(os.Environ(), "PATH="+binDir+":/usr/bin:/bin")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("systemd rollback state check failed: %v\n%s", err, output)
+	}
+}
+
+func TestRemoteInstallUFWStatusFailureRequiresEnabledPolicy(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is unavailable")
+	}
+
+	t.Setenv(panelSourceIPsEnv, "203.0.113.10")
+	handler, token := newExpiryGuardAssetHandler(t)
+	request := httptest.NewRequest(http.MethodGet, "https://panel.example/api/remote/install.sh", nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	handler.GetRemoteInstallScript(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	script := response.Body.String()
+	start := strings.Index(script, "UFW_ACTIVE=0\nif command -v ufw")
+	if start < 0 {
+		t.Fatal("generated installer has no UFW status gate")
+	}
+	endMarker := "\nif command -v ufw >/dev/null 2>&1; then\n    UFW_PORT_PATTERN=\"\""
+	endOffset := strings.Index(script[start:], endMarker)
+	if endOffset < 0 {
+		t.Fatal("generated installer UFW status gate is unterminated")
+	}
+
+	binDir := t.TempDir()
+	ufwConfig := filepath.Join(t.TempDir(), "ufw.conf")
+	fakeUFW := "#!/bin/sh\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(binDir, "ufw"), []byte(fakeUFW), 0755); err != nil {
+		t.Fatal(err)
+	}
+	detectionBlock := strings.ReplaceAll(script[start:start+endOffset], "/etc/ufw/ufw.conf", shellSingleQuote(ufwConfig))
+	runDetection := func(config string) ([]byte, error) {
+		t.Helper()
+		if err := os.WriteFile(ufwConfig, []byte(config), 0600); err != nil {
+			t.Fatal(err)
+		}
+		command := exec.Command(bash, "-c", detectionBlock+"\nprintf 'active=%s status=%s\\n' \"$UFW_ACTIVE\" \"$UFW_STATUS\"\n")
+		command.Env = append(os.Environ(), "PATH="+binDir+":/usr/bin:/bin")
+		return command.CombinedOutput()
+	}
+
+	disabledOutput, disabledErr := runDetection("ENABLED=no\n")
+	if disabledErr != nil {
+		t.Fatalf("disabled UFW status failure was rejected: %v\n%s", disabledErr, disabledOutput)
+	}
+	if !strings.Contains(string(disabledOutput), "active=0 status=Status: inactive") {
+		t.Fatalf("disabled UFW did not enter audited inactive mode: %s", disabledOutput)
+	}
+
+	enabledOutput, enabledErr := runDetection("ENABLED=yes\n")
+	if enabledErr == nil {
+		t.Fatalf("enabled UFW status failure was accepted: %s", enabledOutput)
+	}
+	if !strings.Contains(string(enabledOutput), "active UFW policy cannot be inspected") {
+		t.Fatalf("enabled UFW failure was not explicit: %s", enabledOutput)
 	}
 }
 

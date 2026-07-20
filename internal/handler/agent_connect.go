@@ -909,23 +909,38 @@ INSTALL_HARD_STOP_PID=""
 INSTALL_MAIN_PID=$$
 INSTALL_RENEW_FAILED_FILE="$DOWNLOAD_DIR/install-renew-failed"
 stop_install_renewal() {
-	if [ -n "$INSTALL_RENEW_PID" ]; then
-		kill "$INSTALL_RENEW_PID" >/dev/null 2>&1 || true
-		wait "$INSTALL_RENEW_PID" 2>/dev/null || true
-		INSTALL_RENEW_PID=""
-	fi
-	if [ -n "$INSTALL_HARD_STOP_PID" ]; then
-		kill "$INSTALL_HARD_STOP_PID" >/dev/null 2>&1 || true
-		wait "$INSTALL_HARD_STOP_PID" 2>/dev/null || true
-		INSTALL_HARD_STOP_PID=""
-	fi
+	local renew_pid="$INSTALL_RENEW_PID" hard_stop_pid="$INSTALL_HARD_STOP_PID"
+	[ -z "$renew_pid" ] || kill "$renew_pid" >/dev/null 2>&1 || true
+	[ -z "$hard_stop_pid" ] || kill "$hard_stop_pid" >/dev/null 2>&1 || true
+	[ -z "$renew_pid" ] || wait "$renew_pid" 2>/dev/null || true
+	[ -z "$hard_stop_pid" ] || wait "$hard_stop_pid" 2>/dev/null || true
+	INSTALL_RENEW_PID=""
+	INSTALL_HARD_STOP_PID=""
 }
 start_install_renewal() {
 	rm -f "$INSTALL_RENEW_FAILED_FILE"
 	(
 		exec 9>&-
+		RENEW_SLEEP_PID=""
+		stop_renew_worker() {
+			trap - TERM INT HUP
+			if [ -n "$RENEW_SLEEP_PID" ]; then
+				kill "$RENEW_SLEEP_PID" >/dev/null 2>&1 || true
+				wait "$RENEW_SLEEP_PID" 2>/dev/null || true
+				RENEW_SLEEP_PID=""
+			fi
+			exit 0
+		}
+		trap stop_renew_worker TERM INT HUP
 		consecutive_failures=0
-		while sleep 60; do
+		while :; do
+			sleep 60 &
+			RENEW_SLEEP_PID=$!
+			if ! wait "$RENEW_SLEEP_PID"; then
+				RENEW_SLEEP_PID=""
+				exit 0
+			fi
+			RENEW_SLEEP_PID=""
 			if retry_remote_install_post "/api/remote/install-renew" 10 0 >/dev/null 2>&1; then
 				consecutive_failures=0
 			else
@@ -943,7 +958,24 @@ start_install_renewal() {
 	# cap, so the EXIT trap can still quiesce and roll back under a live lock.
 	(
 		exec 9>&-
-		sleep 5400
+		HARD_STOP_SLEEP_PID=""
+		stop_hard_stop_worker() {
+			trap - TERM INT HUP
+			if [ -n "$HARD_STOP_SLEEP_PID" ]; then
+				kill "$HARD_STOP_SLEEP_PID" >/dev/null 2>&1 || true
+				wait "$HARD_STOP_SLEEP_PID" 2>/dev/null || true
+				HARD_STOP_SLEEP_PID=""
+			fi
+			exit 0
+		}
+		trap stop_hard_stop_worker TERM INT HUP
+		sleep 5400 &
+		HARD_STOP_SLEEP_PID=$!
+		if ! wait "$HARD_STOP_SLEEP_PID"; then
+			HARD_STOP_SLEEP_PID=""
+			exit 0
+		fi
+		HARD_STOP_SLEEP_PID=""
 		: > "$INSTALL_RENEW_FAILED_FILE"
 		kill -TERM "$INSTALL_MAIN_PID" >/dev/null 2>&1 || true
 	) &
@@ -1442,8 +1474,11 @@ restore_systemd_service_state() {
         systemctl start "$service_name" >/dev/null 2>&1 && systemctl is-active --quiet "$service_name" || return 1
     else
         systemctl stop "$service_name" >/dev/null 2>&1 || true
-        systemctl is-active --quiet "$service_name" && return 1
+		if systemctl is-active --quiet "$service_name"; then
+			return 1
+		fi
     fi
+	return 0
 }
 rollback_install() {
     echo "ERROR: installation failed; restoring the previous Arcway node installation" >&2
@@ -1946,8 +1981,16 @@ done
 UFW_ACTIVE=0
 if command -v ufw >/dev/null 2>&1; then
     if ! UFW_STATUS=$(LC_ALL=C ufw status 2>/dev/null); then
-        echo "ERROR: UFW is installed but its persistent policy cannot be inspected" >&2
-        exit 1
+		if grep -q '^ENABLED=yes' /etc/ufw/ufw.conf 2>/dev/null; then
+			echo "ERROR: active UFW policy cannot be inspected" >&2
+			exit 1
+		fi
+		# A disabled UFW can still have inconsistent stale live chains (for
+		# example IPv4 loaded while IPv6 is absent). The inactive branch below
+		# removes exact persisted Arcway rules and then audits the files, while
+		# the independent nft table remains the authoritative live policy.
+		echo "WARNING: disabled UFW status is unavailable; auditing its persisted rules directly" >&2
+		UFW_STATUS='Status: inactive'
     fi
     if printf '%s\n' "$UFW_STATUS" | grep -q '^Status: active' || grep -q '^ENABLED=yes' /etc/ufw/ufw.conf 2>/dev/null; then
         UFW_ACTIVE=1
