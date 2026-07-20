@@ -23,8 +23,10 @@ func (h *RemoteManageHandler) deployTunnelConfig(ctx context.Context, server *st
 	}
 
 	certName := "_." + rootDomain
+	var selectedCert *storage.Certificate
 	if cert, certErr := h.repo.GetCertificateByDomain(ctx, rootDomain, server.ID); certErr == nil && cert != nil {
 		certName = certDeployFilename(cert.Domain)
+		selectedCert = cert
 	}
 	// 统一渲染:伪装站 location / + 该 server 现有 ws 入站的 location
 	// (reality偷自己 + WSS 共存 —— 下发伪装站时把已有 ws location 一并渲染,避免冲掉)
@@ -35,7 +37,7 @@ func (h *RemoteManageHandler) deployTunnelConfig(ctx context.Context, server *st
 
 	clearPayload, _ := json.Marshal(map[string]int{"port": 443})
 	if _, err := h.forwardToRemoteServer(ctx, server.ID, http.MethodPost, "/api/child/nginx/clear-stream-port", clearPayload); err != nil {
-		log.Printf("[DeployTunnel] clear stream port 443 on server %d: %v (non-fatal)", server.ID, err)
+		return fmt.Errorf("清理 Nginx 443 stream 失败: %w", err)
 	}
 
 	sslPayload, _ := json.Marshal(map[string]any{
@@ -83,27 +85,15 @@ func (h *RemoteManageHandler) deployTunnelConfig(ctx context.Context, server *st
 	}
 	log.Printf("[DeployTunnel] Deployed xray config to server %d (%s)", server.ID, server.Name)
 
-	if h.certHandler != nil {
-		cert, certErr := h.repo.GetCertificateByDomain(ctx, rootDomain, server.ID)
-		if certErr == nil && cert != nil && cert.CertPEM != "" && cert.KeyPEM != "" {
-			payload := WSCertDeployPayload{
-				Domain:   rootDomain,
-				CertPEM:  cert.CertPEM,
-				KeyPEM:   cert.KeyPEM,
-				CertPath: fmt.Sprintf("/usr/local/nginx/cert/%s.pem", certDeployFilename(cert.Domain)),
-				KeyPath:  fmt.Sprintf("/usr/local/nginx/cert/%s.key", certDeployFilename(cert.Domain)),
-				Reload:   "nginx",
-			}
-			h.certHandler.deployToRemoteServer(server, payload)
-			log.Printf("[DeployTunnel] Deployed certificate for %s to server %d", rootDomain, server.ID)
-		} else {
-			h.certHandler.DeployAutoDeployCertificates(server.ID)
-			log.Printf("[DeployTunnel] Triggered auto-deploy certificates for server %d", server.ID)
+	if selectedCert != nil && selectedCert.CertPEM != "" && selectedCert.KeyPEM != "" {
+		if err := h.deployStealCertificateSync(ctx, server, rootDomain, selectedCert); err != nil {
+			return err
 		}
+		log.Printf("[DeployTunnel] Deployed certificate for %s to server %d", rootDomain, server.ID)
 	}
 
 	if err := h.restartXrayWithRecovery(ctx, server.ID, "DeployTunnel"); err != nil {
-		log.Printf("[DeployTunnel] %v", err)
+		return err
 	}
 
 	log.Printf("[DeployTunnel] Completed tunnel config deployment for server %d (%s), domain=%s", server.ID, server.Name, domain)
@@ -113,5 +103,23 @@ func (h *RemoteManageHandler) deployTunnelConfig(ctx context.Context, server *st
 		_ = h.wsHandler.SendConfigUpdate(server.ID, map[string]string{"steal_mode": "tunnel"})
 	}
 
+	return nil
+}
+
+func (h *RemoteManageHandler) deployStealCertificateSync(ctx context.Context, server *storage.RemoteServer, rootDomain string, cert *storage.Certificate) error {
+	payload, err := json.Marshal(WSCertDeployPayload{
+		Domain:   rootDomain,
+		CertPEM:  cert.CertPEM,
+		KeyPEM:   cert.KeyPEM,
+		CertPath: fmt.Sprintf("/usr/local/nginx/cert/%s.pem", certDeployFilename(cert.Domain)),
+		KeyPath:  fmt.Sprintf("/usr/local/nginx/cert/%s.key", certDeployFilename(cert.Domain)),
+		Reload:   "nginx",
+	})
+	if err != nil {
+		return fmt.Errorf("编码证书部署请求失败: %w", err)
+	}
+	if _, err := h.forwardToRemoteServer(ctx, server.ID, http.MethodPost, "/api/child/cert/deploy", payload); err != nil {
+		return fmt.Errorf("同步部署证书失败: %w", err)
+	}
 	return nil
 }

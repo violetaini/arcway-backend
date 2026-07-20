@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -117,15 +118,35 @@ func (h *RemoteManageHandler) preprocessWSSInbound(ctx context.Context, serverID
 // 走 forward GET /api/child/inbounds 拿当前真实端口集(权威,不依赖 cache 的 snapshot)。
 func (h *RemoteManageHandler) allocateWSSPort(ctx context.Context, serverID int64) (int, error) {
 	used := make(map[int]struct{})
-	if result, err := h.forwardToRemoteServer(ctx, serverID, http.MethodGet, "/api/child/inbounds", nil); err == nil {
-		var resp struct {
-			Inbounds []map[string]interface{} `json:"inbounds"`
+	result, err := h.forwardToRemoteServer(ctx, serverID, http.MethodGet, "/api/child/inbounds", nil)
+	if err != nil {
+		return 0, err
+	}
+	var resp struct {
+		Success  *bool                    `json:"success"`
+		Inbounds []map[string]interface{} `json:"inbounds"`
+		Error    string                   `json:"error"`
+		Message  string                   `json:"message"`
+	}
+	if err := json.Unmarshal(result, &resp); err != nil {
+		return 0, fmt.Errorf("解析 inbounds 失败: %w", err)
+	}
+	if resp.Success != nil && !*resp.Success {
+		message := strings.TrimSpace(resp.Error)
+		if message == "" {
+			message = strings.TrimSpace(resp.Message)
 		}
-		if jerr := json.Unmarshal(result, &resp); jerr == nil {
-			for _, ib := range resp.Inbounds {
-				if p, ok := ib["port"].(float64); ok {
-					used[int(p)] = struct{}{}
-				}
+		if message == "" {
+			message = "Agent rejected inbounds query"
+		}
+		return 0, errors.New(message)
+	}
+	for _, ib := range resp.Inbounds {
+		if p, ok := ib["port"].(float64); ok {
+			used[int(p)] = struct{}{}
+		} else if text, ok := ib["port"].(string); ok {
+			if p, parseErr := strconv.Atoi(text); parseErr == nil {
+				used[p] = struct{}{}
 			}
 		}
 	}
@@ -161,8 +182,7 @@ func (h *RemoteManageHandler) SyncWSSNginx(ctx context.Context, serverID int64) 
 	}
 	domain := strings.ToLower(strings.TrimSpace(server.Domain))
 	if domain == "" {
-		log.Printf("[WSS-Nginx] server %d 无域名,跳过 nginx 下发", serverID)
-		return nil
+		return fmt.Errorf("server %d 未配置域名，无法同步 WSS nginx", serverID)
 	}
 	rootDomain := extractRootDomain(domain)
 
@@ -177,8 +197,7 @@ func (h *RemoteManageHandler) SyncWSSNginx(ctx context.Context, serverID int64) 
 		certDomain = c2.Domain
 	}
 	if certDomain == "" {
-		log.Printf("[WSS-Nginx] server %d domain=%s 根域=%s 无可用证书,跳过 nginx 下发", serverID, domain, rootDomain)
-		return nil
+		return fmt.Errorf("server %d domain=%s 根域=%s 无可用证书，无法同步 WSS nginx", serverID, domain, rootDomain)
 	}
 	certName := certDeployFilename(certDomain)
 
@@ -292,20 +311,43 @@ func extractWSSInbounds(inbounds []map[string]interface{}) []wssInboundInfo {
 	return infos
 }
 
-// fetchWSSInbounds 拉 server 当前所有 vless+ws 入站(用于偷自己 server 下发伪装站时聚合 ws location,
-// 避免伪装站下发把已有 ws location 冲掉)。拉失败返回 nil(当作无 ws)。
-func (h *RemoteManageHandler) fetchWSSInbounds(ctx context.Context, serverID int64) []wssInboundInfo {
+// fetchWSSInboundsStrict 拉 server 当前所有 vless+ws 入站。多步写操作必须使用
+// strict 版本：读取失败时若当作“没有 WSS”，会用空 location 覆盖掉现网配置。
+func (h *RemoteManageHandler) fetchWSSInboundsStrict(ctx context.Context, serverID int64) ([]wssInboundInfo, error) {
 	result, err := h.forwardToRemoteServer(ctx, serverID, http.MethodGet, "/api/child/inbounds", nil)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	var resp struct {
+		Success  *bool                    `json:"success"`
 		Inbounds []map[string]interface{} `json:"inbounds"`
+		Error    string                   `json:"error"`
+		Message  string                   `json:"message"`
 	}
-	if json.Unmarshal(result, &resp) != nil {
+	if err := json.Unmarshal(result, &resp); err != nil {
+		return nil, fmt.Errorf("解析 inbounds 失败: %w", err)
+	}
+	if resp.Success != nil && !*resp.Success {
+		message := strings.TrimSpace(resp.Error)
+		if message == "" {
+			message = strings.TrimSpace(resp.Message)
+		}
+		if message == "" {
+			message = "Agent rejected inbounds query"
+		}
+		return nil, fmt.Errorf("Agent 返回 inbounds 失败: %s", message)
+	}
+	return extractWSSInbounds(resp.Inbounds), nil
+}
+
+// fetchWSSInbounds 保留给只读/最佳努力调用方；写操作不应使用它。
+func (h *RemoteManageHandler) fetchWSSInbounds(ctx context.Context, serverID int64) []wssInboundInfo {
+	infos, err := h.fetchWSSInboundsStrict(ctx, serverID)
+	if err != nil {
+		log.Printf("[WSS-Nginx] fetch inbounds for server %d failed: %v", serverID, err)
 		return nil
 	}
-	return extractWSSInbounds(resp.Inbounds)
+	return infos
 }
 
 // stealSelfDomainTplPath 按 steal_mode(tunnel/fallback)+ site_type(static/proxy)选伪装站 domain 模板。

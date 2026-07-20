@@ -8,7 +8,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -262,7 +264,7 @@ func (h *XrayServerHandler) RemoteHeartbeat(w http.ResponseWriter, r *http.Reque
 	// 通过重启检测更新心跳
 	result, err := h.repo.UpdateRemoteServerHeartbeatWithRestart(ctx, update)
 	if err != nil {
-		if err == storage.ErrRemoteServerNotFound {
+		if errors.Is(err, storage.ErrRemoteServerNotFound) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
 			json.NewEncoder(w).Encode(RemoteHeartbeatResponse{
@@ -273,6 +275,11 @@ func (h *XrayServerHandler) RemoteHeartbeat(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
+		if errors.Is(err, storage.ErrRemoteListenPortMismatch) {
+			w.WriteHeader(http.StatusConflict)
+		} else {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
 		json.NewEncoder(w).Encode(RemoteHeartbeatResponse{
 			Success:    false,
 			Message:    fmt.Sprintf("更新心跳失败: %s", err.Error()),
@@ -393,6 +400,32 @@ func (h *XrayServerHandler) RefreshRemoteToken(w http.ResponseWriter, r *http.Re
 		json.NewEncoder(w).Encode(RefreshRemoteTokenResponse{Success: false, Message: "Invalid token"})
 		return
 	}
+	leasedCtx, release, leaseErr := h.repo.AcquireRemoteServerMutationLease(ctx, server.ID)
+	if leaseErr != nil {
+		w.Header().Set("Content-Type", "application/json")
+		if errors.Is(leaseErr, storage.ErrRemoteInstallationActive) {
+			w.Header().Set("Retry-After", "30")
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(RefreshRemoteTokenResponse{
+				Success: false,
+				Message: "Server installation is active; retry after it completes",
+			})
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(RefreshRemoteTokenResponse{Success: false, Message: "Failed to acquire server mutation lease"})
+		return
+	}
+	defer release()
+	ctx = leasedCtx
+	// The token may have changed while this request waited for an installation.
+	server, lookupErr = h.repo.GetRemoteServerByToken(ctx, token)
+	if lookupErr != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(RefreshRemoteTokenResponse{Success: false, Message: "Invalid token"})
+		return
+	}
 	newToken, expiresAt, err := h.repo.RefreshRemoteServerToken(ctx, token)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -453,6 +486,80 @@ func (h *XrayServerHandler) masterPublicKeyBase64() string {
 	return ""
 }
 
+const panelSourceIPsEnv = "ARCWAY_PANEL_IPS"
+
+func normalizePanelSourceIPs(raw string) ([]string, error) {
+	fields := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\r' || r == '\n'
+	})
+	seen := make(map[string]struct{}, len(fields))
+	result := make([]string, 0, len(fields))
+	for _, field := range fields {
+		ip := net.ParseIP(strings.TrimSpace(field))
+		if ip == nil {
+			return nil, fmt.Errorf("invalid panel source IP %q", field)
+		}
+		normalized := ip.String()
+		if _, exists := seen[normalized]; exists {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		result = append(result, normalized)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		leftV4 := net.ParseIP(result[i]).To4() != nil
+		rightV4 := net.ParseIP(result[j]).To4() != nil
+		if leftV4 != rightV4 {
+			return leftV4
+		}
+		return result[i] < result[j]
+	})
+	return result, nil
+}
+
+// configuredPanelSourceIPs returns the addresses remote servers will see when
+// the panel connects to their management ports. NAT deployments must set the
+// environment variable explicitly; direct public hosts can be detected safely.
+func configuredPanelSourceIPs() ([]string, error) {
+	if configured := strings.TrimSpace(os.Getenv(panelSourceIPsEnv)); configured != "" {
+		addresses, err := normalizePanelSourceIPs(configured)
+		if err != nil {
+			return nil, err
+		}
+		if len(addresses) == 0 {
+			return nil, errors.New("panel source IP list is empty")
+		}
+		return addresses, nil
+	}
+
+	interfaceAddresses, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil, fmt.Errorf("list panel interfaces: %w", err)
+	}
+	detected := make([]string, 0, len(interfaceAddresses))
+	for _, address := range interfaceAddresses {
+		ipText := address.String()
+		if host, _, splitErr := net.SplitHostPort(ipText); splitErr == nil {
+			ipText = host
+		} else if ip, _, cidrErr := net.ParseCIDR(ipText); cidrErr == nil {
+			ipText = ip.String()
+		}
+		ip := net.ParseIP(strings.TrimSpace(ipText))
+		if ip == nil || !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() {
+			continue
+		}
+		detected = append(detected, ip.String())
+	}
+	detected, err = normalizePanelSourceIPs(strings.Join(detected, " "))
+	if err != nil {
+		return nil, err
+	}
+	if len(detected) == 0 {
+		return nil, fmt.Errorf("no public panel address detected; set %s to the panel egress IPs", panelSourceIPsEnv)
+	}
+	return detected, nil
+}
+
 // 返回远程服务器的安装脚本
 func (h *XrayServerHandler) GetRemoteInstallScript(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
@@ -469,77 +576,107 @@ func (h *XrayServerHandler) GetRemoteInstallScript(w http.ResponseWriter, r *htt
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
-	token := strings.TrimSpace(strings.TrimPrefix(authorization, "Bearer "))
-	server, err := h.repo.GetRemoteServerByToken(r.Context(), token)
-	if err != nil || (server.TokenExpiresAt != nil && !server.TokenExpiresAt.After(time.Now())) {
+	presentedCredential := strings.TrimSpace(strings.TrimPrefix(authorization, "Bearer "))
+	var server *storage.RemoteServer
+	var err error
+	if strings.HasPrefix(presentedCredential, remoteInstallTicketPrefix) {
+		server, err = h.repo.ConsumeRemoteServerInstallTicket(r.Context(), presentedCredential, time.Now())
+	} else {
+		// Backward compatibility for already-issued commands. Newly generated
+		// commands always use a five-minute, single-consumption ticket.
+		server, err = h.repo.GetRemoteServerByToken(r.Context(), presentedCredential)
+	}
+	if err != nil || server == nil || (server.TokenExpiresAt != nil && !server.TokenExpiresAt.After(time.Now())) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
+	token := server.Token
 	guardSecret, err := h.repo.GetOrCreateRemoteServerGuardSecret(r.Context(), server.ID)
 	if err != nil {
 		http.Error(w, "Unable to initialize expiry guard", http.StatusInternalServerError)
 		return
 	}
-	stealSelf := r.URL.Query().Get("steal_self") == "1"
-	xrayMode := r.URL.Query().Get("xray_mode")
+	guardSHA256AMD64, err := expiryGuardAssetSHA256("arcway-expiry-guard-linux-amd64")
+	if err != nil {
+		http.Error(w, "Expiry guard release asset is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	guardSHA256ARM64, err := expiryGuardAssetSHA256("arcway-expiry-guard-linux-arm64")
+	if err != nil {
+		http.Error(w, "Expiry guard release asset is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	panelSourceIPs, err := configuredPanelSourceIPs()
+	if err != nil {
+		http.Error(w, "Panel source IPs are not configured", http.StatusServiceUnavailable)
+		return
+	}
+	stealSelf := server.StealSelf
+	stealMode := "default"
+	if stealSelf && (server.StealMode == "tunnel" || server.StealMode == "fallback") {
+		stealMode = server.StealMode
+	}
+	xrayMode := server.XrayMode
 	if xrayMode != "embedded" {
 		xrayMode = "external"
 	}
-	// 自定义 Agent 监听端口(由主控创建服务器时透传过来),非法/缺省值用 agent 内置默认 23889
-	listenPortParam := strings.TrimSpace(r.URL.Query().Get("listen_port"))
-	if p, perr := strconv.Atoi(listenPortParam); perr != nil || p < 1024 || p > 65535 {
-		listenPortParam = ""
+	agentConnectionMode := server.ConnectionMode
+	switch agentConnectionMode {
+	case storage.ConnectionModePush:
+		agentConnectionMode = "http"
+	case storage.ConnectionModeWebSocket:
+		agentConnectionMode = "websocket"
+	default:
+		http.Error(w, "Pull-mode servers do not use the remote installer", http.StatusConflict)
+		return
 	}
-	frontService := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("front_service")))
-	if frontService != "xray" && frontService != "nginx" {
-		frontService = "xray"
+	// The authenticated server record is the sole source of installation policy.
+	// Query parameters are deliberately ignored so a leaked node token cannot
+	// authorize port takeover or drift the protected management port.
+	listenPort := server.ListenPort
+	if listenPort == 0 {
+		listenPort = 23889
 	}
-	// nginx 前置暂未支持，先固定为 xray
-	if frontService == "nginx" {
-		frontService = "xray"
+	if !storage.IsValidRemoteManagementListenPort(listenPort) || listenPort == 0 {
+		http.Error(w, "Remote management port is invalid", http.StatusConflict)
+		return
 	}
-
+	listenPortParam := strconv.Itoa(listenPort)
 	// 计算 install 脚本里写入的 SERVER:
 	// 优先用系统设置 master_url 里的 host(用户配置的对外可达域名),
 	// 这是 agent 真正访问主控的地址。仅在 master_url 未配置时回退到 r.Host(可能是 nginx upstream 名,如 miaomiaowu_web,不可对外访问)。
 	// 若 master_url 已显式配置,EXPLICIT_MASTER=1 在脚本里禁用"同机部署"自动覆盖
 	// (避免在主控本机上安装 agent 时把 master_url 改写成 127.0.0.1)。
-	scriptServer := strings.TrimSpace(r.Host)
-	// nginx 默认 `proxy_set_header Host $host` 不带端口,导致 cf:8443 → nginx → mmwx 时 r.Host 只有域名,
-	// agent 安装命令缺端口连不上主控。这里如果检测到 X-Forwarded-Host(带端口最优)或 X-Forwarded-Port
-	// 且端口不是 80/443,主动把 :port 拼回去,方便用户不需要必须先去配 master_url 就能拿到正确安装命令。
-	if !strings.Contains(scriptServer, ":") {
-		if xfh := strings.TrimSpace(r.Header.Get("X-Forwarded-Host")); xfh != "" && strings.Contains(xfh, ":") {
-			scriptServer = xfh
-		} else if xfp := strings.TrimSpace(r.Header.Get("X-Forwarded-Port")); xfp != "" && xfp != "80" && xfp != "443" {
-			scriptServer = scriptServer + ":" + xfp
-		}
+	normalizedIngress, hasExplicitMaster, normalizeErr := h.effectiveRemoteInstallMasterURL(r.Context(), r)
+	if normalizeErr != nil {
+		http.Error(w, "Configured master URL is invalid", http.StatusServiceUnavailable)
+		return
 	}
-	scriptProtocol := ""
-	// nginx 反代下大概率有 X-Forwarded-Proto,带这个就别走脚本里 "host 有 : 就当 http" 的启发,直接显式 https
-	if xfproto := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); xfproto == "https" || xfproto == "http" {
-		scriptProtocol = xfproto
+	parsedIngress, parseErr := url.Parse(normalizedIngress)
+	if parseErr != nil || parsedIngress.Host == "" {
+		http.Error(w, "Request host is invalid", http.StatusBadRequest)
+		return
 	}
+	scriptServer := parsedIngress.Host
+	scriptProtocol := parsedIngress.Scheme
 	explicitMaster := "0"
-	if mu, err := h.repo.GetSystemSetting(r.Context(), "master_url"); err == nil {
-		mu = strings.TrimSpace(mu)
-		if mu != "" {
-			explicitMaster = "1"
-			s := strings.TrimRight(mu, "/")
-			if strings.HasPrefix(s, "https://") {
-				scriptProtocol = "https"
-				s = strings.TrimPrefix(s, "https://")
-			} else if strings.HasPrefix(s, "http://") {
-				scriptProtocol = "http"
-				s = strings.TrimPrefix(s, "http://")
-			}
-			if i := strings.Index(s, "/"); i >= 0 {
-				s = s[:i]
-			}
-			if s != "" {
-				scriptServer = s
-			}
-		}
+	if hasExplicitMaster {
+		explicitMaster = "1"
+	}
+	policyContext := storage.RemoteInstallationPolicyContext{
+		PanelSourceIPs:  panelSourceIPs,
+		MasterURL:       normalizedIngress,
+		MasterPublicKey: h.masterPublicKeyBase64(),
+	}
+	policyFingerprint, err := storage.RemoteServerInstallationPolicyFingerprintWithContext(server, policyContext)
+	if err != nil {
+		http.Error(w, "Remote installation policy is invalid", http.StatusConflict)
+		return
+	}
+	installationNonce, err := generateSecureToken()
+	if err != nil {
+		http.Error(w, "Unable to initialize installation transaction", http.StatusInternalServerError)
+		return
 	}
 
 	// 返回安装脚本内容
@@ -550,23 +687,53 @@ func (h *XrayServerHandler) GetRemoteInstallScript(w http.ResponseWriter, r *htt
 set -e
 umask 077
 
+if [ "$(id -u)" -ne 0 ]; then
+    echo "ERROR: run this installer as root" >&2
+    exit 1
+fi
+
+if ! command -v flock >/dev/null 2>&1; then
+    echo "ERROR: install util-linux/flock before retrying; no system files were changed" >&2
+    exit 1
+fi
+exec 9>/run/arcway-node-install.lock
+if ! flock -n 9; then
+    echo "ERROR: another Arcway node installation is already running" >&2
+    exit 1
+fi
+
 DOWNLOAD_DIR=$(mktemp -d /tmp/arcway-install.XXXXXX)
 chmod 0700 "$DOWNLOAD_DIR"
-trap 'rm -rf "$DOWNLOAD_DIR"' EXIT HUP INT TERM
+trap 'rm -rf "$DOWNLOAD_DIR"' EXIT
+trap 'exit 130' HUP INT TERM
 AGENT_DOWNLOAD="$DOWNLOAD_DIR/mmw-agent"
 GUARD_DOWNLOAD="$DOWNLOAD_DIR/arcway-expiry-guard"
+CURL_AUTH_HEADER_FILE="$DOWNLOAD_DIR/curl-auth.header"
+CURL_INSTALL_NONCE_HEADER_FILE="$DOWNLOAD_DIR/curl-install-nonce.header"
+CURL_INSTALL_POLICY_HEADER_FILE="$DOWNLOAD_DIR/curl-install-policy.header"
 
-TOKEN="` + token + `"
-GUARD_SECRET="` + guardSecret + `"
-SERVER="` + scriptServer + `"
-SCRIPT_PROTOCOL="` + scriptProtocol + `"
-EXPLICIT_MASTER="` + explicitMaster + `"
-AUTO_STEAL_SELF="` + map[bool]string{true: "1", false: "0"}[stealSelf] + `"
-FRONT_SERVICE="` + frontService + `"
-XRAY_MODE="` + xrayMode + `"
-MASTER_PUBLIC_KEY="` + h.masterPublicKeyBase64() + `"
-MASTER_PORT="` + h.getMasterPort() + `"
-LISTEN_PORT="` + listenPortParam + `"
+TOKEN=` + shellSingleQuote(token) + `
+INSTALL_NONCE=` + shellSingleQuote(installationNonce) + `
+INSTALL_POLICY_SHA256=` + shellSingleQuote(policyFingerprint) + `
+GUARD_SECRET=` + shellSingleQuote(guardSecret) + `
+SERVER=` + shellSingleQuote(scriptServer) + `
+SCRIPT_PROTOCOL=` + shellSingleQuote(scriptProtocol) + `
+EXPLICIT_MASTER=` + shellSingleQuote(explicitMaster) + `
+AUTO_STEAL_SELF=` + shellSingleQuote(map[bool]string{true: "1", false: "0"}[stealSelf]) + `
+STEAL_MODE=` + shellSingleQuote(stealMode) + `
+XRAY_MODE=` + shellSingleQuote(xrayMode) + `
+CONNECTION_MODE=` + shellSingleQuote(agentConnectionMode) + `
+MASTER_PUBLIC_KEY=` + shellSingleQuote(h.masterPublicKeyBase64()) + `
+MASTER_PORT=` + shellSingleQuote(h.getMasterPort()) + `
+LISTEN_PORT=` + shellSingleQuote(listenPortParam) + `
+PANEL_SOURCE_IPS=` + shellSingleQuote(strings.Join(panelSourceIPs, " ")) + `
+
+# Keep the long-lived node token out of curl argv (/proc/*/cmdline). curl reads
+# these root-only files directly; the enclosing 0700 directory is deleted on exit.
+printf 'Authorization: Bearer %s\n' "$TOKEN" > "$CURL_AUTH_HEADER_FILE"
+printf 'X-Arcway-Install-Nonce: %s\n' "$INSTALL_NONCE" > "$CURL_INSTALL_NONCE_HEADER_FILE"
+printf 'X-Arcway-Install-Policy-SHA256: %s\n' "$INSTALL_POLICY_SHA256" > "$CURL_INSTALL_POLICY_HEADER_FILE"
+chmod 0600 "$CURL_AUTH_HEADER_FILE" "$CURL_INSTALL_NONCE_HEADER_FILE" "$CURL_INSTALL_POLICY_HEADER_FILE"
 
 # 协议:优先用主控注入的 SCRIPT_PROTOCOL(来自系统设置 master_url 的 scheme),
 # 否则按 SERVER 是否带端口启发判断(开发场景常见 http)。
@@ -578,19 +745,17 @@ else
     PROTOCOL="https"
 fi
 
-# 允许通过环境变量强制覆盖协议
-if [ -n "$MMWX_PROTOCOL" ]; then
-    PROTOCOL="$MMWX_PROTOCOL"
+if [ "$PROTOCOL" = "http" ]; then
+    case "$SERVER" in
+        localhost|localhost:*|127.0.0.1|127.0.0.1:*|\[::1\]|\[::1\]:*) ;;
+        *)
+            echo "ERROR: plaintext master transport is allowed only on loopback; configure an HTTPS master_url" >&2
+            exit 1
+            ;;
+    esac
 fi
 
 MASTER_URL="${PROTOCOL}://${SERVER}"
-
-# 同机部署检测:只有在主控"没有显式配置 master_url"时才允许把 master_url 自动改成 127.0.0.1;
-# 用户配置了对外域名(EXPLICIT_MASTER=1)就必须用用户的域名,不让自动改写。
-if [ "$EXPLICIT_MASTER" != "1" ] && curl -sf "http://127.0.0.1:${MASTER_PORT}/api/setup/status" >/dev/null 2>&1; then
-    MASTER_URL="http://127.0.0.1:${MASTER_PORT}"
-    echo "Detected same-machine deployment, using ${MASTER_URL}"
-fi
 
 echo "=========================================="
 echo "  MMWX Remote Server Installation"
@@ -600,9 +765,7 @@ echo "Master Server: $MASTER_URL"
 echo ""
 
 # 检测 init 系统:OpenRC(Alpine 首选)/ systemd(主流)/ 兜底用 nohup + rc.local。
-# - Alpine 优先用 OpenRC:Alpine 主流就是 OpenRC,即便镜像里塞了 systemd 也不用它
-# - Alpine 极简镜像/LXC 可能没装 openrc 包 → 自动 apk add 装上,再走 OpenRC 路径
-# - 大部分 LXC 容器没有 systemd,老脚本直接 systemctl 失败"systemctl: command not found"
+# 安装器不会在事务外安装 init 包；极简系统直接使用兜底 supervisor。
 HAS_SYSTEMD=0
 HAS_OPENRC=0
 IS_ALPINE=0
@@ -610,13 +773,6 @@ if [ -f /etc/alpine-release ]; then
     IS_ALPINE=1
 elif [ -f /etc/os-release ] && grep -qE '^ID=alpine' /etc/os-release 2>/dev/null; then
     IS_ALPINE=1
-fi
-# Alpine 上 openrc 缺失就尝试自动装,失败不致命(下面还有 nohup 兜底)
-if [ "$IS_ALPINE" = "1" ] && ! command -v rc-service >/dev/null 2>&1; then
-    echo "[Init] Alpine detected without OpenRC, installing openrc..."
-    if command -v apk >/dev/null 2>&1; then
-        apk add --no-cache openrc 2>/dev/null || echo "[Init] apk add openrc failed, will fall back to nohup"
-    fi
 fi
 # Alpine 优先 OpenRC;非 Alpine 仍然先看 systemd(主流发行版默认)
 if [ "$IS_ALPINE" = "1" ]; then
@@ -628,30 +784,938 @@ fi
 if [ "$HAS_SYSTEMD" = "0" ] && [ "$HAS_OPENRC" = "0" ] && command -v rc-service >/dev/null 2>&1; then
     HAS_OPENRC=1
 fi
-echo "Init system: $([ "$HAS_OPENRC" = 1 ] && echo openrc || ([ "$HAS_SYSTEMD" = 1 ] && echo systemd || echo none))$([ "$IS_ALPINE" = 1 ] && echo " (Alpine)")"
+INIT_NAME="none"
+if [ "$HAS_OPENRC" = "1" ]; then
+    INIT_NAME="openrc"
+elif [ "$HAS_SYSTEMD" = "1" ]; then
+    INIT_NAME="systemd"
+fi
+if [ "$IS_ALPINE" = "1" ]; then
+    INIT_NAME="${INIT_NAME} (Alpine)"
+fi
+echo "Init system: $INIT_NAME"
 
-# Step 1: Stop existing service if running
-echo "[1/6] Stopping existing service (if any)..."
+# All network downloads and integrity checks complete before the running node is touched.
+echo "[1/7] Downloading and verifying release assets..."
+ARCH=$(uname -m)
+case $ARCH in
+    x86_64)
+        ARCH_NAME="amd64"
+        AGENT_SHA256="6ce2faac96f82a501ab86b1817c332bf05239ba10e36b5be0dd11995a5a1bf2f"
+        GUARD_SHA256=` + shellSingleQuote(guardSHA256AMD64) + `
+        ;;
+    aarch64|arm64)
+        ARCH_NAME="arm64"
+        AGENT_SHA256="04ba897947923592846d3e57282d5ac80c213892b125c1575a8664abb770168f"
+        GUARD_SHA256=` + shellSingleQuote(guardSHA256ARM64) + `
+        ;;
+    *)
+        echo "Unsupported architecture: $ARCH" >&2
+        exit 1
+        ;;
+esac
+
+AGENT_VERSION="v0.3.7"
+AGENT_URL="https://github.com/iluobei/mmw-agent/releases/download/${AGENT_VERSION}/mmw-agent-linux-${ARCH_NAME}"
+if ! command -v curl >/dev/null 2>&1; then
+    echo "ERROR: install curl before retrying; no system packages were changed" >&2
+    exit 1
+fi
+
+echo "Downloading verified mmw-agent ${AGENT_VERSION} from GitHub..."
+curl -fsSL --connect-timeout 10 --max-time 180 -o "$AGENT_DOWNLOAD" "$AGENT_URL" || {
+    echo "ERROR: 无法从 GitHub 下载 mmw-agent" >&2
+    exit 1
+}
+if [ "$(sha256sum "$AGENT_DOWNLOAD" | awk '{ print $1 }')" != "$AGENT_SHA256" ]; then
+    echo "ERROR: mmw-agent SHA-256 校验失败,安装中止" >&2
+    exit 1
+fi
+
+GUARD_URL="${MASTER_URL}/api/remote/expiry-guard?arch=${ARCH_NAME}"
+echo "Downloading Arcway expiry guard from master..."
+if ! curl -fsSL --connect-timeout 10 --max-time 180 \
+	-H @"$CURL_AUTH_HEADER_FILE" \
+	-o "$GUARD_DOWNLOAD" "$GUARD_URL"; then
+    echo "ERROR: 无法从主控下载 expiry guard" >&2
+    exit 1
+fi
+
+validate_elf() {
+    [ -s "$1" ] || return 1
+    [ "$(od -An -tx1 -N4 "$1" 2>/dev/null | tr -d ' \n')" = "7f454c46" ]
+}
+if ! validate_elf "$AGENT_DOWNLOAD" || ! validate_elf "$GUARD_DOWNLOAD"; then
+    echo "ERROR: 下载结果不是有效 ELF 可执行文件,安装中止" >&2
+    exit 1
+fi
+if [ "$(sha256sum "$GUARD_DOWNLOAD" | awk '{ print $1 }')" != "$GUARD_SHA256" ]; then
+    echo "ERROR: expiry guard SHA-256 verification failed; installation aborted" >&2
+    exit 1
+fi
+
+# System prerequisites are verified before the rollback transaction. The node
+# installer never mutates the package database, so a failed install cannot leave
+# unrelated dependency packages behind.
+firewall_stack_ready() {
+    command -v nft >/dev/null 2>&1 && nft list ruleset >/dev/null 2>&1
+}
+if ! firewall_stack_ready; then
+    echo "ERROR: install and enable nftables before retrying; no system packages were changed" >&2
+    exit 1
+fi
+if [ -z "$PANEL_SOURCE_IPS" ]; then
+    echo "ERROR: trusted panel source IPs are empty; configure ARCWAY_PANEL_IPS on the panel" >&2
+    exit 1
+fi
+for PANEL_SOURCE_IP in $PANEL_SOURCE_IPS; do
+    case "$PANEL_SOURCE_IP" in
+        ''|*[!0-9A-Fa-f:.]*)
+            echo "ERROR: invalid trusted panel source IP: $PANEL_SOURCE_IP" >&2
+            exit 1
+            ;;
+    esac
+done
+
+retry_remote_install_post() {
+    local callback_path="$1" max_time="$2" include_policy="$3"
+    local attempt=1 delay=1 max_attempts=5
+    while [ "$attempt" -le "$max_attempts" ]; do
+		if [ "$include_policy" = "1" ]; then
+			if curl -fsS --connect-timeout 5 --max-time "$max_time" -X POST \
+				-H @"$CURL_AUTH_HEADER_FILE" \
+				-H @"$CURL_INSTALL_NONCE_HEADER_FILE" \
+				-H @"$CURL_INSTALL_POLICY_HEADER_FILE" \
+				"${MASTER_URL}${callback_path}" >/dev/null; then
+				return 0
+			fi
+		elif curl -fsS --connect-timeout 5 --max-time "$max_time" -X POST \
+			-H @"$CURL_AUTH_HEADER_FILE" \
+			-H @"$CURL_INSTALL_NONCE_HEADER_FILE" \
+			"${MASTER_URL}${callback_path}" >/dev/null; then
+            return 0
+        fi
+        if [ "$attempt" -lt "$max_attempts" ]; then
+            sleep "$delay"
+            if [ "$delay" -lt 8 ]; then delay=$((delay * 2)); fi
+        fi
+        attempt=$((attempt + 1))
+    done
+	return 1
+}
+
+INSTALL_RENEW_PID=""
+INSTALL_HARD_STOP_PID=""
+INSTALL_MAIN_PID=$$
+INSTALL_RENEW_FAILED_FILE="$DOWNLOAD_DIR/install-renew-failed"
+stop_install_renewal() {
+	if [ -n "$INSTALL_RENEW_PID" ]; then
+		kill "$INSTALL_RENEW_PID" >/dev/null 2>&1 || true
+		wait "$INSTALL_RENEW_PID" 2>/dev/null || true
+		INSTALL_RENEW_PID=""
+	fi
+	if [ -n "$INSTALL_HARD_STOP_PID" ]; then
+		kill "$INSTALL_HARD_STOP_PID" >/dev/null 2>&1 || true
+		wait "$INSTALL_HARD_STOP_PID" 2>/dev/null || true
+		INSTALL_HARD_STOP_PID=""
+	fi
+}
+start_install_renewal() {
+	rm -f "$INSTALL_RENEW_FAILED_FILE"
+	(
+		exec 9>&-
+		consecutive_failures=0
+		while sleep 60; do
+			if retry_remote_install_post "/api/remote/install-renew" 10 0 >/dev/null 2>&1; then
+				consecutive_failures=0
+			else
+				consecutive_failures=$((consecutive_failures + 1))
+				if [ "$consecutive_failures" -ge 3 ]; then
+					: > "$INSTALL_RENEW_FAILED_FILE"
+					kill -TERM "$INSTALL_MAIN_PID" >/dev/null 2>&1 || true
+					exit 1
+				fi
+			fi
+		done
+	) &
+	INSTALL_RENEW_PID=$!
+	# Stop with one full lease window left before the server's absolute two-hour
+	# cap, so the EXIT trap can still quiesce and roll back under a live lock.
+	(
+		exec 9>&-
+		sleep 5400
+		: > "$INSTALL_RENEW_FAILED_FILE"
+		kill -TERM "$INSTALL_MAIN_PID" >/dev/null 2>&1 || true
+	) &
+	INSTALL_HARD_STOP_PID=$!
+}
+assert_install_lease() {
+	if [ -z "$INSTALL_RENEW_PID" ] || [ -e "$INSTALL_RENEW_FAILED_FILE" ] || ! kill -0 "$INSTALL_RENEW_PID" >/dev/null 2>&1; then
+		echo "ERROR: installation lease renewal stopped; refusing further changes" >&2
+		return 1
+	fi
+	if ! retry_remote_install_post "/api/remote/install-renew" 10 0 >/dev/null 2>&1; then
+		: > "$INSTALL_RENEW_FAILED_FILE"
+		echo "ERROR: installation lease could not be renewed; refusing further changes" >&2
+		return 1
+	fi
+}
+
+# Start the durable panel-side transaction only after all downloads and basic
+# host prerequisites pass. From this point, automatic panel writes are blocked
+# until this exact one-time nonce commits or aborts the installation.
+SERVER_LOCK_ATTEMPTED=0
+SERVER_LOCK_STARTED=0
+abort_remote_installation() {
+	[ "$SERVER_LOCK_ATTEMPTED" = "1" ] || return 0
+	stop_install_renewal
+	if ! retry_remote_install_post "/api/remote/install-abort" 10 0 >/dev/null 2>&1; then
+        echo "WARNING: panel installation lock could not be aborted; it will expire automatically" >&2
+		return 1
+    fi
+    SERVER_LOCK_ATTEMPTED=0
+	SERVER_LOCK_STARTED=0
+}
+quiesce_remote_installation() {
+	[ "$SERVER_LOCK_STARTED" = "1" ] || return 1
+	retry_remote_install_post "/api/remote/install-quiesce" 120 0
+}
+early_install_finish() {
+    local install_status=$?
+    trap - EXIT
+    trap '' HUP INT TERM
+    if [ "$install_status" -ne 0 ]; then
+		if ! abort_remote_installation; then
+			echo "WARNING: the panel lock remains active and will expire automatically" >&2
+		fi
+    fi
+    rm -rf "$DOWNLOAD_DIR"
+    exit "$install_status"
+}
+SERVER_LOCK_ATTEMPTED=1
+trap early_install_finish EXIT
+trap 'exit 130' HUP INT TERM
+if ! retry_remote_install_post "/api/remote/install-begin" 10 1; then
+    echo "ERROR: the panel refused the installation transaction; another install may be active" >&2
+    exit 1
+fi
+SERVER_LOCK_STARTED=1
+start_install_renewal
+
+XRAY_BIN=""
+if [ "$XRAY_MODE" != "embedded" ]; then
+    for CANDIDATE in "$(command -v xray 2>/dev/null || true)" /usr/local/bin/xray /usr/bin/xray /opt/xray/xray; do
+        if [ -n "$CANDIDATE" ] && [ -x "$CANDIDATE" ]; then XRAY_BIN="$CANDIDATE"; break; fi
+    done
+    if [ -z "$XRAY_BIN" ] || ! "$XRAY_BIN" version >/dev/null 2>&1; then
+        echo "ERROR: external Xray mode requires a working Xray installation; install Xray before retrying" >&2
+        exit 1
+    fi
+fi
+
+NGINX_BIN=""
+if [ "$AUTO_STEAL_SELF" = "1" ]; then
+    for CANDIDATE in "$(command -v nginx 2>/dev/null || true)" /usr/local/nginx/sbin/nginx /usr/sbin/nginx; do
+        if [ -n "$CANDIDATE" ] && [ -x "$CANDIDATE" ]; then NGINX_BIN="$CANDIDATE"; break; fi
+    done
+    if [ -z "$NGINX_BIN" ] || ! "$NGINX_BIN" -t >/dev/null 2>&1; then
+        echo "ERROR: takeover mode requires a working Nginx installation and valid configuration" >&2
+        exit 1
+    fi
+fi
+
+# The Agent can migrate Xray configuration and change Xray/Nginx service state
+# during startup. Capture the complete data-plane surface before installing it.
+XRAY_UNIT_PRESENT=0
+NGINX_UNIT_PRESENT=0
+OLD_XRAY_ACTIVE=0
+OLD_NGINX_ACTIVE=0
+OLD_XRAY_ENABLE_STATE=""
+OLD_NGINX_ENABLE_STATE=""
+if [ "$HAS_SYSTEMD" = "1" ]; then
+    if systemctl cat xray >/dev/null 2>&1; then
+        XRAY_UNIT_PRESENT=1
+        OLD_XRAY_ENABLE_STATE=$(systemctl is-enabled xray 2>/dev/null || true)
+        systemctl is-active --quiet xray && OLD_XRAY_ACTIVE=1 || true
+    fi
+    if systemctl cat nginx >/dev/null 2>&1; then
+        NGINX_UNIT_PRESENT=1
+        OLD_NGINX_ENABLE_STATE=$(systemctl is-enabled nginx 2>/dev/null || true)
+        systemctl is-active --quiet nginx && OLD_NGINX_ACTIVE=1 || true
+    fi
+fi
+reversible_systemd_enable_state() {
+    case "$1" in
+        enabled|enabled-runtime|disabled|static) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+if [ "$XRAY_UNIT_PRESENT" = "1" ] && ! reversible_systemd_enable_state "$OLD_XRAY_ENABLE_STATE"; then
+    echo "ERROR: xray.service has unsupported enable state '$OLD_XRAY_ENABLE_STATE'; normalize it before installing" >&2
+    exit 1
+fi
+if [ "$NGINX_UNIT_PRESENT" = "1" ] && ! reversible_systemd_enable_state "$OLD_NGINX_ENABLE_STATE"; then
+    echo "ERROR: nginx.service has unsupported enable state '$OLD_NGINX_ENABLE_STATE'; normalize it before installing" >&2
+    exit 1
+fi
+if [ "$XRAY_MODE" != "embedded" ] && { [ "$XRAY_UNIT_PRESENT" != "1" ] || [ "$OLD_XRAY_ACTIVE" != "1" ]; }; then
+    echo "ERROR: external Xray mode requires an active systemd xray service so installation can be rolled back safely" >&2
+    exit 1
+fi
+if [ "$AUTO_STEAL_SELF" = "1" ] && { [ "$NGINX_UNIT_PRESENT" != "1" ] || [ "$OLD_NGINX_ACTIVE" != "1" ]; }; then
+    echo "ERROR: takeover mode requires an active systemd nginx service so installation can be rolled back safely" >&2
+    exit 1
+fi
+if pgrep -x xray >/dev/null 2>&1 && [ "$XRAY_UNIT_PRESENT" != "1" ]; then
+    echo "ERROR: an unmanaged Xray process is running; register it as xray.service before installing Arcway" >&2
+    exit 1
+fi
+
+XRAY_DISCOVERED_PATHS=()
+record_xray_directory() {
+    local candidate="$1"
+    [ -n "$candidate" ] || return 0
+    case "$candidate" in
+        /*) ;;
+        *) echo "ERROR: Xray uses a non-absolute configuration path: $candidate" >&2; return 1 ;;
+    esac
+    candidate=$(readlink -m -- "$candidate") || return 1
+    case "$candidate" in
+        /|/etc|/usr|/usr/local|/usr/local/etc|/var|/opt|/root|/home)
+            echo "ERROR: Xray configuration path is too broad to snapshot safely: $candidate" >&2
+            return 1
+            ;;
+    esac
+    for existing in "${XRAY_DISCOVERED_PATHS[@]}"; do
+        [ "$existing" = "$candidate" ] && return 0
+    done
+    XRAY_DISCOVERED_PATHS+=("$candidate")
+}
+record_xray_config() {
+    local config_path="$1"
+    local resolved_config=""
+    [ -n "$config_path" ] || return 0
+    record_xray_directory "$(dirname -- "$config_path")"
+    if [ -L "$config_path" ]; then
+        resolved_config=$(readlink -m -- "$config_path") || return 1
+        record_xray_directory "$(dirname -- "$resolved_config")"
+    fi
+}
+parse_xray_arguments() {
+    local expect="" argument=""
+    for argument in "$@"; do
+        if [ -n "$expect" ]; then
+            if [ "$expect" = "config" ]; then record_xray_config "$argument" || return 1; else record_xray_directory "$argument" || return 1; fi
+            expect=""
+            continue
+        fi
+        case "$argument" in
+            -config|-c|--config) expect="config" ;;
+            -confdir|-d|--confdir) expect="confdir" ;;
+            -config=*|-c=*|--config=*) record_xray_config "${argument#*=}" || return 1 ;;
+            -confdir=*|-d=*|--confdir=*) record_xray_directory "${argument#*=}" || return 1 ;;
+        esac
+    done
+}
+for XRAY_PID in $(pgrep -x xray 2>/dev/null || true); do
+    XRAY_ARGUMENTS=()
+    if mapfile -d '' -t XRAY_ARGUMENTS < "/proc/$XRAY_PID/cmdline" 2>/dev/null; then
+        parse_xray_arguments "${XRAY_ARGUMENTS[@]}" || exit 1
+    fi
+done
+XRAY_UNIT_FILES=(
+    /etc/systemd/system/xray.service /etc/systemd/system/xray@.service
+    /lib/systemd/system/xray.service /lib/systemd/system/xray@.service
+    /usr/lib/systemd/system/xray.service /usr/lib/systemd/system/xray@.service
+)
+if [ "$XRAY_UNIT_PRESENT" = "1" ]; then
+    XRAY_FRAGMENT=$(systemctl show xray -p FragmentPath --value 2>/dev/null || true)
+    [ -n "$XRAY_FRAGMENT" ] && XRAY_UNIT_FILES+=("$XRAY_FRAGMENT")
+fi
+for XRAY_UNIT_FILE in "${XRAY_UNIT_FILES[@]}"; do
+    [ -r "$XRAY_UNIT_FILE" ] || continue
+    while IFS= read -r XRAY_EXEC_LINE; do
+        case "$XRAY_EXEC_LINE" in ExecStart=*) ;; *) continue ;; esac
+        read -r -a XRAY_ARGUMENTS <<< "${XRAY_EXEC_LINE#ExecStart=}"
+        parse_xray_arguments "${XRAY_ARGUMENTS[@]}" || exit 1
+    done < "$XRAY_UNIT_FILE"
+done
+
+if [ "$AUTO_STEAL_SELF" = "1" ]; then
+    NGINX_BUILD_INFO=$("$NGINX_BIN" -V 2>&1) || {
+        echo "ERROR: cannot inspect the active Nginx build configuration" >&2
+        exit 1
+    }
+    NGINX_CONF_PATH=$(printf '%s\n' "$NGINX_BUILD_INFO" | sed -n 's/.*--conf-path=\([^[:space:]]*\).*/\1/p' | tail -n 1)
+    NGINX_CONF_PATH=${NGINX_CONF_PATH#\"}
+    NGINX_CONF_PATH=${NGINX_CONF_PATH%\"}
+    NGINX_CONF_PATH=${NGINX_CONF_PATH#\'}
+    NGINX_CONF_PATH=${NGINX_CONF_PATH%\'}
+    if [ -z "$NGINX_CONF_PATH" ]; then
+        echo "ERROR: Nginx does not report an authoritative --conf-path" >&2
+        exit 1
+    fi
+    record_xray_config "$NGINX_CONF_PATH" || exit 1
+    for NGINX_MANAGED_PATH in \
+        /etc/nginx \
+        /usr/local/nginx/nginx.conf \
+        /usr/local/nginx/conf \
+        /usr/local/nginx/servers \
+        /usr/local/nginx/stream_servers \
+        /usr/local/nginx/cert \
+        /usr/local/nginx/html; do
+        record_xray_directory "$NGINX_MANAGED_PATH" || exit 1
+    done
+fi
+
+OLD_AGENT_ACTIVE=0
+OLD_GUARD_ACTIVE=0
+OLD_AGENT_ENABLED=0
+OLD_GUARD_ENABLED=0
+OLD_AGENT_UNIT_PRESENT=0
+OLD_GUARD_UNIT_PRESENT=0
+OLD_AGENT_ENABLE_STATE=""
+OLD_GUARD_ENABLE_STATE=""
+if [ "$HAS_SYSTEMD" = "1" ]; then
+    systemctl is-active --quiet mmw-agent && OLD_AGENT_ACTIVE=1 || true
+    systemctl is-active --quiet arcway-expiry-guard && OLD_GUARD_ACTIVE=1 || true
+    if systemctl cat mmw-agent >/dev/null 2>&1; then
+        OLD_AGENT_UNIT_PRESENT=1
+        OLD_AGENT_ENABLE_STATE=$(systemctl is-enabled mmw-agent 2>/dev/null || true)
+        reversible_systemd_enable_state "$OLD_AGENT_ENABLE_STATE" || {
+            echo "ERROR: mmw-agent.service has unsupported enable state '$OLD_AGENT_ENABLE_STATE'" >&2
+            exit 1
+        }
+        case "$OLD_AGENT_ENABLE_STATE" in enabled|enabled-runtime) OLD_AGENT_ENABLED=1 ;; esac
+    fi
+    if systemctl cat arcway-expiry-guard >/dev/null 2>&1; then
+        OLD_GUARD_UNIT_PRESENT=1
+        OLD_GUARD_ENABLE_STATE=$(systemctl is-enabled arcway-expiry-guard 2>/dev/null || true)
+        reversible_systemd_enable_state "$OLD_GUARD_ENABLE_STATE" || {
+            echo "ERROR: arcway-expiry-guard.service has unsupported enable state '$OLD_GUARD_ENABLE_STATE'" >&2
+            exit 1
+        }
+        case "$OLD_GUARD_ENABLE_STATE" in enabled|enabled-runtime) OLD_GUARD_ENABLED=1 ;; esac
+    fi
+elif [ "$HAS_OPENRC" = "1" ]; then
+    rc-service mmw-agent status >/dev/null 2>&1 && OLD_AGENT_ACTIVE=1 || true
+    rc-service arcway-expiry-guard status >/dev/null 2>&1 && OLD_GUARD_ACTIVE=1 || true
+    rc-update show default 2>/dev/null | awk '$1 == "mmw-agent" { found=1 } END { exit !found }' && OLD_AGENT_ENABLED=1 || true
+    rc-update show default 2>/dev/null | awk '$1 == "arcway-expiry-guard" { found=1 } END { exit !found }' && OLD_GUARD_ENABLED=1 || true
+else
+    pgrep -f '/usr/local/bin/mmw-agent' >/dev/null 2>&1 && OLD_AGENT_ACTIVE=1 || true
+    pgrep -f '/usr/local/bin/arcway-expiry-guard' >/dev/null 2>&1 && OLD_GUARD_ACTIVE=1 || true
+fi
+
+EXISTING_LISTEN_PORT=$(awk -F: '/^[[:space:]]*listen_port[[:space:]]*:/ { value=$2; gsub(/["[:space:]]/, "", value); print value; exit }' /etc/mmw-agent/config.yaml 2>/dev/null || true)
+case "$EXISTING_LISTEN_PORT" in
+    ''|*[!0-9]*) EXISTING_LISTEN_PORT="" ;;
+    *)
+        if [ "$EXISTING_LISTEN_PORT" -lt 1024 ] || [ "$EXISTING_LISTEN_PORT" -gt 65534 ]; then
+            EXISTING_LISTEN_PORT=""
+        fi
+        ;;
+esac
+
+BACKUP_DIR="$DOWNLOAD_DIR/backup"
+LEGACY_COMPAT_RULES_FILE="$BACKUP_DIR/legacy-compat.rules"
+TRACKED_PATHS=(
+    /usr/local/bin/mmw-agent
+    /usr/local/bin/arcway-expiry-guard
+    /usr/local/bin/geoip.dat
+    /usr/local/bin/geosite.dat
+    /usr/local/bin/geoip.dat.tmp
+    /usr/local/bin/geosite.dat.tmp
+    /etc/mmw-agent/config.yaml
+    /etc/arcway-expiry-guard.env
+    /var/lib/mmw-agent
+    /var/lib/arcway-expiry-guard
+    /var/log/mmw-agent
+    /usr/local/etc/xray
+    /etc/xray
+    /opt/xray
+    /etc/arcway-port-firewall.env
+    /usr/local/sbin/arcway-agent-firewall
+    /etc/systemd/system/mmw-agent.service
+    /etc/systemd/system/arcway-expiry-guard.service
+    /etc/init.d/mmw-agent
+    /etc/init.d/arcway-expiry-guard
+    /usr/local/bin/mmw-agent-supervisor.sh
+    /usr/local/bin/arcway-expiry-guard-supervisor.sh
+    /etc/ufw/user.rules
+    /etc/ufw/user6.rules
+    /etc/rc.local
+)
+track_path() {
+    local candidate="$1" existing=""
+    for existing in "${TRACKED_PATHS[@]}"; do
+        [ "$existing" = "$candidate" ] && return 0
+        case "$candidate" in "$existing"/*) return 0 ;; esac
+        case "$existing" in
+            "$candidate"/*)
+                echo "ERROR: managed path $candidate is a parent of already tracked path $existing" >&2
+                return 1
+                ;;
+        esac
+    done
+    TRACKED_PATHS+=("$candidate")
+}
+for XRAY_DISCOVERED_PATH in "${XRAY_DISCOVERED_PATHS[@]}"; do
+    track_path "$XRAY_DISCOVERED_PATH"
+done
+track_symlink_target() {
+    local link_path="$1" resolved=""
+    [ -L "$link_path" ] || return 0
+    resolved=$(readlink -m -- "$link_path") || return 1
+    case "$resolved" in
+        /dev/null) return 0 ;;
+        /|/etc|/usr|/usr/local|/usr/local/etc|/var|/var/lib|/var/log|/opt|/root|/home|/srv|/mnt)
+            echo "ERROR: managed path $link_path targets an unsafe broad path: $resolved" >&2
+            return 1
+            ;;
+    esac
+    if [ -e "$resolved" ] && [ ! -f "$resolved" ] && [ ! -d "$resolved" ]; then
+        echo "ERROR: managed path $link_path targets a special file: $resolved" >&2
+        return 1
+    fi
+    track_path "$resolved"
+}
+# Back up targets as well as links. Otherwise writing a managed config through
+# a symlink could mutate data outside the snapshotted directory.
+discover_tracked_symlink_targets() {
+    local scan_index=0 scan_root="" managed_symlink=""
+    while [ "$scan_index" -lt "${#TRACKED_PATHS[@]}" ]; do
+        scan_root="${TRACKED_PATHS[$scan_index]}"
+        scan_index=$((scan_index + 1))
+        if [ -L "$scan_root" ]; then
+            track_symlink_target "$scan_root" || return 1
+        elif [ -d "$scan_root" ]; then
+            while IFS= read -r -d '' managed_symlink; do
+                track_symlink_target "$managed_symlink" || return 1
+            done < <(find "$scan_root" -xdev -type l -print0 2>/dev/null)
+        fi
+    done
+}
+discover_tracked_symlink_targets
+OLD_FIREWALL_PRESENT=0
+OLD_FIREWALL_USES_NFT=0
+OLD_UFW_ACTIVE=0
+if [ -x /usr/local/sbin/arcway-agent-firewall ]; then
+    OLD_FIREWALL_PRESENT=1
+    grep -q 'table inet arcway' /usr/local/sbin/arcway-agent-firewall 2>/dev/null && OLD_FIREWALL_USES_NFT=1 || true
+fi
+if command -v ufw >/dev/null 2>&1; then
+    if LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active' || grep -q '^ENABLED=yes' /etc/ufw/ufw.conf 2>/dev/null; then
+        OLD_UFW_ACTIVE=1
+    fi
+fi
+mkdir -p "$BACKUP_DIR"
+: > "$LEGACY_COMPAT_RULES_FILE"
+snapshot_tracked_path() {
+    local tracked_path="$1"
+    local backup_path="$BACKUP_DIR$tracked_path"
+    local missing_path="$backup_path.arcway-missing"
+    local stage_path="$backup_path.arcway-stage.$$.$RANDOM"
+    local previous_path="$backup_path.arcway-previous.$$.$RANDOM"
+    local previous_missing="$previous_path.arcway-missing"
+    rm -rf "$stage_path" "$stage_path.arcway-missing" "$previous_path" "$previous_missing"
+    mkdir -p "$(dirname "$backup_path")"
+    if [ -e "$tracked_path" ] || [ -L "$tracked_path" ]; then
+        cp -a "$tracked_path" "$stage_path" || { rm -rf "$stage_path"; return 1; }
+    else
+        : > "$stage_path.arcway-missing" || return 1
+    fi
+    if [ -e "$backup_path" ] || [ -L "$backup_path" ]; then
+        mv "$backup_path" "$previous_path" || return 1
+    fi
+    if [ -e "$missing_path" ]; then
+        mv "$missing_path" "$previous_missing" || {
+            [ ! -e "$previous_path" ] || mv "$previous_path" "$backup_path"
+            return 1
+        }
+    fi
+    if [ -e "$stage_path" ] || [ -L "$stage_path" ]; then
+        if ! mv "$stage_path" "$backup_path"; then
+            [ ! -e "$previous_path" ] || mv "$previous_path" "$backup_path"
+            [ ! -e "$previous_missing" ] || mv "$previous_missing" "$missing_path"
+            return 1
+        fi
+    elif ! mv "$stage_path.arcway-missing" "$missing_path"; then
+        [ ! -e "$previous_path" ] || mv "$previous_path" "$backup_path"
+        [ ! -e "$previous_missing" ] || mv "$previous_missing" "$missing_path"
+        return 1
+    fi
+    rm -rf "$previous_path" "$previous_missing"
+}
+
+# Refresh shutdown-flushed state as one complete generation. TRACKED_PATHS also
+# contains recursively resolved symlink targets, which may live outside /var;
+# rebuilding and swapping the whole backup root keeps those targets in the same
+# quiesced generation as the three mutable Arcway trees.
+snapshot_quiesced_mutable_state() {
+    local stage_root="$DOWNLOAD_DIR/quiesced-backup.$$.$RANDOM"
+    local previous_root="$DOWNLOAD_DIR/backup.arcway-previous.$$.$RANDOM"
+    local tracked_path="" stage_path=""
+    rm -rf "$stage_root" "$previous_root"
+    mkdir -p "$stage_root" || return 1
+    : > "$stage_root/legacy-compat.rules" || { rm -rf "$stage_root"; return 1; }
+    for tracked_path in "${TRACKED_PATHS[@]}"; do
+        stage_path="$stage_root$tracked_path"
+        mkdir -p "$(dirname "$stage_path")" || { rm -rf "$stage_root"; return 1; }
+        if [ -e "$tracked_path" ] || [ -L "$tracked_path" ]; then
+            cp -a "$tracked_path" "$stage_path" || { rm -rf "$stage_root"; return 1; }
+        else
+            : > "$stage_path.arcway-missing" || { rm -rf "$stage_root"; return 1; }
+        fi
+    done
+    mv "$BACKUP_DIR" "$previous_root" || { rm -rf "$stage_root"; return 1; }
+    if ! mv "$stage_root" "$BACKUP_DIR"; then
+        mv "$previous_root" "$BACKUP_DIR" || true
+        rm -rf "$stage_root"
+        return 1
+    fi
+    rm -rf "$previous_root"
+}
+for TRACKED_PATH in "${TRACKED_PATHS[@]}"; do
+    snapshot_tracked_path "$TRACKED_PATH"
+done
+
+MUTATION_STARTED=0
+PREPARE_ATTEMPTED=0
+PRESERVE_DOWNLOAD_DIR=0
+systemd_service_registered() {
+    local service_name="$1"
+    systemctl cat "$service_name" >/dev/null 2>&1 && return 0
+    find /etc/systemd/system -type l -name "${service_name}.service" -print -quit 2>/dev/null | grep -q .
+}
+openrc_default_enabled() {
+    local service_name="$1"
+    [ -e "/etc/runlevels/default/$service_name" ] || [ -L "/etc/runlevels/default/$service_name" ]
+}
+restart_quiesced_arcway_services() {
+    if [ "$HAS_SYSTEMD" = "1" ]; then
+        if [ "$OLD_AGENT_ACTIVE" = "1" ]; then
+            systemctl start mmw-agent >/dev/null 2>&1 && systemctl is-active --quiet mmw-agent || return 1
+        fi
+        if [ "$OLD_GUARD_ACTIVE" = "1" ]; then
+            systemctl start arcway-expiry-guard >/dev/null 2>&1 && systemctl is-active --quiet arcway-expiry-guard || return 1
+        fi
+    elif [ "$HAS_OPENRC" = "1" ]; then
+        if [ "$OLD_AGENT_ACTIVE" = "1" ]; then
+            rc-service mmw-agent start 9>&- >/dev/null 2>&1 && rc-service mmw-agent status >/dev/null 2>&1 || return 1
+        fi
+        if [ "$OLD_GUARD_ACTIVE" = "1" ]; then
+            rc-service arcway-expiry-guard start 9>&- >/dev/null 2>&1 && rc-service arcway-expiry-guard status >/dev/null 2>&1 || return 1
+        fi
+    else
+        if [ "$OLD_AGENT_ACTIVE" = "1" ] && [ -x /usr/local/bin/mmw-agent-supervisor.sh ]; then
+            nohup /usr/local/bin/mmw-agent-supervisor.sh 9>&- >/dev/null 2>&1 &
+        fi
+        if [ "$OLD_GUARD_ACTIVE" = "1" ] && [ -x /usr/local/bin/arcway-expiry-guard-supervisor.sh ]; then
+            nohup /usr/local/bin/arcway-expiry-guard-supervisor.sh 9>&- >/dev/null 2>&1 &
+        fi
+        sleep 1
+        if [ "$OLD_AGENT_ACTIVE" = "1" ] && ! pgrep -f '/usr/local/bin/mmw-agent' >/dev/null 2>&1; then return 1; fi
+        if [ "$OLD_GUARD_ACTIVE" = "1" ] && ! pgrep -f '/usr/local/bin/arcway-expiry-guard' >/dev/null 2>&1; then return 1; fi
+    fi
+}
+restore_systemd_service_state() {
+    local service_name="$1" enable_state="$2" was_active="$3" current_state=""
+    systemctl disable "$service_name" >/dev/null 2>&1 || true
+    systemctl disable --runtime "$service_name" >/dev/null 2>&1 || true
+    systemctl unmask "$service_name" >/dev/null 2>&1 || true
+    systemctl unmask --runtime "$service_name" >/dev/null 2>&1 || true
+    case "$enable_state" in
+        enabled) systemctl enable "$service_name" >/dev/null 2>&1 || return 1 ;;
+        enabled-runtime) systemctl enable --runtime "$service_name" >/dev/null 2>&1 || return 1 ;;
+        disabled) ;;
+        masked) systemctl mask "$service_name" >/dev/null 2>&1 || return 1 ;;
+        masked-runtime) systemctl mask --runtime "$service_name" >/dev/null 2>&1 || return 1 ;;
+        static|indirect|generated|transient|alias|"") ;;
+        *) echo "ERROR: unsupported previous $service_name enable state: $enable_state" >&2; return 1 ;;
+    esac
+    if [ -n "$enable_state" ]; then
+        current_state=$(systemctl is-enabled "$service_name" 2>/dev/null || true)
+        [ "$current_state" = "$enable_state" ] || return 1
+    fi
+    if [ "$was_active" = "1" ]; then
+        systemctl start "$service_name" >/dev/null 2>&1 && systemctl is-active --quiet "$service_name" || return 1
+    else
+        systemctl stop "$service_name" >/dev/null 2>&1 || true
+        systemctl is-active --quiet "$service_name" && return 1
+    fi
+}
+rollback_install() {
+    echo "ERROR: installation failed; restoring the previous Arcway node installation" >&2
+    set +e
+    ROLLBACK_FAILED=0
+	if [ "$HAS_SYSTEMD" = "1" ]; then
+		systemctl stop arcway-expiry-guard mmw-agent >/dev/null 2>&1
+			if systemctl is-active --quiet arcway-expiry-guard || systemctl is-active --quiet mmw-agent; then
+				ROLLBACK_FAILED=1
+			fi
+			if [ "$XRAY_UNIT_PRESENT" = "1" ]; then
+				systemctl stop xray >/dev/null 2>&1 || true
+				systemctl is-active --quiet xray && ROLLBACK_FAILED=1
+			fi
+			if [ "$NGINX_UNIT_PRESENT" = "1" ]; then
+				systemctl stop nginx >/dev/null 2>&1 || true
+				systemctl is-active --quiet nginx && ROLLBACK_FAILED=1
+			fi
+		# Disable services that were not enabled before this transaction while the
+		# newly written units still exist. This removes wants symlinks before a
+		# fresh-install rollback deletes the unit files.
+			if [ "$OLD_AGENT_ENABLED" != "1" ] && systemd_service_registered mmw-agent; then
+				systemctl disable mmw-agent >/dev/null 2>&1 || ROLLBACK_FAILED=1
+				systemctl is-enabled --quiet mmw-agent && ROLLBACK_FAILED=1
+			fi
+			if [ "$OLD_GUARD_ENABLED" != "1" ] && systemd_service_registered arcway-expiry-guard; then
+				systemctl disable arcway-expiry-guard >/dev/null 2>&1 || ROLLBACK_FAILED=1
+				systemctl is-enabled --quiet arcway-expiry-guard && ROLLBACK_FAILED=1
+		fi
+	elif [ "$HAS_OPENRC" = "1" ]; then
+		rc-service arcway-expiry-guard stop >/dev/null 2>&1
+		rc-service mmw-agent stop >/dev/null 2>&1
+		if rc-service arcway-expiry-guard status >/dev/null 2>&1 || rc-service mmw-agent status >/dev/null 2>&1; then
+			ROLLBACK_FAILED=1
+		fi
+		# Remove runlevel links created by this transaction before missing init
+		# scripts are restored as absent.
+				if [ "$OLD_AGENT_ENABLED" != "1" ]; then
+					if openrc_default_enabled mmw-agent; then rc-update del mmw-agent default >/dev/null 2>&1 || ROLLBACK_FAILED=1; fi
+					openrc_default_enabled mmw-agent && ROLLBACK_FAILED=1
+				fi
+				if [ "$OLD_GUARD_ENABLED" != "1" ]; then
+					if openrc_default_enabled arcway-expiry-guard; then rc-update del arcway-expiry-guard default >/dev/null 2>&1 || ROLLBACK_FAILED=1; fi
+					openrc_default_enabled arcway-expiry-guard && ROLLBACK_FAILED=1
+				fi
+	else
+		pkill -f '/usr/local/bin/arcway-expiry-guard' >/dev/null 2>&1
+        pkill -f '/usr/local/bin/mmw-agent' >/dev/null 2>&1
+        sleep 1
+        if pgrep -f '/usr/local/bin/arcway-expiry-guard' >/dev/null 2>&1 || pgrep -f '/usr/local/bin/mmw-agent' >/dev/null 2>&1; then
+            ROLLBACK_FAILED=1
+		fi
+	fi
+		rm -f /usr/local/bin/.mmw-agent.new /usr/local/bin/.arcway-expiry-guard.new || ROLLBACK_FAILED=1
+    for TRACKED_PATH in "${TRACKED_PATHS[@]}"; do
+        if [ -e "$BACKUP_DIR$TRACKED_PATH.arcway-missing" ]; then
+            rm -rf "$TRACKED_PATH" || ROLLBACK_FAILED=1
+        elif [ -e "$BACKUP_DIR$TRACKED_PATH" ] || [ -L "$BACKUP_DIR$TRACKED_PATH" ]; then
+            if ! mkdir -p "$(dirname "$TRACKED_PATH")" || ! rm -rf "$TRACKED_PATH" || ! cp -a "$BACKUP_DIR$TRACKED_PATH" "$TRACKED_PATH"; then
+                ROLLBACK_FAILED=1
+            fi
+        else
+            ROLLBACK_FAILED=1
+        fi
+    done
+
+    if [ -s "$LEGACY_COMPAT_RULES_FILE" ]; then
+        while IFS='|' read -r LEGACY_TOOL LEGACY_IP LEGACY_PORT; do
+            if command -v "$LEGACY_TOOL" >/dev/null 2>&1; then
+                "$LEGACY_TOOL" -w 5 -D ARCWAY_PORTS -s "$LEGACY_IP" -p tcp --dport "$LEGACY_PORT" -j ACCEPT >/dev/null 2>&1 || true
+            fi
+        done < "$LEGACY_COMPAT_RULES_FILE"
+    fi
+
+    FIREWALL_SAFE=1
+    if [ "$OLD_UFW_ACTIVE" = "1" ]; then
+        if ! command -v ufw >/dev/null 2>&1 || ! ufw reload >/dev/null 2>&1; then
+            FIREWALL_SAFE=0
+            ROLLBACK_FAILED=1
+        fi
+    fi
+    FIREWALL_RESTORED=0
+    if [ "$OLD_FIREWALL_PRESENT" = "1" ] && [ -r /etc/arcway-port-firewall.env ] && [ -x /usr/local/sbin/arcway-agent-firewall ]; then
+        set -a
+        if ! . /etc/arcway-port-firewall.env; then
+            FIREWALL_SAFE=0
+            ROLLBACK_FAILED=1
+        fi
+        set +a
+        if [ "$FIREWALL_SAFE" = "1" ] && /usr/local/sbin/arcway-agent-firewall >/dev/null 2>&1; then
+            FIREWALL_RESTORED=1
+        else
+            FIREWALL_SAFE=0
+            ROLLBACK_FAILED=1
+        fi
+    elif [ "$OLD_FIREWALL_PRESENT" = "1" ]; then
+        FIREWALL_SAFE=0
+        ROLLBACK_FAILED=1
+    fi
+    # A pre-nft helper cannot own the new table. If the old nft helper cannot be
+    # restored either, remove the new table instead of leaving stale policy behind.
+    if [ "$OLD_FIREWALL_USES_NFT" != "1" ] || [ "$FIREWALL_RESTORED" != "1" ]; then
+        if nft list table inet arcway >/dev/null 2>&1 && ! nft delete table inet arcway >/dev/null 2>&1; then
+            FIREWALL_SAFE=0
+            ROLLBACK_FAILED=1
+        fi
+    fi
+
+	if [ "$HAS_SYSTEMD" = "1" ]; then
+		systemctl daemon-reload >/dev/null 2>&1 || ROLLBACK_FAILED=1
+		if [ "$XRAY_UNIT_PRESENT" = "1" ]; then
+			restore_systemd_service_state xray "$OLD_XRAY_ENABLE_STATE" "$OLD_XRAY_ACTIVE" || ROLLBACK_FAILED=1
+		fi
+		if [ "$NGINX_UNIT_PRESENT" = "1" ]; then
+			restore_systemd_service_state nginx "$OLD_NGINX_ENABLE_STATE" "$OLD_NGINX_ACTIVE" || ROLLBACK_FAILED=1
+		fi
+        if [ "$OLD_AGENT_UNIT_PRESENT" = "1" ]; then
+            restore_systemd_service_state mmw-agent "$OLD_AGENT_ENABLE_STATE" 0 || ROLLBACK_FAILED=1
+        fi
+        if [ "$OLD_GUARD_UNIT_PRESENT" = "1" ]; then
+            restore_systemd_service_state arcway-expiry-guard "$OLD_GUARD_ENABLE_STATE" 0 || ROLLBACK_FAILED=1
+        fi
+        if [ "$FIREWALL_SAFE" = "1" ]; then
+            if [ "$OLD_AGENT_ACTIVE" = "1" ]; then
+                systemctl start mmw-agent >/dev/null 2>&1 && systemctl is-active --quiet mmw-agent || ROLLBACK_FAILED=1
+            fi
+            if [ "$OLD_GUARD_ACTIVE" = "1" ]; then
+                systemctl start arcway-expiry-guard >/dev/null 2>&1 && systemctl is-active --quiet arcway-expiry-guard || ROLLBACK_FAILED=1
+            fi
+        else
+            ROLLBACK_FAILED=1
+        fi
+	elif [ "$HAS_OPENRC" = "1" ]; then
+		if [ -e /etc/init.d/mmw-agent ]; then
+			if [ "$OLD_AGENT_ENABLED" = "1" ]; then
+				rc-update add mmw-agent default >/dev/null 2>&1 || ROLLBACK_FAILED=1
+				openrc_default_enabled mmw-agent || ROLLBACK_FAILED=1
+			elif openrc_default_enabled mmw-agent; then
+				rc-update del mmw-agent default >/dev/null 2>&1 || ROLLBACK_FAILED=1
+				openrc_default_enabled mmw-agent && ROLLBACK_FAILED=1
+			fi
+		fi
+		if [ -e /etc/init.d/arcway-expiry-guard ]; then
+			if [ "$OLD_GUARD_ENABLED" = "1" ]; then
+				rc-update add arcway-expiry-guard default >/dev/null 2>&1 || ROLLBACK_FAILED=1
+				openrc_default_enabled arcway-expiry-guard || ROLLBACK_FAILED=1
+			elif openrc_default_enabled arcway-expiry-guard; then
+				rc-update del arcway-expiry-guard default >/dev/null 2>&1 || ROLLBACK_FAILED=1
+				openrc_default_enabled arcway-expiry-guard && ROLLBACK_FAILED=1
+			fi
+		fi
+        if [ "$FIREWALL_SAFE" = "1" ]; then
+            if [ "$OLD_AGENT_ACTIVE" = "1" ]; then rc-service mmw-agent start 9>&- >/dev/null 2>&1 && rc-service mmw-agent status >/dev/null 2>&1 || ROLLBACK_FAILED=1; fi
+            if [ "$OLD_GUARD_ACTIVE" = "1" ]; then rc-service arcway-expiry-guard start 9>&- >/dev/null 2>&1 && rc-service arcway-expiry-guard status >/dev/null 2>&1 || ROLLBACK_FAILED=1; fi
+        else
+            ROLLBACK_FAILED=1
+        fi
+    else
+        if [ "$FIREWALL_SAFE" = "1" ]; then
+            if [ "$OLD_AGENT_ACTIVE" = "1" ] && [ -x /usr/local/bin/mmw-agent-supervisor.sh ]; then
+                nohup /usr/local/bin/mmw-agent-supervisor.sh 9>&- >/dev/null 2>&1 &
+            fi
+            if [ "$OLD_GUARD_ACTIVE" = "1" ] && [ -x /usr/local/bin/arcway-expiry-guard-supervisor.sh ]; then
+                nohup /usr/local/bin/arcway-expiry-guard-supervisor.sh 9>&- >/dev/null 2>&1 &
+            fi
+            sleep 1
+            if [ "$OLD_AGENT_ACTIVE" = "1" ] && ! pgrep -f '/usr/local/bin/mmw-agent' >/dev/null 2>&1; then ROLLBACK_FAILED=1; fi
+            if [ "$OLD_GUARD_ACTIVE" = "1" ] && ! pgrep -f '/usr/local/bin/arcway-expiry-guard' >/dev/null 2>&1; then ROLLBACK_FAILED=1; fi
+        else
+            ROLLBACK_FAILED=1
+        fi
+    fi
+    MUTATION_STARTED=0
+    if [ "$ROLLBACK_FAILED" != "0" ]; then
+        echo "ERROR: automatic rollback was incomplete" >&2
+        return 1
+    fi
+    echo "Previous Arcway node installation restored." >&2
+    return 0
+}
+
+finish_install() {
+    INSTALL_STATUS=$?
+    trap - EXIT
+    trap '' HUP INT TERM
+    ROLLBACK_COMPLETE=1
+    if [ "$INSTALL_STATUS" -ne 0 ] && [ "$MUTATION_STARTED" = "1" ]; then
+        if [ "$PREPARE_ATTEMPTED" = "1" ] && ! quiesce_remote_installation; then
+            ROLLBACK_COMPLETE=0
+            PRESERVE_DOWNLOAD_DIR=1
+            echo "ERROR: panel-side Prepare could not be quiesced; local rollback was not started" >&2
+            echo "ERROR: retry recovery before changing files in $DOWNLOAD_DIR" >&2
+        elif ! rollback_install; then
+            ROLLBACK_COMPLETE=0
+            PRESERVE_DOWNLOAD_DIR=1
+            echo "ERROR: rollback backup retained at $BACKUP_DIR" >&2
+        fi
+    fi
+    if [ "$INSTALL_STATUS" -ne 0 ] && [ "$ROLLBACK_COMPLETE" = "1" ]; then
+        abort_remote_installation
+	elif [ "$INSTALL_STATUS" -ne 0 ] && [ "$SERVER_LOCK_STARTED" = "1" ]; then
+		echo "ERROR: panel installation lock retained until expiry because rollback was incomplete" >&2
+	fi
+	stop_install_renewal
+	if [ "$PRESERVE_DOWNLOAD_DIR" != "1" ]; then
+        rm -rf "$DOWNLOAD_DIR"
+    else
+        echo "ERROR: do not delete $DOWNLOAD_DIR until recovery is complete" >&2
+    fi
+    exit "$INSTALL_STATUS"
+}
+trap finish_install EXIT
+trap 'exit 130' HUP INT TERM
+
+assert_install_lease
+MUTATION_STARTED=1
+# Step 2: Stop existing service if running
+echo "[2/7] Stopping existing service (if any)..."
 if [ "$HAS_SYSTEMD" = "1" ]; then
     systemctl stop arcway-expiry-guard 2>/dev/null || true
-    systemctl disable arcway-expiry-guard 2>/dev/null || true
     systemctl stop mmw-agent 2>/dev/null || true
-    systemctl disable mmw-agent 2>/dev/null || true
+    if systemctl is-active --quiet arcway-expiry-guard || systemctl is-active --quiet mmw-agent; then
+        echo "ERROR: existing Arcway services did not stop" >&2
+        exit 1
+    fi
 elif [ "$HAS_OPENRC" = "1" ]; then
     rc-service arcway-expiry-guard stop 2>/dev/null || true
-    rc-update del arcway-expiry-guard 2>/dev/null || true
     rc-service mmw-agent stop 2>/dev/null || true
-    rc-update del mmw-agent 2>/dev/null || true
+    if rc-service arcway-expiry-guard status >/dev/null 2>&1 || rc-service mmw-agent status >/dev/null 2>&1; then
+        echo "ERROR: existing Arcway services did not stop" >&2
+        exit 1
+    fi
 else
     # nohup 兜底:杀掉现有 agent / guard 进程及 supervisor
     pkill -f /usr/local/bin/arcway-expiry-guard 2>/dev/null || true
     pkill -f /usr/local/bin/mmw-agent 2>/dev/null || true
     sleep 1
+    if pgrep -f '/usr/local/bin/arcway-expiry-guard' >/dev/null 2>&1 || pgrep -f '/usr/local/bin/mmw-agent' >/dev/null 2>&1; then
+        echo "ERROR: existing Arcway processes did not stop" >&2
+        exit 1
+    fi
 fi
 
-# Step 2: Create config directory first
+# Shutdown hooks may create or retarget state symlinks. Re-discover them while
+# services are quiescent, before constructing the authoritative generation.
+if ! discover_tracked_symlink_targets; then
+    echo "ERROR: managed symlink topology became unsafe while stopping services" >&2
+    if restart_quiesced_arcway_services; then
+        MUTATION_STARTED=0
+    else
+        echo "ERROR: old Arcway services could not be restarted; full rollback will be attempted" >&2
+    fi
+    exit 1
+fi
+
+# The first snapshot protects failures while stopping old services. Refresh
+# all tracked state after they are quiescent so rollback cannot lose late writes.
+if ! snapshot_quiesced_mutable_state; then
+    echo "ERROR: failed to capture a complete quiesced mutable-state snapshot" >&2
+    if restart_quiesced_arcway_services; then
+        # No files were changed yet. Preserve shutdown-flushed state and let the
+        # EXIT handler abort only the panel transaction.
+        MUTATION_STARTED=0
+    else
+        echo "ERROR: old Arcway services could not be restarted; full rollback will be attempted" >&2
+    fi
+    exit 1
+fi
+
+# Step 3: Create config directory first
 echo ""
-echo "[2/6] Creating configuration..."
+echo "[3/7] Creating configuration..."
 mkdir -p /etc/mmw-agent
 mkdir -p /var/lib/mmw-agent
 mkdir -p /var/lib/arcway-expiry-guard
@@ -673,10 +1737,14 @@ port_is_listening() {
     awk -v suffix=":${CHECK_PORT_HEX}" '$2 ~ suffix "$" && $4 == "0A" { found=1 } END { exit !found }' /proc/net/tcp /proc/net/tcp6 2>/dev/null
 }
 
-REQUESTED_PORT="${LISTEN_PORT:-23889}"
+REQUESTED_PORT="${LISTEN_PORT:-${EXISTING_LISTEN_PORT:-23889}}"
+PORT_SEARCH_LIMIT=19
+if [ -n "$LISTEN_PORT" ] || [ -n "$EXISTING_LISTEN_PORT" ]; then
+    PORT_SEARCH_LIMIT=0
+fi
 ACTUAL_PORT=""
 GUARD_PORT=""
-for i in $(seq 0 19); do
+for i in $(seq 0 "$PORT_SEARCH_LIMIT"); do
     TRY_PORT=$((REQUESTED_PORT + i))
     TRY_GUARD_PORT=$((TRY_PORT + 1))
     if [ "$TRY_GUARD_PORT" -gt 65535 ]; then
@@ -706,9 +1774,9 @@ cat > /etc/mmw-agent/config.yaml << EOF
 mode: remote
 master_url: ${MASTER_URL}
 token: ${TOKEN}
-connection_mode: websocket
+connection_mode: ${CONNECTION_MODE}
 xray_mode: ${XRAY_MODE}
-steal_mode: $([ "$AUTO_STEAL_SELF" = "1" ] && echo "tunnel" || echo "")
+steal_mode: ${STEAL_MODE}
 master_public_key: ${MASTER_PUBLIC_KEY}
 listen_port: "${LISTEN_PORT}"
 hide_port_on_ws: false
@@ -717,7 +1785,7 @@ EOF
 echo "Configuration saved to /etc/mmw-agent/config.yaml"
 
 cat > /etc/arcway-expiry-guard.env << EOF
-ARCWAY_GUARD_LISTEN=[::]:${GUARD_PORT}
+ARCWAY_GUARD_LISTEN=:${GUARD_PORT}
 ARCWAY_AGENT_URL=http://127.0.0.1:${LISTEN_PORT}
 ARCWAY_GUARD_STATE=/var/lib/arcway-expiry-guard/state.json
 ARCWAY_GUARD_SECRET=${GUARD_SECRET}
@@ -729,42 +1797,297 @@ if [ ! -e /var/lib/arcway-expiry-guard/state.json ]; then
 fi
 chmod 0600 /var/lib/arcway-expiry-guard/state.json
 
-# guard API 需要主控直连。仅当 UFW 已启用时增加端口规则；失败必须明确告警,
-# 避免出现本机 healthz 正常、主控却永远无法下发到期计划的隐蔽故障。
-# 某些 IPv4-only 主机的 ufw status 会因 ip6tables 损坏直接报错，因此同时读取 ufw.conf。
+# 保留上一版信息，用于删除 UFW 中旧出口地址的持久化规则。
+OLD_ARCWAY_AGENT_PORT=""
+OLD_ARCWAY_GUARD_PORT=""
+OLD_ARCWAY_PANEL_IPS=""
+if [ -r /etc/arcway-port-firewall.env ]; then
+    OLD_ARCWAY_AGENT_PORT=$(sed -n 's/^ARCWAY_AGENT_PORT=//p' /etc/arcway-port-firewall.env | head -n 1)
+    OLD_ARCWAY_GUARD_PORT=$(sed -n 's/^ARCWAY_GUARD_PORT=//p' /etc/arcway-port-firewall.env | head -n 1)
+    OLD_ARCWAY_PANEL_IPS=$(sed -n "s/^ARCWAY_PANEL_IPS='\(.*\)'$/\1/p" /etc/arcway-port-firewall.env | head -n 1)
+fi
+if [ -z "$OLD_ARCWAY_AGENT_PORT" ] && [ -n "$EXISTING_LISTEN_PORT" ]; then
+    OLD_ARCWAY_AGENT_PORT="$EXISTING_LISTEN_PORT"
+fi
+if [ -z "$OLD_ARCWAY_GUARD_PORT" ] && [ -n "$OLD_ARCWAY_AGENT_PORT" ]; then
+    OLD_ARCWAY_GUARD_PORT=$((OLD_ARCWAY_AGENT_PORT + 1))
+fi
+
+# 用独立 inet table 同时保护 IPv4/IPv6。helper 由各 init 系统在每次启动前调用，
+# nft -f 会将整份规则作为单个事务提交，校验或应用失败时旧 table 保持不变。
+mkdir -p /usr/local/sbin
+cat > /etc/arcway-port-firewall.env << EOF
+ARCWAY_AGENT_PORT=${LISTEN_PORT}
+ARCWAY_GUARD_PORT=${GUARD_PORT}
+ARCWAY_PANEL_IPS='$PANEL_SOURCE_IPS'
+EOF
+chmod 0600 /etc/arcway-port-firewall.env
+cat > /usr/local/sbin/arcway-agent-firewall << 'EOF'
+#!/bin/sh
+set -eu
+: "${ARCWAY_AGENT_PORT:?missing ARCWAY_AGENT_PORT}"
+: "${ARCWAY_GUARD_PORT:?missing ARCWAY_GUARD_PORT}"
+: "${ARCWAY_PANEL_IPS:?missing ARCWAY_PANEL_IPS}"
+
+CONFIGURED_AGENT_PORT=$(awk -F: '/^[[:space:]]*listen_port[[:space:]]*:/ { value=$2; gsub(/["[:space:]]/, "", value); print value; exit }' /etc/mmw-agent/config.yaml 2>/dev/null || true)
+case "$CONFIGURED_AGENT_PORT" in
+    ''|*[!0-9]*)
+        echo "ERROR: mmw-agent config has no valid listen_port" >&2
+        exit 1
+        ;;
+esac
+if [ "$CONFIGURED_AGENT_PORT" != "$ARCWAY_AGENT_PORT" ]; then
+    echo "ERROR: mmw-agent listen_port drifted from the protected Arcway port" >&2
+    exit 1
+fi
+
+if [ ! -r /etc/arcway-expiry-guard.env ]; then
+    echo "ERROR: expiry guard configuration is missing" >&2
+    exit 1
+fi
+CONFIGURED_GUARD_LISTEN=$(sed -n 's/^ARCWAY_GUARD_LISTEN=//p' /etc/arcway-expiry-guard.env | head -n 1)
+CONFIGURED_GUARD_AGENT_URL=$(sed -n 's/^ARCWAY_AGENT_URL=//p' /etc/arcway-expiry-guard.env | head -n 1)
+if [ "$CONFIGURED_GUARD_LISTEN" != ":${ARCWAY_GUARD_PORT}" ]; then
+    echo "ERROR: expiry guard listen port drifted from the protected Arcway port" >&2
+    exit 1
+fi
+if [ "$CONFIGURED_GUARD_AGENT_URL" != "http://127.0.0.1:${ARCWAY_AGENT_PORT}" ]; then
+    echo "ERROR: expiry guard Agent URL drifted from the protected Arcway port" >&2
+    exit 1
+fi
+
+LOCK_DIR=/run/arcway-agent-firewall.lock
+LOCK_ATTEMPTS=0
+until mkdir "$LOCK_DIR" 2>/dev/null; do
+    LOCK_OWNER=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+    case "$LOCK_OWNER" in
+        ''|*[!0-9]*) ;;
+        *)
+            if ! kill -0 "$LOCK_OWNER" 2>/dev/null; then
+                rm -rf "$LOCK_DIR"
+                continue
+            fi
+            ;;
+    esac
+    LOCK_ATTEMPTS=$((LOCK_ATTEMPTS + 1))
+    if [ "$LOCK_ATTEMPTS" -ge 30 ]; then
+        echo "ERROR: timed out waiting for the Arcway firewall lock" >&2
+        exit 1
+    fi
+    sleep 1
+done
+printf '%s\n' "$$" > "$LOCK_DIR/pid"
+RULESET="/run/arcway-agent-firewall.$$.nft"
+cleanup() {
+    rm -f "$RULESET"
+    rm -rf "$LOCK_DIR"
+}
+trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
+
+{
+    if nft list table inet arcway >/dev/null 2>&1; then
+        echo 'delete table inet arcway'
+    fi
+    echo 'table inet arcway {'
+    echo '  chain input {'
+    echo '    type filter hook input priority -10; policy accept;'
+    echo '    iifname "lo" return'
+    for panel_ip in $ARCWAY_PANEL_IPS; do
+        case "$panel_ip" in
+            *:*) printf '    ip6 saddr %s tcp dport { %s, %s } accept\n' "$panel_ip" "$ARCWAY_AGENT_PORT" "$ARCWAY_GUARD_PORT" ;;
+            *)   printf '    ip saddr %s tcp dport { %s, %s } accept\n' "$panel_ip" "$ARCWAY_AGENT_PORT" "$ARCWAY_GUARD_PORT" ;;
+        esac
+    done
+    printf '    tcp dport { %s, %s } drop\n' "$ARCWAY_AGENT_PORT" "$ARCWAY_GUARD_PORT"
+    echo '  }'
+    echo '}'
+} > "$RULESET"
+
+nft -c -f "$RULESET"
+nft -f "$RULESET"
+nft list chain inet arcway input >/dev/null
+EOF
+chmod 0755 /usr/local/sbin/arcway-agent-firewall
+set -a
+. /etc/arcway-port-firewall.env
+set +a
+if ! /usr/local/sbin/arcway-agent-firewall; then
+    echo "ERROR: failed to protect the Arcway management ports" >&2
+    exit 1
+fi
+
+# Pre-nft Arcway installations may still jump through ARCWAY_PORTS at a later
+# netfilter priority. Temporarily admit only the new panel/port pairs so the
+# panel can verify the migration. Rollback removes just these recorded rules;
+# successful readiness removes the obsolete chain in full.
+for PANEL_IP in $PANEL_SOURCE_IPS; do
+    case "$PANEL_IP" in
+        *:*) LEGACY_TOOL=ip6tables ;;
+        *) LEGACY_TOOL=iptables ;;
+    esac
+    if ! command -v "$LEGACY_TOOL" >/dev/null 2>&1 || ! "$LEGACY_TOOL" -w 5 -n -L ARCWAY_PORTS >/dev/null 2>&1; then
+        continue
+    fi
+    for MANAGEMENT_PORT in "$LISTEN_PORT" "$GUARD_PORT"; do
+        if "$LEGACY_TOOL" -w 5 -C ARCWAY_PORTS -s "$PANEL_IP" -p tcp --dport "$MANAGEMENT_PORT" -j ACCEPT >/dev/null 2>&1; then
+            continue
+        fi
+        printf '%s|%s|%s\n' "$LEGACY_TOOL" "$PANEL_IP" "$MANAGEMENT_PORT" >> "$LEGACY_COMPAT_RULES_FILE"
+        if ! "$LEGACY_TOOL" -w 5 -I ARCWAY_PORTS 1 -s "$PANEL_IP" -p tcp --dport "$MANAGEMENT_PORT" -j ACCEPT; then
+            echo "ERROR: failed to add a temporary legacy firewall migration rule" >&2
+            exit 1
+        fi
+    done
+done
+
+# 若 UFW 已启用，同步写入可见、可持久化的精确来源规则。Arcway owns
+# both management ports, so all prior UFW rules for those ports are replaced.
 UFW_ACTIVE=0
 if command -v ufw >/dev/null 2>&1; then
-    if ufw status 2>/dev/null | grep -q '^Status: active' || grep -q '^ENABLED=yes' /etc/ufw/ufw.conf 2>/dev/null; then
+    if ! UFW_STATUS=$(LC_ALL=C ufw status 2>/dev/null); then
+        echo "ERROR: UFW is installed but its persistent policy cannot be inspected" >&2
+        exit 1
+    fi
+    if printf '%s\n' "$UFW_STATUS" | grep -q '^Status: active' || grep -q '^ENABLED=yes' /etc/ufw/ufw.conf 2>/dev/null; then
         UFW_ACTIVE=1
     fi
 fi
-if [ "$UFW_ACTIVE" = "1" ]; then
-    echo "Active UFW detected, allowing expiry guard TCP port ${GUARD_PORT}..."
-    if ufw allow "${GUARD_PORT}/tcp"; then
-        echo "UFW rule added for ${GUARD_PORT}/tcp"
-    else
-        # ufw may have installed the IPv4 rule before failing on ip6tables. If
-        # not, install it in ufw-user-input for the current boot and flag that
-        # the operator still needs to repair UFW persistence.
-        IPV4_RULE_READY=0
-        if command -v iptables >/dev/null 2>&1; then
-            if iptables -C ufw-user-input -p tcp --dport "$GUARD_PORT" -j ACCEPT 2>/dev/null; then
-                IPV4_RULE_READY=1
-            elif iptables -I ufw-user-input 1 -p tcp --dport "$GUARD_PORT" -j ACCEPT 2>/dev/null; then
-                IPV4_RULE_READY=1
-                echo "WARNING: installed a temporary IPv4 guard rule; repair UFW/ip6tables so it survives firewall reload." >&2
+if command -v ufw >/dev/null 2>&1; then
+    UFW_PORT_PATTERN=""
+    UFW_MANAGED_PORTS=""
+    for UFW_PORT in $OLD_ARCWAY_AGENT_PORT $OLD_ARCWAY_GUARD_PORT "$LISTEN_PORT" "$GUARD_PORT"; do
+        case "$UFW_PORT" in ''|*[!0-9]*) continue ;; esac
+        if [ -z "$UFW_PORT_PATTERN" ]; then UFW_PORT_PATTERN="$UFW_PORT"; else UFW_PORT_PATTERN="$UFW_PORT_PATTERN|$UFW_PORT"; fi
+        case " $UFW_MANAGED_PORTS " in *" $UFW_PORT "*) ;; *) UFW_MANAGED_PORTS="$UFW_MANAGED_PORTS $UFW_PORT" ;; esac
+    done
+    if [ "$UFW_ACTIVE" = "1" ]; then
+        if ! UFW_NUMBERED=$(LC_ALL=C ufw status numbered 2>/dev/null); then
+            echo "ERROR: failed to enumerate active UFW rules" >&2
+            exit 1
+        fi
+        if printf '%s\n' "$UFW_NUMBERED" | awk -v managed_ports="$UFW_MANAGED_PORTS" '
+            function covers_managed(spec, parts, limits, ports, count, i) {
+                split(spec, parts, "/")
+                spec=parts[1]
+                if (spec !~ /^[0-9]+:[0-9]+$/) return 0
+                split(spec, limits, ":")
+                count=split(managed_ports, ports, " ")
+                for (i=1; i<=count; i++) if (ports[i] >= limits[1] && ports[i] <= limits[2]) return 1
+                return 0
+            }
+            /ALLOW/ {
+                line=$0
+                sub(/^\[[^]]*\][[:space:]]*/, "", line)
+                split(line, fields, /[[:space:]]+/)
+                if (covers_managed(fields[1])) found=1
+            }
+            END { exit(found ? 0 : 1) }
+        '; then
+            echo "ERROR: UFW has a port-range rule covering an Arcway management port; narrow or remove it before retrying" >&2
+            exit 1
+        fi
+        UFW_RULE_NUMBERS=$(printf '%s\n' "$UFW_NUMBERED" | awk -v managed_ports="$UFW_MANAGED_PORTS" '
+            function is_managed(spec, parts, ports, count, i) {
+                split(spec, parts, "/")
+                spec=parts[1]
+                if (spec !~ /^[0-9]+$/) return 0
+                count=split(managed_ports, ports, " ")
+                for (i=1; i<=count; i++) if (ports[i] == spec) return 1
+                return 0
+            }
+            match($0, /^\[[[:space:]]*[0-9]+\]/) {
+                number=substr($0, RSTART, RLENGTH)
+                gsub(/[^0-9]/, "", number)
+                line=substr($0, RSTART+RLENGTH)
+                sub(/^[[:space:]]*/, "", line)
+                split(line, fields, /[[:space:]]+/)
+                if (is_managed(fields[1])) print number
+            }
+        ' | sort -rn -u)
+        for RULE_NUMBER in $UFW_RULE_NUMBERS; do
+            if ! ufw --force delete "$RULE_NUMBER" >/dev/null 2>&1; then
+                echo "ERROR: failed to remove obsolete UFW rule $RULE_NUMBER" >&2
+                exit 1
             fi
+        done
+        for PANEL_IP in $PANEL_SOURCE_IPS; do
+            for MANAGEMENT_PORT in "$LISTEN_PORT" "$GUARD_PORT"; do
+                echo "Persisting UFW rule for panel $PANEL_IP to management port $MANAGEMENT_PORT..."
+                if ! ufw allow proto tcp from "$PANEL_IP" to any port "$MANAGEMENT_PORT" comment 'arcway-managed'; then
+                    echo "ERROR: UFW could not persist the trusted source rule" >&2
+                    exit 1
+                fi
+            done
+        done
+        if ! UFW_FINAL_STATUS=$(LC_ALL=C ufw status numbered 2>/dev/null); then
+            echo "ERROR: failed to verify UFW persistent rules" >&2
+            exit 1
         fi
-        if [ "$IPV4_RULE_READY" != "1" ]; then
-            echo "WARNING: UFW failed to allow ${GUARD_PORT}/tcp (including a possible ip6tables error)." >&2
-            echo "WARNING: expiry enforcement will fail until the panel can reach this TCP port." >&2
+        for MANAGEMENT_PORT in "$LISTEN_PORT" "$GUARD_PORT"; do
+            UFW_PORT_LINES=$(printf '%s\n' "$UFW_FINAL_STATUS" | grep -E "(^|[[:space:]])${MANAGEMENT_PORT}(/tcp)?([[:space:]]|$)" || true)
+            if [ -z "$UFW_PORT_LINES" ] || printf '%s\n' "$UFW_PORT_LINES" | grep -q 'Anywhere'; then
+                echo "ERROR: UFW has a missing or broad rule for Arcway port $MANAGEMENT_PORT" >&2
+                exit 1
+            fi
+            for PANEL_IP in $PANEL_SOURCE_IPS; do
+                if ! printf '%s\n' "$UFW_PORT_LINES" | grep -F -- "$PANEL_IP" >/dev/null; then
+                    echo "ERROR: UFW is missing panel $PANEL_IP on Arcway port $MANAGEMENT_PORT" >&2
+                    exit 1
+                fi
+            done
+        done
+    else
+        # Inactive UFW does not expose numbered rules. Remove known Arcway rules,
+        # then inspect the persisted files; command failures are harmless only
+        # because the final file-state check is authoritative.
+        for UFW_PANEL_IP in $OLD_ARCWAY_PANEL_IPS $PANEL_SOURCE_IPS; do
+            for UFW_PORT in $OLD_ARCWAY_AGENT_PORT $OLD_ARCWAY_GUARD_PORT "$LISTEN_PORT" "$GUARD_PORT"; do
+                case "$UFW_PORT" in ''|*[!0-9]*) continue ;; esac
+                ufw --force delete allow proto tcp from "$UFW_PANEL_IP" to any port "$UFW_PORT" >/dev/null 2>&1 || true
+            done
+        done
+        for UFW_PORT in $OLD_ARCWAY_AGENT_PORT $OLD_ARCWAY_GUARD_PORT "$LISTEN_PORT" "$GUARD_PORT"; do
+            case "$UFW_PORT" in ''|*[!0-9]*) continue ;; esac
+            ufw --force delete allow "${UFW_PORT}/tcp" >/dev/null 2>&1 || true
+        done
+        if awk -v managed_ports="$UFW_MANAGED_PORTS" '
+            function covers_managed(spec, parts, limits, ports, count, i) {
+                split(spec, parts, "/")
+                spec=parts[1]
+                count=split(managed_ports, ports, " ")
+                if (spec ~ /^[0-9]+$/) {
+                    for (i=1; i<=count; i++) if (ports[i] == spec) return 1
+                    return 0
+                }
+                if (spec ~ /^[0-9]+:[0-9]+$/) {
+                    split(spec, limits, ":")
+                    for (i=1; i<=count; i++) if (ports[i] >= limits[1] && ports[i] <= limits[2]) return 1
+                }
+                return 0
+            }
+            {
+                dport=""; accept=0
+                for (i=1; i<=NF; i++) {
+                    if ($i == "--dport" && i < NF) dport=$(i+1)
+                    if (($i == "-j" || $i == "--jump") && i < NF && $(i+1) == "ACCEPT") accept=1
+                }
+                if (accept && covers_managed(dport)) found=1
+            }
+            END { exit(found ? 0 : 1) }
+        ' /etc/ufw/user.rules /etc/ufw/user6.rules 2>/dev/null; then
+            echo "ERROR: inactive UFW retains an Arcway management-port rule; remove it explicitly and retry" >&2
+            exit 1
         fi
+    fi
+    if [ "$UFW_ACTIVE" = "1" ]; then
+        /usr/local/sbin/arcway-agent-firewall
     fi
 fi
 
-# Step 3: 创建 service 文件 — 按检测到的 init 系统选不同写法
+# Step 4: 创建 service 文件 — 按检测到的 init 系统选不同写法
 echo ""
-echo "[3/6] Creating service..."
+echo "[4/7] Creating service..."
 
 if [ "$HAS_SYSTEMD" = "1" ]; then
     cat > /etc/systemd/system/mmw-agent.service << EOF
@@ -774,6 +2097,8 @@ After=network.target
 
 [Service]
 Type=simple
+EnvironmentFile=/etc/arcway-port-firewall.env
+ExecStartPre=/usr/local/sbin/arcway-agent-firewall
 ExecStart=/usr/local/bin/mmw-agent -c /etc/mmw-agent/config.yaml
 Restart=always
 RestartSec=5
@@ -790,7 +2115,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+EnvironmentFile=/etc/arcway-port-firewall.env
 EnvironmentFile=/etc/arcway-expiry-guard.env
+ExecStartPre=/usr/local/sbin/arcway-agent-firewall
 ExecStart=/usr/local/bin/arcway-expiry-guard
 Restart=always
 RestartSec=5
@@ -811,9 +2138,16 @@ name="mmw-agent"
 description="MMW Agent Remote Server"
 command="/usr/local/bin/mmw-agent"
 command_args="-c /etc/mmw-agent/config.yaml"
-command_background="yes"
-pidfile="/run/mmw-agent.pid"
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
 # 日志由 agent 自身写文件并轮转(/var/log/mmw-agent/mmw-agent.log),不再用 output_log 重复落地(避免无轮转爆盘)
+start_pre() {
+    set -a
+    . /etc/arcway-port-firewall.env
+    set +a
+    /usr/local/sbin/arcway-agent-firewall
+}
 depend() { need net; }
 EOF
     chmod +x /etc/init.d/mmw-agent
@@ -822,11 +2156,16 @@ EOF
 name="arcway-expiry-guard"
 description="Arcway Managed Client Expiry Guard"
 command="/usr/local/bin/arcway-expiry-guard"
-command_background="yes"
-pidfile="/run/arcway-expiry-guard.pid"
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
 start_pre() {
     set -a
-    . /etc/arcway-expiry-guard.env
+    . /etc/arcway-port-firewall.env
+    set +a
+    /usr/local/sbin/arcway-agent-firewall || return 1
+    set -a
+    . /etc/arcway-expiry-guard.env || return 1
     set +a
 }
 depend() { need net; after mmw-agent; }
@@ -864,108 +2203,32 @@ EOF
         echo "exit 0" >> /etc/rc.local
         chmod +x /etc/rc.local
     fi
-    if ! grep -q "mmw-agent-supervisor.sh" /etc/rc.local; then
-        sed -i '/^exit 0/i nohup /usr/local/bin/mmw-agent-supervisor.sh >/dev/null 2>&1 \&' /etc/rc.local
-    fi
-    if ! grep -q "arcway-expiry-guard-supervisor.sh" /etc/rc.local; then
-        sed -i '/^exit 0/i nohup /usr/local/bin/arcway-expiry-guard-supervisor.sh >/dev/null 2>&1 \&' /etc/rc.local
-    fi
+    # Rebuild all managed lines as one ordered block. This also repairs an old
+    # installation where the firewall line had been appended after supervisors.
+    RC_LOCAL_NEW="$DOWNLOAD_DIR/rc.local"
+    awk '
+        /arcway-agent-firewall|mmw-agent-supervisor[.]sh|arcway-expiry-guard-supervisor[.]sh/ { next }
+        /^exit 0[[:space:]]*$/ && !inserted {
+            print "set -a; . /etc/arcway-port-firewall.env; set +a; /usr/local/sbin/arcway-agent-firewall || exit 1"
+            print "nohup /usr/local/bin/mmw-agent-supervisor.sh >/dev/null 2>&1 &"
+            print "nohup /usr/local/bin/arcway-expiry-guard-supervisor.sh >/dev/null 2>&1 &"
+            inserted=1
+        }
+        { print }
+        END {
+            if (!inserted) {
+                print "set -a; . /etc/arcway-port-firewall.env; set +a; /usr/local/sbin/arcway-agent-firewall || exit 1"
+                print "nohup /usr/local/bin/mmw-agent-supervisor.sh >/dev/null 2>&1 &"
+                print "nohup /usr/local/bin/arcway-expiry-guard-supervisor.sh >/dev/null 2>&1 &"
+            }
+        }
+    ' /etc/rc.local > "$RC_LOCAL_NEW"
+    install -m 0755 "$RC_LOCAL_NEW" /etc/rc.local
 fi
 
-# Step 4: Download and install binary only (without starting)
+# Step 5: atomically install the already verified binaries.
 echo ""
-echo "[4/6] Downloading MMWX binary..."
-
-# Detect architecture
-ARCH=$(uname -m)
-case $ARCH in
-    x86_64)
-        ARCH_NAME="amd64"
-        AGENT_SHA256="6ce2faac96f82a501ab86b1817c332bf05239ba10e36b5be0dd11995a5a1bf2f"
-        ;;
-    aarch64|arm64)
-        ARCH_NAME="arm64"
-        AGENT_SHA256="04ba897947923592846d3e57282d5ac80c213892b125c1575a8664abb770168f"
-        ;;
-    *)
-        echo "Unsupported architecture: $ARCH"
-        exit 1
-        ;;
-esac
-
-AGENT_VERSION="v0.3.7"
-AGENT_URL="https://github.com/iluobei/mmw-agent/releases/download/${AGENT_VERSION}/mmw-agent-linux-${ARCH_NAME}"
-
-# Download binary — 优先用 curl(更普遍),没有就用 wget;两者都没就按发行版包管理器装一个,
-# 杜绝 "wget: command not found" 噪声 / "ERROR: 都没装" 卡死。
-ensure_downloader() {
-    if command -v curl >/dev/null 2>&1; then return 0; fi
-    if command -v wget >/dev/null 2>&1; then return 0; fi
-    echo "未检测到 curl/wget,尝试自动安装 curl..."
-    if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -qq >/dev/null 2>&1 || true
-        DEBIAN_FRONTEND=noninteractive apt-get install -y curl
-    elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y curl
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y curl
-    elif command -v apk >/dev/null 2>&1; then
-        apk add --no-cache curl
-    elif command -v pacman >/dev/null 2>&1; then
-        pacman -Sy --noconfirm curl
-    elif command -v zypper >/dev/null 2>&1; then
-        zypper -n install curl
-    else
-        echo "ERROR: 无法识别系统包管理器,请手动安装 curl 或 wget 后重试" >&2
-        return 1
-    fi
-}
-ensure_downloader || exit 1
-echo "Downloading verified mmw-agent ${AGENT_VERSION} from GitHub..."
-if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --connect-timeout 10 --max-time 180 -o "$AGENT_DOWNLOAD" "$AGENT_URL" || {
-        echo "ERROR: 无法从 GitHub 下载 mmw-agent" >&2
-        exit 1
-    }
-else
-    wget -q --connect-timeout=10 --read-timeout=180 -O "$AGENT_DOWNLOAD" "$AGENT_URL" || {
-        echo "ERROR: 无法从 GitHub 下载 mmw-agent" >&2
-        exit 1
-    }
-fi
-if [ "$(sha256sum "$AGENT_DOWNLOAD" | awk '{ print $1 }')" != "$AGENT_SHA256" ]; then
-    echo "ERROR: mmw-agent SHA-256 校验失败,安装中止" >&2
-    exit 1
-fi
-
-# expiry guard 由当前主控按远程服务器 token 鉴权分发,不依赖私有 GitHub Release。
-GUARD_URL="${MASTER_URL}/api/remote/expiry-guard?arch=${ARCH_NAME}"
-echo "Downloading Arcway expiry guard from master..."
-if command -v curl >/dev/null 2>&1; then
-	    curl -fsSL --connect-timeout 10 --max-time 180 \
-	        -H "Authorization: Bearer ${TOKEN}" \
-	        -o "$GUARD_DOWNLOAD" "$GUARD_URL"
-else
-	    wget -q --connect-timeout=10 --read-timeout=180 \
-	        --header="Authorization: Bearer ${TOKEN}" \
-	        -O "$GUARD_DOWNLOAD" "$GUARD_URL"
-	fi
-	if [ ! -s "$GUARD_DOWNLOAD" ]; then
-    echo "ERROR: expiry guard 下载结果为空,安装中止" >&2
-    exit 1
-fi
-
-# 拒绝明显的代理错误页/空文件，再以原子 rename 安装。
-validate_elf() {
-    [ -s "$1" ] || return 1
-    [ "$(od -An -tx1 -N4 "$1" 2>/dev/null | tr -d ' \n')" = "7f454c46" ]
-}
-if ! validate_elf "$AGENT_DOWNLOAD" || ! validate_elf "$GUARD_DOWNLOAD"; then
-    echo "ERROR: 下载结果不是有效 ELF 可执行文件,安装中止" >&2
-    exit 1
-fi
-
-# Install binaries
+echo "[5/7] Installing verified binaries..."
 install -m 0755 "$AGENT_DOWNLOAD" /usr/local/bin/.mmw-agent.new
 mv -f /usr/local/bin/.mmw-agent.new /usr/local/bin/mmw-agent
 install -m 0755 "$GUARD_DOWNLOAD" /usr/local/bin/.arcway-expiry-guard.new
@@ -973,38 +2236,40 @@ mv -f /usr/local/bin/.arcway-expiry-guard.new /usr/local/bin/arcway-expiry-guard
 
 echo "Binaries installed to /usr/local/bin/mmw-agent and /usr/local/bin/arcway-expiry-guard"
 
-# Step 5: 启用并启动 service
+# Step 6: 启用并启动 service
 echo ""
-echo "[5/6] Starting service..."
+echo "[6/7] Starting service..."
 if [ "$HAS_SYSTEMD" = "1" ]; then
     systemctl enable mmw-agent
     systemctl start mmw-agent
     systemctl enable arcway-expiry-guard
     systemctl start arcway-expiry-guard
 elif [ "$HAS_OPENRC" = "1" ]; then
-    # rc-update 在 LXC 容器里没初始化 runlevel 时会报错,失败不致命(set -e 兜底)
-    rc-update add mmw-agent default 2>/dev/null || echo "  ⚠ rc-update add 失败(常见于 LXC 容器,不影响当前会话启动)"
-    rc-service mmw-agent start
-    rc-update add arcway-expiry-guard default 2>/dev/null || echo "  ⚠ guard rc-update add 失败,不影响当前会话启动"
-    rc-service arcway-expiry-guard start
+	rc-update add mmw-agent default
+	rc-update show default 2>/dev/null | awk '$1 == "mmw-agent" { found=1 } END { exit !found }' || {
+		echo "ERROR: mmw-agent was not registered in the OpenRC default runlevel" >&2
+		exit 1
+	}
+	rc-service mmw-agent start 9>&-
+	rc-update add arcway-expiry-guard default
+	rc-update show default 2>/dev/null | awk '$1 == "arcway-expiry-guard" { found=1 } END { exit !found }' || {
+		echo "ERROR: arcway-expiry-guard was not registered in the OpenRC default runlevel" >&2
+		exit 1
+	}
+	rc-service arcway-expiry-guard start 9>&-
 else
-    nohup /usr/local/bin/mmw-agent-supervisor.sh >/dev/null 2>&1 &
-    nohup /usr/local/bin/arcway-expiry-guard-supervisor.sh >/dev/null 2>&1 &
+    nohup /usr/local/bin/mmw-agent-supervisor.sh 9>&- >/dev/null 2>&1 &
+    nohup /usr/local/bin/arcway-expiry-guard-supervisor.sh 9>&- >/dev/null 2>&1 &
     echo "Started via nohup (PID=$!); 安装重启后通过 /etc/rc.local 自启动"
 fi
 
 # Wait a moment for service to start
 sleep 3
 
-# Step 6: Verify installation
+# Step 7: Verify installation
 echo ""
-echo "[6/6] Verifying installation..."
+echo "[7/7] Verifying installation..."
 
-echo ""
-echo "=========================================="
-echo "  Installation Complete!"
-echo "=========================================="
-echo ""
 echo "Service status:"
 if [ "$HAS_SYSTEMD" = "1" ]; then
     systemctl status mmw-agent --no-pager -l 2>/dev/null | head -15 || echo "Service started"
@@ -1017,15 +2282,156 @@ else
     pgrep -af /usr/local/bin/arcway-expiry-guard | head -5 || echo "Guard process not found"
 fi
 guard_healthy=0
-if command -v curl >/dev/null 2>&1; then
-    curl -fsS --max-time 5 "http://127.0.0.1:${GUARD_PORT}/healthz" >/dev/null 2>&1 && guard_healthy=1
-else
-    wget -q --timeout=5 -O /dev/null "http://127.0.0.1:${GUARD_PORT}/healthz" >/dev/null 2>&1 && guard_healthy=1
-fi
+curl -fsS --max-time 5 "http://127.0.0.1:${GUARD_PORT}/healthz" >/dev/null 2>&1 && guard_healthy=1
 if [ "$guard_healthy" != "1" ]; then
     echo "ERROR: expiry guard health check failed on port ${GUARD_PORT}" >&2
     exit 1
 fi
+
+verify_local_services() {
+	local services_status=""
+	services_status=$(curl -fsS --connect-timeout 2 --max-time 5 \
+		-H @"$CURL_AUTH_HEADER_FILE" \
+		"http://127.0.0.1:${LISTEN_PORT}/api/child/services/status") || {
+        echo "ERROR: local Agent service-status check failed" >&2
+        return 1
+    }
+    if ! printf '%s\n' "$services_status" | grep -Eq '"xray"[[:space:]]*:[[:space:]]*\{[^}]*"running"[[:space:]]*:[[:space:]]*true'; then
+        echo "ERROR: Agent reports that Xray is not running" >&2
+        return 1
+    fi
+    if [ "$AUTO_STEAL_SELF" = "1" ] && ! printf '%s\n' "$services_status" | grep -Eq '"nginx"[[:space:]]*:[[:space:]]*\{[^}]*"running"[[:space:]]*:[[:space:]]*true'; then
+        echo "ERROR: Agent reports that Nginx is not running" >&2
+        return 1
+    fi
+}
+verify_local_services
+
+# Management readiness covers the control plane. Validate selected data-plane
+# prerequisites separately so a healthy Agent cannot mask a stopped Xray/Nginx.
+if [ "$XRAY_MODE" != "embedded" ]; then
+    if ! "$XRAY_BIN" version >/dev/null 2>&1; then
+        echo "ERROR: external Xray became unavailable during installation" >&2
+        exit 1
+    fi
+    if [ "$HAS_SYSTEMD" = "1" ] && systemctl cat xray >/dev/null 2>&1; then
+        if ! systemctl is-active --quiet xray; then
+            echo "ERROR: external Xray systemd service is not active" >&2
+            exit 1
+        fi
+    elif ! pgrep -x xray >/dev/null 2>&1; then
+        echo "ERROR: external Xray process is not running" >&2
+        exit 1
+    fi
+fi
+if [ "$AUTO_STEAL_SELF" = "1" ]; then
+    if ! "$NGINX_BIN" -t >/dev/null 2>&1; then
+        echo "ERROR: Nginx configuration is invalid after enabling takeover mode" >&2
+        exit 1
+    fi
+    if [ "$HAS_SYSTEMD" = "1" ] && systemctl cat nginx >/dev/null 2>&1; then
+        if ! systemctl is-active --quiet nginx; then
+            echo "ERROR: Nginx systemd service is not active" >&2
+            exit 1
+        fi
+    elif ! pgrep -x nginx >/dev/null 2>&1; then
+        echo "ERROR: Nginx process is not running" >&2
+        exit 1
+    fi
+fi
+
+# 由主控反向验证 Agent HTTP fallback 和 guard 端口。这一步能检出云防火墙、native nft
+# default-drop 或 NAT 出口配置错误，避免只做本机 healthz 后误报安装成功。
+management_ready=0
+for attempt in $(seq 1 20); do
+	if curl -fsS --connect-timeout 5 --max-time 10 -X POST \
+		-H @"$CURL_AUTH_HEADER_FILE" \
+		-H @"$CURL_INSTALL_NONCE_HEADER_FILE" \
+		"${MASTER_URL}/api/remote/management-ready" >/dev/null; then
+        management_ready=1
+        break
+    fi
+    if [ "$attempt" -eq 1 ]; then
+        echo "Waiting for the panel to verify both management services..."
+    fi
+    sleep 2
+done
+if [ "$management_ready" != "1" ]; then
+    echo "ERROR: panel cannot reach Agent ${LISTEN_PORT} and guard ${GUARD_PORT}." >&2
+    echo "ERROR: allow the configured ARCWAY_PANEL_IPS in the host/cloud firewall and retry." >&2
+    exit 1
+fi
+
+# Apply the final panel-owned data-plane state while both the durable install
+# lock and local rollback snapshot are still active.
+assert_install_lease
+PREPARE_ATTEMPTED=1
+if ! curl -fsS --connect-timeout 10 --max-time 120 -X POST \
+	-H @"$CURL_AUTH_HEADER_FILE" \
+	-H @"$CURL_INSTALL_NONCE_HEADER_FILE" \
+	"${MASTER_URL}/api/remote/install-prepare" >/dev/null; then
+    echo "ERROR: panel could not prepare the final desired state" >&2
+    exit 1
+fi
+verify_local_services
+
+# Desired state is proven, so commit the local rollback transaction before
+# removing legacy iptables state. Legacy cleanup is deliberately outside rollback: partial chain
+# deletion cannot be reconstructed reliably without restoring the entire host
+# firewall. Any cleanup failure is reported as a failed install, never hidden.
+assert_install_lease
+MUTATION_STARTED=0
+cleanup_legacy_firewall() {
+    local LEGACY_TOOL="$1"
+    if ! "$LEGACY_TOOL" -w 5 -S INPUT >/dev/null 2>&1; then
+        echo "ERROR: cannot inspect legacy $LEGACY_TOOL INPUT rules" >&2
+        return 1
+    fi
+
+    if "$LEGACY_TOOL" -w 5 -S ARCWAY_PORTS >/dev/null 2>&1; then
+        while "$LEGACY_TOOL" -w 5 -C INPUT -j ARCWAY_PORTS >/dev/null 2>&1; do
+            "$LEGACY_TOOL" -w 5 -D INPUT -j ARCWAY_PORTS >/dev/null 2>&1 || return 1
+        done
+        if ! "$LEGACY_TOOL" -w 5 -S INPUT >/dev/null 2>&1; then return 1; fi
+        if "$LEGACY_TOOL" -w 5 -S INPUT 2>/dev/null | grep -q -- '-A INPUT -j ARCWAY_PORTS'; then
+            echo "ERROR: a legacy $LEGACY_TOOL ARCWAY_PORTS jump remains" >&2
+            return 1
+        fi
+        "$LEGACY_TOOL" -w 5 -F ARCWAY_PORTS >/dev/null 2>&1 || return 1
+        "$LEGACY_TOOL" -w 5 -X ARCWAY_PORTS >/dev/null 2>&1 || return 1
+    fi
+
+    if "$LEGACY_TOOL" -w 5 -S ufw-user-input >/dev/null 2>&1; then
+        for LEGACY_PORT in $OLD_ARCWAY_AGENT_PORT $OLD_ARCWAY_GUARD_PORT "$LISTEN_PORT" "$GUARD_PORT"; do
+            case "$LEGACY_PORT" in
+                ''|*[!0-9]*) continue ;;
+            esac
+            while "$LEGACY_TOOL" -w 5 -C ufw-user-input -p tcp --dport "$LEGACY_PORT" -j ACCEPT >/dev/null 2>&1; do
+                "$LEGACY_TOOL" -w 5 -D ufw-user-input -p tcp --dport "$LEGACY_PORT" -j ACCEPT >/dev/null 2>&1 || return 1
+            done
+        done
+        "$LEGACY_TOOL" -w 5 -S ufw-user-input >/dev/null 2>&1 || return 1
+    fi
+}
+for LEGACY_TOOL in iptables ip6tables; do
+    if ! command -v "$LEGACY_TOOL" >/dev/null 2>&1; then
+        continue
+    fi
+    if ! cleanup_legacy_firewall "$LEGACY_TOOL"; then
+        echo "ERROR: Arcway services are healthy, but obsolete $LEGACY_TOOL rules require manual cleanup" >&2
+        exit 1
+    fi
+done
+
+# The panel releases its durable lock only after legacy cleanup succeeds.
+if ! retry_remote_install_post "/api/remote/install-finalize" 120 0; then
+    echo "ERROR: panel could not finalize the installation transaction" >&2
+    exit 1
+fi
+SERVER_LOCK_ATTEMPTED=0
+SERVER_LOCK_STARTED=0
+stop_install_renewal
+
 echo ""
 echo "To check status:"
 if [ "$HAS_SYSTEMD" = "1" ]; then
@@ -1042,41 +2448,10 @@ echo "To view logs:"
 echo "  journalctl -u mmw-agent -f"
 echo ""
 
-# Auto-install Xray (unless embedded mode)
-if [ "$XRAY_MODE" != "embedded" ]; then
-    XRAY_INSTALLED=0
-    if command -v xray >/dev/null 2>&1 || [ -x /usr/local/bin/xray ] || [ -x /usr/bin/xray ] || [ -x /opt/xray/xray ]; then
-        XRAY_INSTALLED=1
-    fi
-
-    if [ "$XRAY_INSTALLED" = "1" ]; then
-        echo "[Auto] Xray already installed, skip."
-    else
-        echo "[Auto] Installing Xray..."
-        bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-    fi
-fi
-
-if [ "$AUTO_STEAL_SELF" = "1" ]; then
-    echo "=========================================="
-    echo "  Auto Install: Nginx"
-    echo "=========================================="
-    echo ""
-
-    NGINX_INSTALLED=0
-    if command -v nginx >/dev/null 2>&1 || [ -x /usr/local/nginx/sbin/nginx ]; then
-        NGINX_INSTALLED=1
-    fi
-
-    if [ "$NGINX_INSTALLED" = "1" ]; then
-        echo "[Auto] Nginx already installed, skip."
-    else
-        echo "[Auto] Installing Nginx..."
-        curl -fsSL https://raw.githubusercontent.com/violetaini/arcway-backend/main/install-nginx.sh | bash
-    fi
-    echo ""
-    echo "Auto install complete (front service: ${FRONT_SERVICE}, xray mode: ${XRAY_MODE})"
-fi
+echo ""
+echo "=========================================="
+echo "  Installation Complete!"
+echo "=========================================="
 echo ""
 `
 

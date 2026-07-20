@@ -40,6 +40,9 @@ func (h *RemoteManageHandler) consumeExpectRecovery(serverID int64) bool {
 func (h *RemoteManageHandler) SyncXrayConfigOnReconnect(ctx context.Context, serverID int64, prevStatus string) {
 	fctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+	if !remoteInstallationAllowsAutoDeploy(fctx, h.repo, serverID, "Xray snapshot sync") {
+		return
+	}
 
 	raw, err := h.forwardToRemoteServer(fctx, serverID, "GET", "/api/child/xray/config", nil)
 	if err != nil {
@@ -55,6 +58,11 @@ func (h *RemoteManageHandler) SyncXrayConfigOnReconnect(ctx context.Context, ser
 	}
 	if jerr := json.Unmarshal(raw, &resp); jerr != nil || !resp.Success || strings.TrimSpace(resp.Config) == "" {
 		log.Printf("[XraySync] server=%d parse agent xray config skipped: jerr=%v success=%v", serverID, jerr, resp.Success)
+		return
+	}
+	// The install lock may have been acquired while the remote GET was in
+	// flight. Never snapshot or restore a transient config that may roll back.
+	if !remoteInstallationAllowsAutoDeploy(fctx, h.repo, serverID, "Xray snapshot sync") {
 		return
 	}
 
@@ -87,7 +95,13 @@ func (h *RemoteManageHandler) SyncXrayConfigOnReconnect(ctx context.Context, ser
 				}
 			}
 			putBody, _ := json.Marshal(map[string]interface{}{"config": cfgToApply, "force": true})
-			if _, perr := h.forwardToRemoteServer(fctx, serverID, "POST", "/api/child/xray/config", putBody); perr != nil {
+			if perr := withRemoteInstallationSafeMutation(fctx, h.repo, serverID, "Xray snapshot restore", func(actionCtx context.Context) error {
+				_, err := h.forwardToRemoteServer(actionCtx, serverID, "POST", "/api/child/xray/config", putBody)
+				return err
+			}); perr != nil {
+				// consumeExpectRecovery ran before the remote validation. Preserve the
+				// user's recovery intent so a post-finalize reconnect/trigger can retry.
+				h.SetExpectRecovery(serverID)
 				log.Printf("[XraySync] server=%d expect_recovery PUT failed: %v", serverID, perr)
 				return
 			}
@@ -95,7 +109,12 @@ func (h *RemoteManageHandler) SyncXrayConfigOnReconnect(ctx context.Context, ser
 			return
 		}
 
-		wrote, werr := h.repo.WritePendingXrayRecovery(fctx, serverID, resp.Config, storage.XraySnapshotSourceAgentReport)
+		var wrote bool
+		werr := withRemoteInstallationSafeMutation(fctx, h.repo, serverID, "Xray pending recovery", func(actionCtx context.Context) error {
+			var err error
+			wrote, err = h.repo.WritePendingXrayRecovery(actionCtx, serverID, resp.Config, storage.XraySnapshotSourceAgentReport)
+			return err
+		})
 		if werr != nil {
 			log.Printf("[XraySync] server=%d write pending recovery failed: %v", serverID, werr)
 			return
@@ -108,16 +127,21 @@ func (h *RemoteManageHandler) SyncXrayConfigOnReconnect(ctx context.Context, ser
 		return
 	}
 
-	snap, werr := h.repo.UpsertCurrentXraySnapshot(fctx, serverID, resp.Config, storage.XraySnapshotSourceAgentReport)
+	var snap *storage.ServerXrayConfigSnapshot
+	werr := withRemoteInstallationSafeMutation(fctx, h.repo, serverID, "Xray snapshot upsert", func(actionCtx context.Context) error {
+		var err error
+		snap, err = h.repo.UpsertCurrentXraySnapshot(actionCtx, serverID, resp.Config, storage.XraySnapshotSourceAgentReport)
+		if err == nil && h.inboundCache != nil {
+			h.inboundCache.SyncFromConfig(serverID, resp.Config)
+		}
+		return err
+	})
 	if werr != nil {
 		log.Printf("[XraySync] server=%d upsert current failed: %v", serverID, werr)
 		return
 	}
 	if snap != nil && snap.ConfigHash != "" {
 		log.Printf("[XraySync] server=%d current snapshot synced (hash=%s)", serverID, shortHash(snap.ConfigHash))
-	}
-	if h.inboundCache != nil {
-		h.inboundCache.SyncFromConfig(serverID, resp.Config)
 	}
 }
 
@@ -184,16 +208,21 @@ func (h *RemoteManageHandler) refreshXraySnapshot(serverID int64) {
 		log.Printf("[XraySync] refresh parse skipped for server=%d: jerr=%v success=%v", serverID, jerr, resp.Success)
 		return
 	}
-	snap, werr := h.repo.UpsertCurrentXraySnapshot(ctx, serverID, resp.Config, storage.XraySnapshotSourceMasterWrite)
+	var snap *storage.ServerXrayConfigSnapshot
+	werr := withRemoteInstallationSafeMutation(ctx, h.repo, serverID, "Xray snapshot refresh", func(actionCtx context.Context) error {
+		var err error
+		snap, err = h.repo.UpsertCurrentXraySnapshot(actionCtx, serverID, resp.Config, storage.XraySnapshotSourceMasterWrite)
+		if err == nil && h.inboundCache != nil {
+			h.inboundCache.SyncFromConfig(serverID, resp.Config)
+		}
+		return err
+	})
 	if werr != nil {
 		log.Printf("[XraySync] refresh upsert failed for server=%d: %v", serverID, werr)
 		return
 	}
 	if snap != nil && snap.ConfigHash != "" {
 		log.Printf("[XraySync] refresh after master write ok server=%d (hash=%s)", serverID, shortHash(snap.ConfigHash))
-	}
-	if h.inboundCache != nil {
-		h.inboundCache.SyncFromConfig(serverID, resp.Config)
 	}
 }
 
@@ -264,6 +293,9 @@ func (h *RemoteManageHandler) CorrectXrayModeDrift(ctx context.Context, serverID
 	if strings.TrimSpace(agentMode) != "external" {
 		return
 	}
+	if !remoteInstallationAllowsAutoDeploy(ctx, h.repo, serverID, "Xray mode drift") {
+		return
+	}
 	server, err := h.repo.GetRemoteServer(ctx, serverID)
 	if err != nil || server == nil || server.XrayMode != "embedded" {
 		return
@@ -272,7 +304,10 @@ func (h *RemoteManageHandler) CorrectXrayModeDrift(ctx context.Context, serverID
 	fctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	body, _ := json.Marshal(map[string]string{"xray_mode": "embedded"})
-	if _, perr := h.forwardToRemoteServer(fctx, serverID, "POST", "/api/child/agent/switch-xray-mode", body); perr != nil {
+	if perr := withRemoteInstallationSafeMutation(fctx, h.repo, serverID, "Xray mode drift", func(actionCtx context.Context) error {
+		_, err := h.forwardToRemoteServer(actionCtx, serverID, "POST", "/api/child/agent/switch-xray-mode", body)
+		return err
+	}); perr != nil {
 		log.Printf("[XrayModeDrift] server=%d auto-switch to embedded failed: %v", serverID, perr)
 		return
 	}

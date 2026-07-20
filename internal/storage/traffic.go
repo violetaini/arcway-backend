@@ -3,13 +3,17 @@ package storage
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -83,8 +87,9 @@ type TrafficRecord struct {
 
 // TrafficRepository 管理流量使用快照的持久性。
 type TrafficRepository struct {
-	db            *sql.DB
-	managedNodeMu sync.Mutex
+	db                       *sql.DB
+	managedNodeMu            sync.Mutex
+	remoteInstallationLeases sync.Map // serverID (int64) -> *sync.RWMutex
 }
 
 // SubscriptionLink 表示向客户端公开的可配置订阅条目。
@@ -170,28 +175,43 @@ func scanSubscriptionLink(scanner rowScanner) (SubscriptionLink, error) {
 }
 
 var (
-	ErrTokenNotFound                = errors.New("token not found")
-	ErrUserNotFound                 = errors.New("user not found")
-	ErrUserExists                   = errors.New("user already exists")
-	ErrRuleVersionNotFound          = errors.New("rule version not found")
-	ErrSubscriptionNotFound         = errors.New("subscription link not found")
-	ErrSubscriptionExists           = errors.New("subscription link already exists")
-	ErrNodeNotFound                 = errors.New("node not found")
-	ErrSubscribeFileNotFound        = errors.New("subscribe file not found")
-	ErrSubscribeFileExists          = errors.New("subscribe file already exists")
-	ErrCustomShortCodeExists        = errors.New("该短码已被占用，请更换一个")
-	ErrSharedServerNotFound         = errors.New("shared server not found")
-	ErrFederatedServerNotFound      = errors.New("federated server not found")
-	ErrUserSettingsNotFound         = errors.New("user settings not found")
-	ErrExternalSubscriptionNotFound = errors.New("external subscription not found")
-	ErrExternalSubscriptionExists   = errors.New("external subscription already exists")
-	ErrPackageNotFound              = errors.New("package not found")
-	ErrPackageExists                = errors.New("package already exists")
-	ErrRemoteServerNotFound         = errors.New("remote server not found")
-	ErrRemoteServerExists           = errors.New("remote server already exists")
-	ErrCertificateNotFound          = errors.New("certificate not found")
-	ErrCertificateExists            = errors.New("certificate already exists")
+	ErrTokenNotFound                 = errors.New("token not found")
+	ErrUserNotFound                  = errors.New("user not found")
+	ErrUserExists                    = errors.New("user already exists")
+	ErrRuleVersionNotFound           = errors.New("rule version not found")
+	ErrSubscriptionNotFound          = errors.New("subscription link not found")
+	ErrSubscriptionExists            = errors.New("subscription link already exists")
+	ErrNodeNotFound                  = errors.New("node not found")
+	ErrSubscribeFileNotFound         = errors.New("subscribe file not found")
+	ErrSubscribeFileExists           = errors.New("subscribe file already exists")
+	ErrCustomShortCodeExists         = errors.New("该短码已被占用，请更换一个")
+	ErrSharedServerNotFound          = errors.New("shared server not found")
+	ErrFederatedServerNotFound       = errors.New("federated server not found")
+	ErrUserSettingsNotFound          = errors.New("user settings not found")
+	ErrExternalSubscriptionNotFound  = errors.New("external subscription not found")
+	ErrExternalSubscriptionExists    = errors.New("external subscription already exists")
+	ErrPackageNotFound               = errors.New("package not found")
+	ErrPackageExists                 = errors.New("package already exists")
+	ErrRemoteServerNotFound          = errors.New("remote server not found")
+	ErrRemoteServerExists            = errors.New("remote server already exists")
+	ErrRemoteListenPortMismatch      = errors.New("remote Agent listen port mismatch")
+	ErrRemoteInstallationActive      = errors.New("remote server installation is already active")
+	ErrRemoteInstallationInvalid     = errors.New("remote server installation is invalid or expired")
+	ErrRemoteInstallationAborted     = errors.New("remote server installation was aborted")
+	ErrRemoteInstallationRollingBack = errors.New("remote server installation is rolling back")
+	ErrRemoteInstallationPolicy      = errors.New("remote server installation policy changed")
+	ErrRemoteInstallationNotReady    = errors.New("remote server installation is not ready")
+	ErrRemoteInstallationNotPrepared = errors.New("remote server installation is not prepared")
+	ErrRemoteInstallTicketInvalid    = errors.New("remote server install ticket is invalid, expired, or already used")
+	ErrCertificateNotFound           = errors.New("certificate not found")
+	ErrCertificateExists             = errors.New("certificate already exists")
 )
+
+// IsValidRemoteManagementListenPort reserves port+1 for the expiry guard.
+// Zero means the Agent default and is resolved during first heartbeat.
+func IsValidRemoteManagementListenPort(port int) bool {
+	return port == 0 || (port >= 1024 && port <= 65534)
+}
 
 var (
 	allowedSubscriptionButtons = map[string]struct{}{
@@ -771,6 +791,7 @@ type RemoteServer struct {
 	AgentTokenExpiresAt   *time.Time `json:"agent_token_expires_at,omitempty"`
 	LastAgentTokenRefresh *time.Time `json:"last_agent_token_refresh,omitempty"`
 	Use443                bool       `json:"use_443"`                       // 是否使用443端口与nginx+xray隧道
+	StealSelf             bool       `json:"steal_self"`                    // 安装/重装时是否允许自动接管本机443
 	StealMode             string     `json:"steal_mode,omitempty"`          // "tunnel" | "fallback"，默认 tunnel
 	SiteType              string     `json:"site_type,omitempty"`           // "static" | "proxy"
 	SiteValue             string     `json:"site_value,omitempty"`          // 静态路径或反向代理地址
@@ -1981,6 +2002,68 @@ CREATE INDEX IF NOT EXISTS idx_remote_servers_status ON remote_servers(status);
 		return fmt.Errorf("migrate remote_servers: %w", err)
 	}
 
+	// 安装事务锁跨进程持久化，避免 Agent 首连/scan_result 的自动配置在安装脚本
+	// 尚可能回滚时改写 Xray 或 Nginx。nonce 只保存 SHA-256；ready_at 表示主控
+	// 已完成管理面探测，prepared_at 表示 desired state 已下发，completed_at 是
+	// 支持 Finalize 网络重试的完成墓碑。
+	const remoteServerInstallationsSchema = `
+CREATE TABLE IF NOT EXISTS remote_server_installations (
+    server_id INTEGER PRIMARY KEY,
+    nonce_hash TEXT NOT NULL CHECK (length(nonce_hash) = 64),
+    started_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    ready_at INTEGER,
+    prepared_at INTEGER,
+    completed_at INTEGER,
+    rolling_back_at INTEGER,
+    aborted_at INTEGER,
+    FOREIGN KEY (server_id) REFERENCES remote_servers(id) ON DELETE CASCADE
+);
+`
+	if _, err := r.db.Exec(remoteServerInstallationsSchema); err != nil {
+		return fmt.Errorf("migrate remote_server_installations: %w", err)
+	}
+	if err := r.ensureTableColumn("remote_server_installations", "prepared_at", "INTEGER"); err != nil {
+		return fmt.Errorf("migrate remote_server_installations.prepared_at: %w", err)
+	}
+	if err := r.ensureTableColumn("remote_server_installations", "completed_at", "INTEGER"); err != nil {
+		return fmt.Errorf("migrate remote_server_installations.completed_at: %w", err)
+	}
+	if err := r.ensureTableColumn("remote_server_installations", "rolling_back_at", "INTEGER"); err != nil {
+		return fmt.Errorf("migrate remote_server_installations.rolling_back_at: %w", err)
+	}
+	if err := r.ensureTableColumn("remote_server_installations", "aborted_at", "INTEGER"); err != nil {
+		return fmt.Errorf("migrate remote_server_installations.aborted_at: %w", err)
+	}
+	if err := r.ensureTableColumn("remote_server_installations", "started_at", "INTEGER"); err != nil {
+		return fmt.Errorf("migrate remote_server_installations.started_at: %w", err)
+	}
+	// Legacy in-flight rows predate renewable leases. Their original start time
+	// cannot be recovered, so pin it to their existing expiry rather than grant
+	// them a fresh two-hour renewal window after an upgrade.
+	if _, err := r.db.Exec(`UPDATE remote_server_installations SET started_at = expires_at WHERE started_at IS NULL`); err != nil {
+		return fmt.Errorf("backfill remote_server_installations.started_at: %w", err)
+	}
+
+	// Admin-issued install commands carry a five-minute, single-consumption
+	// download ticket. Only its SHA-256 digest is persisted; the long-lived node
+	// token is never embedded in the command copied into shell history.
+	const remoteServerInstallTicketsSchema = `
+CREATE TABLE IF NOT EXISTS remote_server_install_tickets (
+    ticket_hash TEXT PRIMARY KEY CHECK (length(ticket_hash) = 64),
+    server_id INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    consumed_at INTEGER,
+    FOREIGN KEY (server_id) REFERENCES remote_servers(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_remote_server_install_tickets_server
+    ON remote_server_install_tickets(server_id, expires_at);
+`
+	if _, err := r.db.Exec(remoteServerInstallTicketsSchema); err != nil {
+		return fmt.Errorf("migrate remote_server_install_tickets: %w", err)
+	}
+
 	// 添加新列以进行重启检测和令牌刷新
 	if err := r.ensureRemoteServerColumn("boot_time", "TIMESTAMP"); err != nil {
 		return err
@@ -2092,6 +2175,11 @@ CREATE INDEX IF NOT EXISTS idx_remote_servers_status ON remote_servers(status);
 	}
 	// 443端口模式（nginx隧道）
 	if err := r.ensureRemoteServerColumn("use_443", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	// 单独保存安装时的接管授权。历史 steal_mode 默认值曾是 tunnel，不能据此
+	// 推断允许重装脚本接管 443；已有记录安全地迁移为关闭。
+	if err := r.ensureRemoteServerColumn("steal_self", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
 	if err := r.ensureRemoteServerColumn("steal_mode", "TEXT NOT NULL DEFAULT 'tunnel'"); err != nil {
@@ -9203,6 +9291,926 @@ func (r *TrafficRepository) CountUserCustomRules(ctx context.Context, username s
 	return n, err
 }
 
+func remoteInstallationNonceHash(nonce string) string {
+	sum := sha256.Sum256([]byte(nonce))
+	return hex.EncodeToString(sum[:])
+}
+
+// CreateRemoteServerInstallTicket stores only a digest of a short-lived ticket
+// used to download one installer. A ticket may be consumed exactly once.
+func (r *TrafficRepository) CreateRemoteServerInstallTicket(ctx context.Context, serverID int64, ticket string, expiresAt time.Time) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	if serverID <= 0 || strings.TrimSpace(ticket) == "" {
+		return errors.New("remote server and install ticket are required")
+	}
+	now := time.Now()
+	if !expiresAt.After(now) {
+		return errors.New("install ticket expiry must be in the future")
+	}
+	if _, err := r.db.ExecContext(ctx, `
+		DELETE FROM remote_server_install_tickets
+		WHERE expires_at <= ? OR (consumed_at IS NOT NULL AND consumed_at <= ?)`,
+		now.UnixNano(), now.Add(-time.Hour).UnixNano()); err != nil {
+		return fmt.Errorf("prune remote server install tickets: %w", err)
+	}
+	result, err := r.db.ExecContext(ctx, `
+		INSERT INTO remote_server_install_tickets (ticket_hash, server_id, created_at, expires_at, consumed_at)
+		SELECT ?, id, ?, ?, NULL FROM remote_servers WHERE id = ?
+		ON CONFLICT(ticket_hash) DO NOTHING`,
+		remoteInstallationNonceHash(ticket), now.UnixNano(), expiresAt.UnixNano(), serverID)
+	if err != nil {
+		return fmt.Errorf("create remote server install ticket: %w", err)
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return fmt.Errorf("create remote server install ticket rows affected: %w", err)
+	} else if affected == 0 {
+		var exists int
+		if err := r.db.QueryRowContext(ctx, `SELECT 1 FROM remote_servers WHERE id = ?`, serverID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+			return ErrRemoteServerNotFound
+		} else if err != nil {
+			return fmt.Errorf("check remote server for install ticket: %w", err)
+		}
+		return errors.New("install ticket collision")
+	}
+	return nil
+}
+
+// ConsumeRemoteServerInstallTicket atomically marks a live ticket consumed and
+// returns the server it authorizes. Response loss deliberately burns the ticket;
+// an administrator can issue a fresh command without exposing the node token.
+func (r *TrafficRepository) ConsumeRemoteServerInstallTicket(ctx context.Context, ticket string, now time.Time) (*RemoteServer, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("traffic repository not initialized")
+	}
+	if strings.TrimSpace(ticket) == "" {
+		return nil, ErrRemoteInstallTicketInvalid
+	}
+	ticketHash := remoteInstallationNonceHash(ticket)
+	result, err := r.db.ExecContext(ctx, `
+		UPDATE remote_server_install_tickets
+		SET consumed_at = ?
+		WHERE ticket_hash = ? AND consumed_at IS NULL AND expires_at > ?`,
+		now.UnixNano(), ticketHash, now.UnixNano())
+	if err != nil {
+		return nil, fmt.Errorf("consume remote server install ticket: %w", err)
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return nil, fmt.Errorf("consume remote server install ticket rows affected: %w", err)
+	} else if affected != 1 {
+		return nil, ErrRemoteInstallTicketInvalid
+	}
+	var serverID int64
+	if err := r.db.QueryRowContext(ctx,
+		`SELECT server_id FROM remote_server_install_tickets WHERE ticket_hash = ? AND consumed_at = ?`,
+		ticketHash, now.UnixNano(),
+	).Scan(&serverID); err != nil {
+		return nil, fmt.Errorf("read consumed remote server install ticket: %w", err)
+	}
+	server, err := r.GetRemoteServer(ctx, serverID)
+	if err != nil {
+		if errors.Is(err, ErrRemoteServerNotFound) {
+			return nil, ErrRemoteInstallTicketInvalid
+		}
+		return nil, err
+	}
+	return server, nil
+}
+
+const (
+	remoteInstallationDefaultListenPort = 23889
+	remoteInstallationGuardPortOffset   = 1
+	remoteInstallationAbortedTTL        = 5 * time.Minute
+)
+
+// RemoteServerInstallationPolicyFingerprint binds a downloaded installer to
+// the normalized server policy that determines what it may replace, snapshot,
+// expose, and start. Tokens and other credentials are deliberately excluded.
+func RemoteServerInstallationPolicyFingerprint(server *RemoteServer) (string, error) {
+	if server == nil {
+		return "", errors.New("remote server is required")
+	}
+	stealSelf := server.StealSelf
+	stealMode := "default"
+	if stealSelf {
+		switch server.StealMode {
+		case "tunnel", "fallback":
+			stealMode = server.StealMode
+		default:
+			return "", errors.New("invalid remote server takeover mode")
+		}
+	}
+	xrayMode := "external"
+	if server.XrayMode == "embedded" {
+		xrayMode = "embedded"
+	}
+	connectionMode := ""
+	switch server.ConnectionMode {
+	case ConnectionModePush:
+		connectionMode = "http"
+	case ConnectionModeWebSocket:
+		connectionMode = "websocket"
+	default:
+		return "", errors.New("remote installer requires push or websocket connection mode")
+	}
+	listenPort := server.ListenPort
+	if listenPort == 0 {
+		listenPort = remoteInstallationDefaultListenPort
+	}
+	if !IsValidRemoteManagementListenPort(listenPort) || listenPort == 0 {
+		return "", errors.New("invalid remote server management port")
+	}
+	guardPort := listenPort + remoteInstallationGuardPortOffset
+	canonical := fmt.Sprintf(
+		"arcway-install-policy-v1\nsteal_self=%t\nsteal_mode=%s\nxray_mode=%s\nconnection_mode=%s\nfront_service=xray\nlisten_port=%d\nguard_port=%d\n",
+		stealSelf, stealMode, xrayMode, connectionMode, listenPort, guardPort,
+	)
+	sum := sha256.Sum256([]byte(canonical))
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// RemoteInstallationPolicyContext contains panel-wide inputs that change what
+// an installer trusts or where it connects. Callers must pass normalized,
+// deterministic values (panel IPs sorted, master URL normalized).
+type RemoteInstallationPolicyContext struct {
+	PanelSourceIPs  []string
+	MasterURL       string
+	MasterPublicKey string
+}
+
+// RemoteServerInstallationPolicyFingerprintWithContext binds the server policy
+// and all panel-wide trust inputs into one digest. The server portion is
+// recomputed while the exclusive installation lease is held by Begin.
+func RemoteServerInstallationPolicyFingerprintWithContext(server *RemoteServer, policy RemoteInstallationPolicyContext) (string, error) {
+	serverFingerprint, err := RemoteServerInstallationPolicyFingerprint(server)
+	if err != nil {
+		return "", err
+	}
+	if len(policy.PanelSourceIPs) == 0 {
+		return "", errors.New("panel source IPs are required")
+	}
+	panelSourceIPs := append([]string(nil), policy.PanelSourceIPs...)
+	for index := range panelSourceIPs {
+		panelSourceIPs[index] = strings.TrimSpace(panelSourceIPs[index])
+		if panelSourceIPs[index] == "" || strings.ContainsAny(panelSourceIPs[index], "\r\n") {
+			return "", errors.New("invalid panel source IP")
+		}
+	}
+	sort.Strings(panelSourceIPs)
+	masterURL := strings.TrimSpace(policy.MasterURL)
+	if masterURL == "" || strings.ContainsAny(masterURL, "\r\n") {
+		return "", errors.New("effective master URL is required")
+	}
+	masterPublicKey := strings.TrimSpace(policy.MasterPublicKey)
+	if strings.ContainsAny(masterPublicKey, "\r\n") {
+		return "", errors.New("invalid master public key")
+	}
+	canonical := fmt.Sprintf(
+		"arcway-install-policy-v2\nserver=%s\npanel_source_ips=%s\nmaster_url=%s\nmaster_public_key=%s\n",
+		serverFingerprint, strings.Join(panelSourceIPs, ","), masterURL, masterPublicKey,
+	)
+	sum := sha256.Sum256([]byte(canonical))
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func remoteInstallationPolicyMatches(supplied, expected string) bool {
+	if len(supplied) != sha256.Size*2 || len(expected) != sha256.Size*2 {
+		return false
+	}
+	if _, err := hex.DecodeString(supplied); err != nil {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(strings.ToLower(supplied)), []byte(expected)) == 1
+}
+
+type remoteServerInstallation struct {
+	nonceHash     string
+	startedAt     int64
+	expiresAt     int64
+	readyAt       sql.NullInt64
+	preparedAt    sql.NullInt64
+	completedAt   sql.NullInt64
+	rollingBackAt sql.NullInt64
+	abortedAt     sql.NullInt64
+}
+
+func (r *TrafficRepository) getRemoteServerInstallation(ctx context.Context, serverID int64) (*remoteServerInstallation, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("traffic repository not initialized")
+	}
+	if serverID <= 0 {
+		return nil, errors.New("remote server id is required")
+	}
+
+	var installation remoteServerInstallation
+	err := r.db.QueryRowContext(ctx, `
+		SELECT nonce_hash, started_at, expires_at, ready_at, prepared_at, completed_at, rolling_back_at, aborted_at
+		FROM remote_server_installations
+		WHERE server_id = ?`, serverID).Scan(
+		&installation.nonceHash,
+		&installation.startedAt,
+		&installation.expiresAt,
+		&installation.readyAt,
+		&installation.preparedAt,
+		&installation.completedAt,
+		&installation.rollingBackAt,
+		&installation.abortedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get remote server installation: %w", err)
+	}
+	return &installation, nil
+}
+
+func remoteInstallationNonceMatches(installation *remoteServerInstallation, nonce string) bool {
+	if installation == nil || nonce == "" {
+		return false
+	}
+	want := remoteInstallationNonceHash(nonce)
+	return subtle.ConstantTimeCompare([]byte(installation.nonceHash), []byte(want)) == 1
+}
+
+func remoteInstallationMatches(installation *remoteServerInstallation, nonce string, now time.Time) bool {
+	return remoteInstallationNonceMatches(installation, nonce) &&
+		!installation.completedAt.Valid && !installation.abortedAt.Valid &&
+		installation.expiresAt > now.UnixNano()
+}
+
+func remoteInstallationUsable(installation *remoteServerInstallation, nonce string, now time.Time) bool {
+	return remoteInstallationMatches(installation, nonce, now) && !installation.rollingBackAt.Valid
+}
+
+func (r *TrafficRepository) remoteServerInstallationLease(serverID int64) *sync.RWMutex {
+	lease, _ := r.remoteInstallationLeases.LoadOrStore(serverID, &sync.RWMutex{})
+	return lease.(*sync.RWMutex)
+}
+
+type remoteServerMutationLeaseContextKey struct{}
+
+type remoteServerMutationLeaseContext struct {
+	repo               *TrafficRepository
+	heldServerIDs      map[int64]struct{}
+	exclusiveServerIDs map[int64]struct{}
+	bypassServerIDs    map[int64]struct{}
+}
+
+// RemoteServerMutationLeaseBypassContext marks an explicit installation
+// mutation for one server (the authenticated Prepare phase). The first
+// WithRemoteServerMutationLease call takes the exclusive lease but bypasses the
+// durable-active rejection; nested calls reuse it. Keep this context scoped to
+// that request.
+func (r *TrafficRepository) RemoteServerMutationLeaseBypassContext(ctx context.Context, serverID int64) context.Context {
+	previous, _ := ctx.Value(remoteServerMutationLeaseContextKey{}).(remoteServerMutationLeaseContext)
+	held := make(map[int64]struct{})
+	exclusive := make(map[int64]struct{})
+	bypassed := make(map[int64]struct{})
+	if previous.repo == r {
+		for id := range previous.heldServerIDs {
+			held[id] = struct{}{}
+		}
+		for id := range previous.bypassServerIDs {
+			bypassed[id] = struct{}{}
+		}
+		for id := range previous.exclusiveServerIDs {
+			exclusive[id] = struct{}{}
+		}
+	}
+	bypassed[serverID] = struct{}{}
+	return context.WithValue(ctx, remoteServerMutationLeaseContextKey{}, remoteServerMutationLeaseContext{
+		repo:               r,
+		heldServerIDs:      held,
+		exclusiveServerIDs: exclusive,
+		bypassServerIDs:    bypassed,
+	})
+}
+
+// AcquireRemoteServerMutationLease holds the server's installation lease from
+// the final durable-lock check until release. The returned context must be used
+// for all nested repository calls so same-server acquisition is reentrant even
+// when an installation Begin is waiting for the exclusive side of the lock.
+//
+// A context produced by RemoteServerMutationLeaseBypassContext takes the
+// exclusive side and skips only the durable-active rejection. This is reserved
+// for the authenticated Prepare transaction itself.
+func (r *TrafficRepository) AcquireRemoteServerMutationLease(ctx context.Context, serverID int64) (context.Context, func(), error) {
+	if r == nil || r.db == nil {
+		return nil, nil, errors.New("traffic repository not initialized")
+	}
+	if serverID <= 0 {
+		return nil, nil, errors.New("remote server id is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	state, _ := ctx.Value(remoteServerMutationLeaseContextKey{}).(remoteServerMutationLeaseContext)
+	if state.repo == r {
+		if _, held := state.heldServerIDs[serverID]; held {
+			return ctx, func() {}, nil
+		}
+	}
+
+	lease := r.remoteServerInstallationLease(serverID)
+	_, bypassed := state.bypassServerIDs[serverID]
+	exclusive := state.repo == r && bypassed
+	if exclusive {
+		lease.Lock()
+	} else {
+		lease.RLock()
+	}
+	unlock := func() {
+		if exclusive {
+			lease.Unlock()
+		} else {
+			lease.RUnlock()
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		unlock()
+		return nil, nil, err
+	}
+	if !exclusive {
+		active, err := r.IsRemoteServerInstallationActive(ctx, serverID)
+		if err != nil {
+			unlock()
+			return nil, nil, err
+		}
+		if active {
+			unlock()
+			return nil, nil, ErrRemoteInstallationActive
+		}
+	}
+	heldServerIDs := make(map[int64]struct{}, len(state.heldServerIDs)+1)
+	exclusiveServerIDs := make(map[int64]struct{}, len(state.exclusiveServerIDs))
+	bypassServerIDs := make(map[int64]struct{}, len(state.bypassServerIDs))
+	if state.repo == r {
+		for heldID := range state.heldServerIDs {
+			heldServerIDs[heldID] = struct{}{}
+		}
+		for bypassedID := range state.bypassServerIDs {
+			bypassServerIDs[bypassedID] = struct{}{}
+		}
+		for exclusiveID := range state.exclusiveServerIDs {
+			exclusiveServerIDs[exclusiveID] = struct{}{}
+		}
+	}
+	heldServerIDs[serverID] = struct{}{}
+	if exclusive {
+		exclusiveServerIDs[serverID] = struct{}{}
+	}
+	leasedCtx := context.WithValue(ctx, remoteServerMutationLeaseContextKey{}, remoteServerMutationLeaseContext{
+		repo:               r,
+		heldServerIDs:      heldServerIDs,
+		exclusiveServerIDs: exclusiveServerIDs,
+		bypassServerIDs:    bypassServerIDs,
+	})
+	var releaseOnce sync.Once
+	return leasedCtx, func() { releaseOnce.Do(unlock) }, nil
+}
+
+// WithRemoteServerMutationLease is the single-return convenience wrapper for
+// AcquireRemoteServerMutationLease. Multi-step handlers should acquire once and
+// defer release so reads, database writes, and cache updates share one lease.
+func (r *TrafficRepository) WithRemoteServerMutationLease(ctx context.Context, serverID int64, action func(context.Context) error) error {
+	if action == nil {
+		return errors.New("remote server mutation action is required")
+	}
+	leasedCtx, release, err := r.AcquireRemoteServerMutationLease(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return action(leasedCtx)
+}
+
+func (r *TrafficRepository) acquireRemoteServerInstallationExclusive(ctx context.Context, serverID int64) (func(), error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("traffic repository not initialized")
+	}
+	if serverID <= 0 {
+		return nil, errors.New("remote server id is required")
+	}
+	state, _ := ctx.Value(remoteServerMutationLeaseContextKey{}).(remoteServerMutationLeaseContext)
+	if state.repo == r {
+		if _, exclusive := state.exclusiveServerIDs[serverID]; exclusive {
+			return func() {}, nil
+		}
+		if _, held := state.heldServerIDs[serverID]; held {
+			return nil, errors.New("cannot acquire installation exclusive lease while shared mutation lease is held")
+		}
+	}
+	lease := r.remoteServerInstallationLease(serverID)
+	lease.Lock()
+	if err := ctx.Err(); err != nil {
+		lease.Unlock()
+		return nil, err
+	}
+	return lease.Unlock, nil
+}
+
+func (r *TrafficRepository) validateRemoteServerInstallationPolicyLocked(ctx context.Context, serverID int64, suppliedFingerprint string) error {
+	server, err := r.GetRemoteServer(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	expectedFingerprint, err := RemoteServerInstallationPolicyFingerprint(server)
+	if err != nil {
+		return fmt.Errorf("calculate remote installation policy: %w", err)
+	}
+	if !remoteInstallationPolicyMatches(suppliedFingerprint, expectedFingerprint) {
+		return ErrRemoteInstallationPolicy
+	}
+	return nil
+}
+
+func (r *TrafficRepository) validateRemoteServerInstallationPolicyContextLocked(ctx context.Context, serverID int64, suppliedFingerprint string, policy RemoteInstallationPolicyContext) error {
+	server, err := r.GetRemoteServer(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	expectedFingerprint, err := RemoteServerInstallationPolicyFingerprintWithContext(server, policy)
+	if err != nil {
+		return fmt.Errorf("calculate remote installation policy context: %w", err)
+	}
+	if !remoteInstallationPolicyMatches(suppliedFingerprint, expectedFingerprint) {
+		return ErrRemoteInstallationPolicy
+	}
+	return nil
+}
+
+func (r *TrafficRepository) beginRemoteServerInstallationLocked(ctx context.Context, serverID int64, nonce string, expiresAt, now time.Time) error {
+	result, err := r.db.ExecContext(ctx, `
+		INSERT INTO remote_server_installations (
+			server_id, nonce_hash, started_at, expires_at, ready_at, prepared_at, completed_at, rolling_back_at, aborted_at
+		)
+		SELECT id, ?, ?, ?, NULL, NULL, NULL, NULL, NULL FROM remote_servers WHERE id = ?
+		ON CONFLICT(server_id) DO UPDATE SET
+			nonce_hash = excluded.nonce_hash,
+			started_at = excluded.started_at,
+			expires_at = excluded.expires_at,
+			ready_at = NULL,
+			prepared_at = NULL,
+			completed_at = NULL,
+			rolling_back_at = NULL,
+			aborted_at = NULL
+		WHERE remote_server_installations.nonce_hash <> excluded.nonce_hash
+			AND (remote_server_installations.completed_at IS NOT NULL
+				OR remote_server_installations.aborted_at IS NOT NULL
+				OR remote_server_installations.expires_at <= ?)`,
+		remoteInstallationNonceHash(nonce), now.UnixNano(), expiresAt.UnixNano(), serverID, now.UnixNano())
+	if err != nil {
+		return fmt.Errorf("begin remote server installation: %w", err)
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return fmt.Errorf("begin remote server installation rows affected: %w", err)
+	} else if affected == 0 {
+		installation, installErr := r.getRemoteServerInstallation(ctx, serverID)
+		if installErr != nil {
+			return installErr
+		}
+		if remoteInstallationNonceMatches(installation, nonce) {
+			switch {
+			case installation.abortedAt.Valid:
+				return ErrRemoteInstallationAborted
+			case installation.completedAt.Valid, installation.rollingBackAt.Valid, installation.expiresAt <= now.UnixNano():
+				return ErrRemoteInstallationInvalid
+			default:
+				// A response-loss retry for the same live transaction keeps the
+				// original expiry and readiness state.
+				return nil
+			}
+		}
+		var exists int
+		if err := r.db.QueryRowContext(ctx, `SELECT 1 FROM remote_servers WHERE id = ?`, serverID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+			return ErrRemoteServerNotFound
+		} else if err != nil {
+			return fmt.Errorf("check remote server after installation conflict: %w", err)
+		}
+		return ErrRemoteInstallationActive
+	}
+	return nil
+}
+
+// BeginRemoteServerInstallation creates a durable transaction for trusted
+// internal callers. The authenticated HTTP installer must use the policy-bound
+// variant below so a downloaded script cannot outlive a policy edit.
+func (r *TrafficRepository) BeginRemoteServerInstallation(ctx context.Context, serverID int64, nonce string, expiresAt time.Time) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	if serverID <= 0 {
+		return errors.New("remote server id is required")
+	}
+	if nonce == "" {
+		return errors.New("installation nonce is required")
+	}
+	now := time.Now()
+	if !expiresAt.After(now) {
+		return errors.New("installation expiry must be in the future")
+	}
+	release, err := r.acquireRemoteServerInstallationExclusive(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return r.beginRemoteServerInstallationLocked(ctx, serverID, nonce, expiresAt, now)
+}
+
+// BeginRemoteServerInstallationWithPolicy compares the downloaded script's
+// fingerprint against a fresh database read while holding the same exclusive
+// lease that creates the durable transaction.
+func (r *TrafficRepository) BeginRemoteServerInstallationWithPolicy(ctx context.Context, serverID int64, nonce string, expiresAt time.Time, policyFingerprint string) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	if serverID <= 0 {
+		return errors.New("remote server id is required")
+	}
+	if nonce == "" {
+		return errors.New("installation nonce is required")
+	}
+	now := time.Now()
+	if !expiresAt.After(now) {
+		return errors.New("installation expiry must be in the future")
+	}
+	release, err := r.acquireRemoteServerInstallationExclusive(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if err := r.validateRemoteServerInstallationPolicyLocked(ctx, serverID, policyFingerprint); err != nil {
+		return err
+	}
+	return r.beginRemoteServerInstallationLocked(ctx, serverID, nonce, expiresAt, now)
+}
+
+// BeginRemoteServerInstallationWithPolicyContext validates server-specific and
+// panel-wide trust inputs while holding the same exclusive lease that creates
+// the durable installation row.
+func (r *TrafficRepository) BeginRemoteServerInstallationWithPolicyContext(ctx context.Context, serverID int64, nonce string, expiresAt time.Time, policyFingerprint string, policy RemoteInstallationPolicyContext) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	if serverID <= 0 {
+		return errors.New("remote server id is required")
+	}
+	if nonce == "" {
+		return errors.New("installation nonce is required")
+	}
+	now := time.Now()
+	if !expiresAt.After(now) {
+		return errors.New("installation expiry must be in the future")
+	}
+	release, err := r.acquireRemoteServerInstallationExclusive(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if err := r.validateRemoteServerInstallationPolicyContextLocked(ctx, serverID, policyFingerprint, policy); err != nil {
+		return err
+	}
+	return r.beginRemoteServerInstallationLocked(ctx, serverID, nonce, expiresAt, now)
+}
+
+// RenewRemoteServerInstallation extends a live nonce-bound lease without ever
+// moving it past started_at+maxLifetime. Expired, rolling-back, aborted, and
+// completed transactions cannot be resurrected.
+func (r *TrafficRepository) RenewRemoteServerInstallation(ctx context.Context, serverID int64, nonce string, now time.Time, ttl, maxLifetime time.Duration) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	if serverID <= 0 || nonce == "" {
+		return ErrRemoteInstallationInvalid
+	}
+	if ttl <= 0 || maxLifetime <= 0 || ttl > maxLifetime {
+		return errors.New("invalid installation renewal policy")
+	}
+	release, err := r.acquireRemoteServerInstallationExclusive(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	installation, err := r.getRemoteServerInstallation(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	if !remoteInstallationUsable(installation, nonce, now) || installation.startedAt <= 0 {
+		if remoteInstallationMatches(installation, nonce, now) && installation.rollingBackAt.Valid {
+			return ErrRemoteInstallationRollingBack
+		}
+		if remoteInstallationNonceMatches(installation, nonce) && installation != nil && installation.abortedAt.Valid {
+			return ErrRemoteInstallationAborted
+		}
+		return ErrRemoteInstallationInvalid
+	}
+	hardDeadline := time.Unix(0, installation.startedAt).Add(maxLifetime)
+	if !hardDeadline.After(now) {
+		return ErrRemoteInstallationInvalid
+	}
+	newExpiry := now.Add(ttl)
+	if newExpiry.After(hardDeadline) {
+		newExpiry = hardDeadline
+	}
+	result, err := r.db.ExecContext(ctx, `
+		UPDATE remote_server_installations
+		SET expires_at = ?
+		WHERE server_id = ? AND nonce_hash = ? AND started_at = ? AND expires_at = ?
+			AND completed_at IS NULL AND aborted_at IS NULL
+			AND rolling_back_at IS NULL AND expires_at > ?`,
+		newExpiry.UnixNano(), serverID, installation.nonceHash, installation.startedAt,
+		installation.expiresAt, now.UnixNano())
+	if err != nil {
+		return fmt.Errorf("renew remote server installation: %w", err)
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return fmt.Errorf("renew remote server installation rows affected: %w", err)
+	} else if affected == 0 {
+		return ErrRemoteInstallationInvalid
+	}
+	return nil
+}
+
+// ValidateRemoteServerInstallation verifies the nonce without exposing its
+// stored digest. Expired installations are invalid even if the nonce matches.
+func (r *TrafficRepository) ValidateRemoteServerInstallation(ctx context.Context, serverID int64, nonce string) (bool, error) {
+	installation, err := r.getRemoteServerInstallation(ctx, serverID)
+	if err != nil {
+		return false, err
+	}
+	return remoteInstallationUsable(installation, nonce, time.Now()), nil
+}
+
+// ValidateRemoteServerInstallationReady authorizes the explicit prepare phase:
+// the transaction must be live, nonce-bound, and already management-ready.
+func (r *TrafficRepository) ValidateRemoteServerInstallationReady(ctx context.Context, serverID int64, nonce string) (bool, error) {
+	installation, err := r.getRemoteServerInstallation(ctx, serverID)
+	if err != nil {
+		return false, err
+	}
+	return remoteInstallationUsable(installation, nonce, time.Now()) && installation.readyAt.Valid, nil
+}
+
+// MarkRemoteServerInstallationReady records that the management readiness
+// checks passed. It is idempotent for the same live installation.
+func (r *TrafficRepository) MarkRemoteServerInstallationReady(ctx context.Context, serverID int64, nonce string) error {
+	installation, err := r.getRemoteServerInstallation(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	if !remoteInstallationUsable(installation, nonce, time.Now()) {
+		return ErrRemoteInstallationInvalid
+	}
+
+	readyAt := time.Now().UnixNano()
+	result, err := r.db.ExecContext(ctx, `
+		UPDATE remote_server_installations
+		SET ready_at = COALESCE(ready_at, ?)
+		WHERE server_id = ? AND nonce_hash = ? AND expires_at = ?
+			AND completed_at IS NULL AND aborted_at IS NULL
+			AND rolling_back_at IS NULL AND expires_at > ?`,
+		readyAt, serverID, installation.nonceHash, installation.expiresAt, readyAt)
+	if err != nil {
+		return fmt.Errorf("mark remote server installation ready: %w", err)
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return fmt.Errorf("mark remote server installation ready rows affected: %w", err)
+	} else if affected == 0 {
+		return ErrRemoteInstallationInvalid
+	}
+	return nil
+}
+
+// MarkRemoteServerInstallationRollingBack quiesces panel-side writes before a
+// failed installer restores local files. The exclusive lease waits for an
+// in-flight Prepare to finish; the durable state then blocks later Prepare
+// requests and all ordinary mutations until Abort records its tombstone.
+func (r *TrafficRepository) MarkRemoteServerInstallationRollingBack(ctx context.Context, serverID int64, nonce string) error {
+	release, err := r.acquireRemoteServerInstallationExclusive(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	installation, err := r.getRemoteServerInstallation(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	if !remoteInstallationMatches(installation, nonce, time.Now()) {
+		return ErrRemoteInstallationInvalid
+	}
+	if installation.rollingBackAt.Valid {
+		return nil
+	}
+
+	now := time.Now().UnixNano()
+	result, err := r.db.ExecContext(ctx, `
+		UPDATE remote_server_installations
+		SET rolling_back_at = COALESCE(rolling_back_at, ?)
+		WHERE server_id = ? AND nonce_hash = ? AND expires_at = ?
+			AND completed_at IS NULL AND aborted_at IS NULL AND expires_at > ?`,
+		now, serverID, installation.nonceHash, installation.expiresAt, now)
+	if err != nil {
+		return fmt.Errorf("mark remote server installation rolling back: %w", err)
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return fmt.Errorf("mark remote server installation rolling back rows affected: %w", err)
+	} else if affected == 0 {
+		return ErrRemoteInstallationInvalid
+	}
+	return nil
+}
+
+// MarkRemoteServerInstallationPrepared records that the panel deployed the
+// desired Xray/Nginx state successfully. Preparation is valid only after the
+// management readiness phase and is idempotent for the same live transaction.
+func (r *TrafficRepository) MarkRemoteServerInstallationPrepared(ctx context.Context, serverID int64, nonce string) error {
+	installation, err := r.getRemoteServerInstallation(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	if !remoteInstallationUsable(installation, nonce, time.Now()) {
+		if remoteInstallationMatches(installation, nonce, time.Now()) && installation.rollingBackAt.Valid {
+			return ErrRemoteInstallationRollingBack
+		}
+		return ErrRemoteInstallationInvalid
+	}
+	if !installation.readyAt.Valid {
+		return ErrRemoteInstallationNotReady
+	}
+
+	preparedAt := time.Now().UnixNano()
+	result, err := r.db.ExecContext(ctx, `
+		UPDATE remote_server_installations
+		SET prepared_at = COALESCE(prepared_at, ?)
+		WHERE server_id = ? AND nonce_hash = ? AND expires_at = ?
+			AND ready_at IS NOT NULL AND completed_at IS NULL
+			AND aborted_at IS NULL AND rolling_back_at IS NULL AND expires_at > ?`,
+		preparedAt, serverID, installation.nonceHash, installation.expiresAt, preparedAt)
+	if err != nil {
+		return fmt.Errorf("mark remote server installation prepared: %w", err)
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return fmt.Errorf("mark remote server installation prepared rows affected: %w", err)
+	} else if affected == 0 {
+		return ErrRemoteInstallationInvalid
+	}
+	return nil
+}
+
+// FinalizeRemoteServerInstallation marks a prepared installation completed.
+// The nonce-bound tombstone makes response-loss retries idempotent while
+// IsActive immediately stops blocking automatic mutations.
+func (r *TrafficRepository) FinalizeRemoteServerInstallation(ctx context.Context, serverID int64, nonce string) error {
+	release, err := r.acquireRemoteServerInstallationExclusive(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	installation, err := r.getRemoteServerInstallation(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	if !remoteInstallationNonceMatches(installation, nonce) {
+		return ErrRemoteInstallationInvalid
+	}
+	if installation.completedAt.Valid {
+		return nil
+	}
+	if installation.abortedAt.Valid {
+		return ErrRemoteInstallationAborted
+	}
+	if installation.rollingBackAt.Valid {
+		return ErrRemoteInstallationRollingBack
+	}
+	if installation.expiresAt <= time.Now().UnixNano() {
+		return ErrRemoteInstallationInvalid
+	}
+	if !installation.readyAt.Valid {
+		return ErrRemoteInstallationNotReady
+	}
+	if !installation.preparedAt.Valid {
+		return ErrRemoteInstallationNotPrepared
+	}
+
+	now := time.Now().UnixNano()
+	result, err := r.db.ExecContext(ctx, `
+		UPDATE remote_server_installations
+		SET completed_at = COALESCE(completed_at, ?)
+		WHERE server_id = ? AND nonce_hash = ? AND expires_at = ?
+			AND ready_at = ? AND prepared_at = ? AND completed_at IS NULL
+			AND aborted_at IS NULL AND rolling_back_at IS NULL AND expires_at > ?`,
+		now, serverID, installation.nonceHash, installation.expiresAt,
+		installation.readyAt.Int64, installation.preparedAt.Int64, now)
+	if err != nil {
+		return fmt.Errorf("finalize remote server installation: %w", err)
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return fmt.Errorf("finalize remote server installation rows affected: %w", err)
+	} else if affected == 0 {
+		latest, latestErr := r.getRemoteServerInstallation(ctx, serverID)
+		if latestErr != nil {
+			return latestErr
+		}
+		if remoteInstallationNonceMatches(latest, nonce) && latest.completedAt.Valid {
+			return nil
+		}
+		return ErrRemoteInstallationInvalid
+	}
+	return nil
+}
+
+// AbortRemoteServerInstallation records a nonce-bound tombstone. It may arrive
+// before a timed-out Begin request; the later same-nonce Begin then fails closed
+// instead of recreating an active lock. A different nonce may replace an
+// aborted, completed, or expired row.
+func (r *TrafficRepository) AbortRemoteServerInstallation(ctx context.Context, serverID int64, nonce string) error {
+	if nonce == "" {
+		return errors.New("installation nonce is required")
+	}
+	release, err := r.acquireRemoteServerInstallationExclusive(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	installation, err := r.getRemoteServerInstallation(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	nowUnix := now.UnixNano()
+	tombstoneExpiry := now.Add(remoteInstallationAbortedTTL).UnixNano()
+	if remoteInstallationNonceMatches(installation, nonce) {
+		if installation.completedAt.Valid {
+			return ErrRemoteInstallationInvalid
+		}
+		if installation.abortedAt.Valid {
+			return nil
+		}
+		result, err := r.db.ExecContext(ctx, `
+			UPDATE remote_server_installations
+			SET aborted_at = ?, expires_at = CASE WHEN expires_at > ? THEN expires_at ELSE ? END
+			WHERE server_id = ? AND nonce_hash = ? AND completed_at IS NULL AND aborted_at IS NULL`,
+			nowUnix, tombstoneExpiry, tombstoneExpiry, serverID, installation.nonceHash)
+		if err != nil {
+			return fmt.Errorf("abort remote server installation: %w", err)
+		}
+		if affected, err := result.RowsAffected(); err != nil {
+			return fmt.Errorf("abort remote server installation rows affected: %w", err)
+		} else if affected == 0 {
+			return ErrRemoteInstallationInvalid
+		}
+		return nil
+	}
+	result, err := r.db.ExecContext(ctx, `
+		INSERT INTO remote_server_installations (
+			server_id, nonce_hash, started_at, expires_at, ready_at, prepared_at, completed_at, rolling_back_at, aborted_at
+		)
+		SELECT id, ?, ?, ?, NULL, NULL, NULL, NULL, ? FROM remote_servers WHERE id = ?
+		ON CONFLICT(server_id) DO UPDATE SET
+			nonce_hash = excluded.nonce_hash,
+			started_at = excluded.started_at,
+			expires_at = excluded.expires_at,
+			ready_at = NULL,
+			prepared_at = NULL,
+			completed_at = NULL,
+			rolling_back_at = NULL,
+			aborted_at = excluded.aborted_at
+		WHERE remote_server_installations.completed_at IS NOT NULL
+			OR remote_server_installations.aborted_at IS NOT NULL
+			OR remote_server_installations.expires_at <= ?`,
+		remoteInstallationNonceHash(nonce), nowUnix, tombstoneExpiry, nowUnix, serverID, nowUnix)
+	if err != nil {
+		return fmt.Errorf("abort remote server installation: %w", err)
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return fmt.Errorf("abort remote server installation rows affected: %w", err)
+	} else if affected == 0 {
+		if installation == nil {
+			var exists int
+			if err := r.db.QueryRowContext(ctx, `SELECT 1 FROM remote_servers WHERE id = ?`, serverID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+				return ErrRemoteServerNotFound
+			} else if err != nil {
+				return fmt.Errorf("check remote server after abort conflict: %w", err)
+			}
+		}
+		return ErrRemoteInstallationInvalid
+	}
+	return nil
+}
+
+// IsRemoteServerInstallationActive reports whether a non-expired installation
+// transaction exists. Expired rows deliberately remain available for audit but
+// never block automatic deployment.
+func (r *TrafficRepository) IsRemoteServerInstallationActive(ctx context.Context, serverID int64) (bool, error) {
+	installation, err := r.getRemoteServerInstallation(ctx, serverID)
+	if err != nil {
+		return false, err
+	}
+	return installation != nil && !installation.completedAt.Valid && !installation.abortedAt.Valid && installation.expiresAt > time.Now().UnixNano(), nil
+}
+
 // 远程服务器CRUD操作
 
 // 返回所有远程服务器。
@@ -9220,7 +10228,7 @@ func (r *TrafficRepository) ListRemoteServers(ctx context.Context) ([]RemoteServ
 		COALESCE(xray_running, 0), COALESCE(xray_version, ''), xray_scanned_at,
 		COALESCE(listen_port, 0), COALESCE(traffic_limit, 0), COALESCE(traffic_reset_day, 0),
 		COALESCE(agent_token, ''), agent_token_expires_at, last_agent_token_refresh,
-		COALESCE(use_443, 0), COALESCE(steal_mode, 'tunnel'),
+		COALESCE(use_443, 0), COALESCE(steal_self, 0), COALESCE(steal_mode, 'tunnel'),
 		COALESCE(site_type, ''), COALESCE(site_value, ''),
 		COALESCE(xray_mode, 'external'),
 		COALESCE(time_offset_seconds, 0),
@@ -9260,7 +10268,7 @@ func (r *TrafficRepository) ListRemoteServers(ctx context.Context) ([]RemoteServ
 			&xrayRunning, &server.XrayVersion, &xrayScannedAt,
 			&server.ListenPort, &server.TrafficLimit, &server.TrafficResetDay,
 			&server.AgentToken, &agentTokenExpiresAt, &lastAgentTokenRefresh,
-			&server.Use443, &server.StealMode,
+			&server.Use443, &server.StealSelf, &server.StealMode,
 			&server.SiteType, &server.SiteValue,
 			&server.XrayMode,
 			&timeOffsetSeconds,
@@ -9347,7 +10355,7 @@ func (r *TrafficRepository) GetRemoteServer(ctx context.Context, id int64) (*Rem
 		COALESCE(connection_mode, 'push'), COALESCE(pull_address, ''), COALESCE(pull_port, 0), COALESCE(pull_token, ''), last_pull_at,
 		COALESCE(listen_port, 0),
 		COALESCE(agent_token, ''), agent_token_expires_at, last_agent_token_refresh,
-		COALESCE(use_443, 0), COALESCE(steal_mode, 'tunnel'),
+		COALESCE(use_443, 0), COALESCE(steal_self, 0), COALESCE(steal_mode, 'tunnel'),
 		COALESCE(site_type, ''), COALESCE(site_value, ''),
 		COALESCE(xray_mode, 'external'),
 		COALESCE(traffic_limit, 0), COALESCE(traffic_reset_day, 0),
@@ -9376,7 +10384,7 @@ func (r *TrafficRepository) GetRemoteServer(ctx context.Context, id int64) (*Rem
 		&server.ConnectionMode, &server.PullAddress, &server.PullPort, &server.PullToken, &lastPullAt,
 		&server.ListenPort,
 		&server.AgentToken, &agentTokenExpiresAt, &lastAgentTokenRefresh,
-		&server.Use443, &server.StealMode,
+		&server.Use443, &server.StealSelf, &server.StealMode,
 		&server.SiteType, &server.SiteValue,
 		&server.XrayMode,
 		&server.TrafficLimit, &server.TrafficResetDay,
@@ -9444,8 +10452,9 @@ func (r *TrafficRepository) GetRemoteServerByToken(ctx context.Context, token st
 		boot_time, xray_boot_time, COALESCE(boot_count, 0), COALESCE(xray_boot_count, 0),
 		token_expires_at, last_token_refresh,
 		COALESCE(connection_mode, 'push'), COALESCE(pull_address, ''), COALESCE(pull_port, 0), COALESCE(pull_token, ''), last_pull_at,
+		COALESCE(listen_port, 0),
 		COALESCE(agent_token, ''), agent_token_expires_at, last_agent_token_refresh,
-		COALESCE(use_443, 0), COALESCE(steal_mode, 'tunnel'),
+		COALESCE(use_443, 0), COALESCE(steal_self, 0), COALESCE(steal_mode, 'tunnel'),
 		COALESCE(site_type, ''), COALESCE(site_value, ''),
 		COALESCE(xray_mode, 'external'),
 		COALESCE(ddns_enabled, 0), COALESCE(ddns_provider_id, 0), ddns_last_synced_at, COALESCE(ddns_last_error, ''), COALESCE(ddns_pending, 0),
@@ -9462,8 +10471,9 @@ func (r *TrafficRepository) GetRemoteServerByToken(ctx context.Context, token st
 		&bootTime, &xrayBootTime, &server.BootCount, &server.XrayBootCount,
 		&tokenExpiresAt, &lastTokenRefresh,
 		&server.ConnectionMode, &server.PullAddress, &server.PullPort, &server.PullToken, &lastPullAt,
+		&server.ListenPort,
 		&server.AgentToken, &agentTokenExpiresAt, &lastAgentTokenRefresh,
-		&server.Use443, &server.StealMode,
+		&server.Use443, &server.StealSelf, &server.StealMode,
 		&server.SiteType, &server.SiteValue,
 		&server.XrayMode,
 		&ddnsEnabledInt, &server.DDNSProviderID, &ddnsLastSyncedAt, &server.DDNSLastError, &ddnsPendingInt,
@@ -9520,7 +10530,7 @@ func (r *TrafficRepository) GetRemoteServerByName(ctx context.Context, name stri
 		COALESCE(connection_mode, 'push'), COALESCE(pull_address, ''), COALESCE(pull_port, 0), COALESCE(pull_token, ''), last_pull_at,
 		COALESCE(listen_port, 0),
 		COALESCE(agent_token, ''), agent_token_expires_at, last_agent_token_refresh,
-		COALESCE(use_443, 0), COALESCE(steal_mode, 'tunnel'),
+		COALESCE(use_443, 0), COALESCE(steal_self, 0), COALESCE(steal_mode, 'tunnel'),
 		COALESCE(site_type, ''), COALESCE(site_value, ''),
 		COALESCE(xray_mode, 'external'),
 		COALESCE(ddns_enabled, 0), COALESCE(ddns_provider_id, 0), ddns_last_synced_at, COALESCE(ddns_last_error, ''), COALESCE(ddns_pending, 0),
@@ -9539,7 +10549,7 @@ func (r *TrafficRepository) GetRemoteServerByName(ctx context.Context, name stri
 		&server.ConnectionMode, &server.PullAddress, &server.PullPort, &server.PullToken, &lastPullAt,
 		&server.ListenPort,
 		&server.AgentToken, &agentTokenExpiresAt, &lastAgentTokenRefresh,
-		&server.Use443, &server.StealMode,
+		&server.Use443, &server.StealSelf, &server.StealMode,
 		&server.SiteType, &server.SiteValue,
 		&server.XrayMode,
 		&ddnsEnabledInt, &server.DDNSProviderID, &ddnsLastSyncedAt, &server.DDNSLastError, &ddnsPendingInt,
@@ -9617,7 +10627,7 @@ func (r *TrafficRepository) CreateRemoteServer(ctx context.Context, server *Remo
 	// 将令牌有效期设置为从现在起 7 天
 	tokenExpiresAt := time.Now().Add(7 * 24 * time.Hour)
 
-	const stmt = `INSERT INTO remote_servers (name, token, status, ip_address, ip_address_v6, ipv6_enabled, domain, token_expires_at, last_token_refresh, connection_mode, listen_port, pull_address, pull_port, pull_token, use_443, steal_mode, site_type, site_value, xray_mode, traffic_limit, traffic_used_offset, traffic_reset_day, traffic_stats_mode, traffic_source, ddns_enabled, ddns_provider_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+	const stmt = `INSERT INTO remote_servers (name, token, status, ip_address, ip_address_v6, ipv6_enabled, domain, token_expires_at, last_token_refresh, connection_mode, listen_port, pull_address, pull_port, pull_token, use_443, steal_self, steal_mode, site_type, site_value, xray_mode, traffic_limit, traffic_used_offset, traffic_reset_day, traffic_stats_mode, traffic_source, ddns_enabled, ddns_provider_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
 
 	stealMode := server.StealMode
 	if stealMode == "" {
@@ -9641,7 +10651,7 @@ func (r *TrafficRepository) CreateRemoteServer(ctx context.Context, server *Remo
 	if server.DDNSEnabled {
 		ddnsEnabledInt = 1
 	}
-	result, err := r.db.ExecContext(ctx, stmt, server.Name, server.Token, server.Status, server.IPAddress, server.IPAddressV6, server.IPv6Enabled, server.Domain, tokenExpiresAt, server.ConnectionMode, server.ListenPort, server.PullAddress, server.PullPort, server.PullToken, server.Use443, stealMode, server.SiteType, server.SiteValue, xrayMode, server.TrafficLimit, server.TrafficUsedOffset, server.TrafficResetDay, statsMode, trafficSource, ddnsEnabledInt, server.DDNSProviderID)
+	result, err := r.db.ExecContext(ctx, stmt, server.Name, server.Token, server.Status, server.IPAddress, server.IPAddressV6, server.IPv6Enabled, server.Domain, tokenExpiresAt, server.ConnectionMode, server.ListenPort, server.PullAddress, server.PullPort, server.PullToken, server.Use443, server.StealSelf, stealMode, server.SiteType, server.SiteValue, xrayMode, server.TrafficLimit, server.TrafficUsedOffset, server.TrafficResetDay, statsMode, trafficSource, ddnsEnabledInt, server.DDNSProviderID)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			return ErrRemoteServerExists
@@ -9844,6 +10854,16 @@ func (r *TrafficRepository) UpdateRemoteServerHeartbeatWithRestart(ctx context.C
 	if err != nil {
 		return nil, err
 	}
+	reportedListenPort := update.ListenPort
+	if !IsValidRemoteManagementListenPort(reportedListenPort) {
+		return nil, fmt.Errorf("invalid Agent listen port %d", reportedListenPort)
+	}
+	effectiveListenPort := server.ListenPort
+	if effectiveListenPort <= 0 {
+		effectiveListenPort = reportedListenPort
+	} else if reportedListenPort > 0 && reportedListenPort != effectiveListenPort {
+		return nil, fmt.Errorf("%w: reported %d, provisioned %d", ErrRemoteListenPortMismatch, reportedListenPort, effectiveListenPort)
+	}
 
 	result := &HeartbeatResult{
 		ServerID:       server.ID,
@@ -9911,7 +10931,7 @@ func (r *TrafficRepository) UpdateRemoteServerHeartbeatWithRestart(ctx context.C
 		update.XrayBootTime,
 		result.BootCount,
 		result.XrayBootCount,
-		update.ListenPort,
+		effectiveListenPort,
 		pullAddress,
 		update.TimeOffsetSeconds,
 		token)
@@ -9932,6 +10952,7 @@ func (r *TrafficRepository) UpdateRemoteServerHeartbeatWithRestart(ctx context.C
 		if v6Changed {
 			latest.IPAddressV6 = update.IPAddressV6
 		}
+		latest.ListenPort = effectiveListenPort
 		latest.PullAddress = pullAddress
 		result.IPChanged = true
 		result.Server = &latest
@@ -10288,7 +11309,8 @@ func (r *TrafficRepository) UpdateRemoteServerXrayStatus(ctx context.Context, id
 	return prev != 0, nil
 }
 
-// UpdateRemoteServerListenPort 仅更新 Agent 监听端口字段(编辑服务器场景)。0 表示沿用 agent 默认 23889。
+// UpdateRemoteServerListenPort updates the provisioned Agent port for initial
+// migration/setup helpers. Runtime edits must reinstall the remote server.
 func (r *TrafficRepository) UpdateRemoteServerListenPort(ctx context.Context, id int64, port int) error {
 	if r == nil || r.db == nil {
 		return errors.New("traffic repository not initialized")
@@ -10296,7 +11318,7 @@ func (r *TrafficRepository) UpdateRemoteServerListenPort(ctx context.Context, id
 	if id <= 0 {
 		return errors.New("remote server id is required")
 	}
-	if port < 0 || port > 65535 {
+	if !IsValidRemoteManagementListenPort(port) {
 		return errors.New("listen_port out of range")
 	}
 	_, err := r.db.ExecContext(ctx,
@@ -10432,6 +11454,13 @@ func (r *TrafficRepository) UpdateRemoteServer(ctx context.Context, id int64, na
 	if name == "" {
 		return errors.New("remote server name is required")
 	}
+	leasedCtx, release, err := r.AcquireRemoteServerMutationLease(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer release()
+	ctx = leasedCtx
+
 	var existingID int64
 	if err := r.db.QueryRowContext(ctx, `SELECT id FROM remote_servers WHERE name = ? AND id != ? LIMIT 1`, name, id).Scan(&existingID); err == nil {
 		return ErrRemoteServerExists
@@ -10514,7 +11543,8 @@ func (r *TrafficRepository) UpdateRemoteServerStealMode(ctx context.Context, id 
 	if r == nil || r.db == nil {
 		return errors.New("traffic repository not initialized")
 	}
-	result, err := r.db.ExecContext(ctx, `UPDATE remote_servers SET steal_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, stealMode, id)
+	stealSelf := stealMode == "tunnel" || stealMode == "fallback"
+	result, err := r.db.ExecContext(ctx, `UPDATE remote_servers SET steal_mode = ?, steal_self = ?, use_443 = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, stealMode, stealSelf, stealSelf, id)
 	if err != nil {
 		return fmt.Errorf("update steal_mode: %w", err)
 	}
@@ -10576,6 +11606,12 @@ func (r *TrafficRepository) DeleteRemoteServer(ctx context.Context, id int64) er
 	if id <= 0 {
 		return errors.New("remote server id is required")
 	}
+	leasedCtx, release, err := r.AcquireRemoteServerMutationLease(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer release()
+	ctx = leasedCtx
 
 	// nodes / user_subaccounts 按服务器**名字**(nodes.original_server)关联,先取出来。
 	var name string
@@ -10615,6 +11651,8 @@ func (r *TrafficRepository) DeleteRemoteServer(ctx context.Context, id int64) er
 	//    注:证书(certificates.remote_server_id)按用户要求保留不动;dns_providers / custom_rules 为全局可复用资源,不在此列。
 	for _, table := range []string{
 		// 活跃运营配置
+		"remote_server_installations",
+		"remote_server_install_tickets",
 		"user_inbound_configs",
 		"user_outbounds",
 		"server_xray_config_snapshots",

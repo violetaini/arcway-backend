@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -13,6 +14,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"miaomiaowux/internal/capabilities"
@@ -36,6 +38,8 @@ type XrayServerHandler struct {
 	crypto            *CryptoConfig
 	capabilityManager *capabilities.Manager
 	ddnsManager       *ddns.Manager
+	managementProbeMu sync.Mutex
+	managementProbes  map[int64]time.Time
 }
 
 func (h *XrayServerHandler) SetWSHandler(ws *RemoteWSHandler) {
@@ -48,9 +52,10 @@ func (h *XrayServerHandler) SetDDNSManager(m *ddns.Manager) {
 
 func NewXrayServerHandler(repo *storage.TrafficRepository, collector *traffic.Collector, crypto *CryptoConfig) *XrayServerHandler {
 	return &XrayServerHandler{
-		repo:      repo,
-		collector: collector,
-		crypto:    crypto,
+		repo:             repo,
+		collector:        collector,
+		crypto:           crypto,
+		managementProbes: make(map[int64]time.Time),
 	}
 }
 
@@ -145,7 +150,7 @@ type RemoteServerUpdateRequest struct {
 	TrafficResetDay  int    `json:"traffic_reset_day"`
 	TrafficUsed      *int64 `json:"traffic_used"`
 	ConnectionMode   string `json:"connection_mode"`
-	ListenPort       int    `json:"listen_port"` // Agent HTTP 监听端口;变更时主控会通知 agent 改配置+重启
+	ListenPort       int    `json:"listen_port"` // Agent HTTP 监听端口;安装后不可单独修改
 	PullAddress      string `json:"pull_address"`
 	PullPort         int    `json:"pull_port"`
 	PullToken        string `json:"pull_token"`
@@ -273,12 +278,30 @@ func (h *XrayServerHandler) RevealServerToken(w stdhttp.ResponseWriter, r *stdht
 		json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "server not found"})
 		return
 	}
+	var panelSourceIPs []string
+	if server.ConnectionMode != storage.ConnectionModePull {
+		panelSourceIPs, err = configuredPanelSourceIPs()
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(stdhttp.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "trusted panel source IPs are not configured"})
+			return
+		}
+	}
+	installCommand, err := h.buildRemoteInstallCommand(r, server, panelSourceIPs, server.StealSelf, "xray")
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(stdhttp.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "failed to build install command"})
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"success":     true,
-		"token":       server.Token,
-		"pull_token":  server.PullToken,
-		"agent_token": server.AgentToken,
+		"success":         true,
+		"token":           server.Token,
+		"pull_token":      server.PullToken,
+		"agent_token":     server.AgentToken,
+		"install_command": installCommand,
 	})
 }
 
@@ -317,6 +340,115 @@ func isDottedNumeric(s string) bool {
 	return true
 }
 
+// shellSingleQuote returns one POSIX-shell argument without allowing the value
+// to terminate the surrounding command. Install commands are copied verbatim
+// into a root shell, so every dynamic value must pass through this helper.
+func shellSingleQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
+}
+
+func shellCommentText(value string) string {
+	return strings.Join(strings.Fields(value), " ")
+}
+
+// effectiveRemoteInstallMasterURL returns the exact normalized panel URL that
+// is embedded in an installer. The bool reports whether it came from the
+// authoritative master_url setting rather than the current admin request.
+func (h *XrayServerHandler) effectiveRemoteInstallMasterURL(ctx context.Context, r *stdhttp.Request) (string, bool, error) {
+	if h == nil || h.repo == nil {
+		return "", false, errors.New("remote server repository is unavailable")
+	}
+	if masterURL, err := h.repo.GetSystemSetting(ctx, "master_url"); err == nil && strings.TrimSpace(masterURL) != "" {
+		normalized, normalizeErr := normalizeMasterURL(masterURL)
+		if normalizeErr != nil {
+			return "", false, fmt.Errorf("configured master URL is invalid: %w", normalizeErr)
+		}
+		if !masterURLAllowsNodeInstall(normalized) {
+			return "", false, errors.New("remote node installation requires an HTTPS master URL")
+		}
+		return normalized, true, nil
+	}
+	host := strings.TrimSpace(r.Host)
+	scheme := defaultMasterScheme(host, r.TLS != nil)
+	normalized, err := normalizeMasterURL(scheme + "://" + host)
+	if err != nil {
+		return "", false, fmt.Errorf("request host is invalid: %w", err)
+	}
+	return normalized, false, nil
+}
+
+func (h *XrayServerHandler) remoteInstallationPolicyContext(ctx context.Context, r *stdhttp.Request, panelSourceIPs []string) (storage.RemoteInstallationPolicyContext, error) {
+	masterURL, _, err := h.effectiveRemoteInstallMasterURL(ctx, r)
+	if err != nil {
+		return storage.RemoteInstallationPolicyContext{}, err
+	}
+	return storage.RemoteInstallationPolicyContext{
+		PanelSourceIPs:  append([]string(nil), panelSourceIPs...),
+		MasterURL:       masterURL,
+		MasterPublicKey: h.masterPublicKeyBase64(),
+	}, nil
+}
+
+func (h *XrayServerHandler) buildRemoteInstallCommand(r *stdhttp.Request, server *storage.RemoteServer, panelSourceIPs []string, stealSelf bool, frontService string) (string, error) {
+	if server == nil {
+		return "", errors.New("remote server is required")
+	}
+	if server.ConnectionMode == storage.ConnectionModePull {
+		agentToken := server.AgentToken
+		if agentToken == "" {
+			agentToken = server.PullToken
+		}
+		return fmt.Sprintf("# pull模式：主服务器将从 %s:%d 拉取流量数据\n# 请确保子服务器已配置 MMWX_MODE=child MMWX_CHILD_API_TOKEN=%s", shellCommentText(server.PullAddress), server.PullPort, shellCommentText(agentToken)), nil
+	}
+	if len(panelSourceIPs) == 0 {
+		return "", errors.New("trusted panel source IPs are required")
+	}
+
+	serverURL, _, err := h.effectiveRemoteInstallMasterURL(r.Context(), r)
+	if err != nil {
+		return "", err
+	}
+
+	frontService = strings.ToLower(strings.TrimSpace(frontService))
+	if frontService != "xray" {
+		frontService = "xray"
+	}
+	installQuery := url.Values{}
+	agentConnectionMode := "websocket"
+	if server.ConnectionMode == storage.ConnectionModePush {
+		agentConnectionMode = "http"
+	}
+	installQuery.Set("connection_mode", agentConnectionMode)
+	if stealSelf {
+		installQuery.Set("steal_self", "1")
+		installQuery.Set("front_service", frontService)
+	}
+	if server.XrayMode == "embedded" {
+		installQuery.Set("xray_mode", "embedded")
+	}
+	if server.ListenPort > 0 {
+		installQuery.Set("listen_port", strconv.Itoa(server.ListenPort))
+	}
+	installScriptURL := serverURL + "/api/remote/install.sh"
+	if encodedQuery := installQuery.Encode(); encodedQuery != "" {
+		installScriptURL += "?" + encodedQuery
+	}
+
+	installTicket, err := generateSecureToken()
+	if err != nil {
+		return "", fmt.Errorf("generate install ticket: %w", err)
+	}
+	installTicket = remoteInstallTicketPrefix + installTicket
+	if err := h.repo.CreateRemoteServerInstallTicket(r.Context(), server.ID, installTicket, time.Now().Add(remoteInstallTicketTTL)); err != nil {
+		return "", fmt.Errorf("create install ticket: %w", err)
+	}
+	panelEnvironment := "ARCWAY_PANEL_IPS=" + shellSingleQuote(strings.Join(panelSourceIPs, " "))
+	authorizationHeader := shellSingleQuote("Authorization: Bearer " + installTicket)
+	installURLArgument := shellSingleQuote(installScriptURL)
+	downloadCommand := fmt.Sprintf(`set -eu; installer="$(mktemp /tmp/arcway-node-install.XXXXXX)"; trap 'rm -f "$installer"' EXIT; trap 'exit 130' HUP INT TERM; curl -fsSL -H %s -o "$installer" %s;`, authorizationHeader, installURLArgument)
+	return fmt.Sprintf("(%s env %s bash \"$installer\")", downloadCommand, panelEnvironment), nil
+}
+
 func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 	if r.Method != "POST" {
 		stdhttp.Error(w, "Method not allowed", stdhttp.StatusMethodNotAllowed)
@@ -350,9 +482,48 @@ func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		})
 		return
 	}
+	if !storage.IsValidRemoteManagementListenPort(req.ListenPort) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(stdhttp.StatusBadRequest)
+		json.NewEncoder(w).Encode(RemoteServerResponse{
+			Success: false,
+			Message: "Agent 监听端口必须为 1024-65534，0 表示使用默认端口",
+		})
+		return
+	}
 
 	ctx := r.Context()
-	reqDomain := strings.ToLower(strings.TrimSpace(req.Domain))
+	reqDomain := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(req.Domain)), ".")
+	if reqDomain != "" && (net.ParseIP(reqDomain) != nil || !validMasterHostname(reqDomain)) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(stdhttp.StatusBadRequest)
+		json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: "节点域名格式无效"})
+		return
+	}
+
+	stealMode := strings.TrimSpace(req.StealMode)
+	if stealMode == "" {
+		stealMode = "default"
+	}
+	if stealMode != "default" && stealMode != "tunnel" && stealMode != "fallback" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(stdhttp.StatusBadRequest)
+		json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: "接管模式必须为 default、tunnel 或 fallback"})
+		return
+	}
+	stealSelf := stealMode == "tunnel" || stealMode == "fallback"
+	if req.StealSelf != stealSelf || req.Use443 != stealSelf {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(stdhttp.StatusBadRequest)
+		json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: "接管模式、443 部署和安装授权必须保持一致"})
+		return
+	}
+	if stealSelf && reqDomain == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(stdhttp.StatusBadRequest)
+		json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: "Tunnel/Fallback 接管模式必须填写节点域名"})
+		return
+	}
 	mmwxDomain := getDomainFromMasterURL(h.repo, ctx)
 
 	isLocalByAddr := false
@@ -417,22 +588,17 @@ func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 	if connectionMode == "" {
 		connectionMode = storage.ConnectionModePush
 	}
-
-	// steal_mode 三种值:tunnel / fallback / default。
-	// 历史 BUG:这里曾"非 fallback 就强制 tunnel",导致没勾偷自己的服务器实际也存 tunnel,
-	// 用户在编辑 dialog 看到默认选中 tunnel,语义混淆。
-	// 现在:
-	//   - 显式 fallback / tunnel / default → 原样保留
-	//   - 其它值(包括空)→ 偷自己时默认 tunnel,否则默认 default
-	stealMode := req.StealMode
-	switch stealMode {
-	case "tunnel", "fallback", "default":
-		// ok
-	default:
-		if req.StealSelf {
-			stealMode = "tunnel"
-		} else {
-			stealMode = "default"
+	var panelSourceIPs []string
+	if connectionMode != storage.ConnectionModePull {
+		panelSourceIPs, err = configuredPanelSourceIPs()
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(stdhttp.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(RemoteServerResponse{
+				Success: false,
+				Message: fmt.Sprintf("主控出口 IP 未配置: %v", err),
+			})
+			return
 		}
 	}
 
@@ -447,11 +613,8 @@ func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		return
 	}
 
-	// Agent 监听端口:有效范围 1024-65535;0 表示用 agent 内置默认 23889
+	// Agent 与 expiry guard 使用连续端口，因此只接受 0 或 1024-65534。
 	listenPort := req.ListenPort
-	if listenPort < 0 || listenPort > 65535 {
-		listenPort = 0
-	}
 
 	resetDay := req.TrafficResetDay
 	if resetDay < 0 || resetDay > 31 {
@@ -516,8 +679,9 @@ func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		PullAddress:       req.PullAddress,
 		PullPort:          req.PullPort,
 		PullToken:         agentToken,
-		Domain:            strings.TrimSpace(req.Domain),
-		Use443:            req.Use443,
+		Domain:            reqDomain,
+		Use443:            stealSelf,
+		StealSelf:         stealSelf,
 		StealMode:         stealMode,
 		SiteType:          req.SiteType,
 		SiteValue:         req.SiteValue,
@@ -531,7 +695,6 @@ func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		DDNSEnabled:       req.DDNSEnabled,
 		DDNSProviderID:    req.DDNSProviderID,
 	}
-
 	if err := h.repo.CreateRemoteServer(ctx, server); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(RemoteServerResponse{
@@ -540,66 +703,17 @@ func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		})
 		return
 	}
-
-	// 构建安装命令 — 优先用系统设置里的 master_url(用户配置的对外域名),
-	// 这是 agent 实际访问主控的地址,r.Host 可能是 nginx upstream 名(如 miaomiaowu_web),
-	// 不可对外访问。仅在 master_url 未配置时回退到请求 Host。
-	serverURL := ""
-	if masterURL, err := h.repo.GetSystemSetting(ctx, "master_url"); err == nil {
-		if mu := strings.TrimRight(strings.TrimSpace(masterURL), "/"); mu != "" {
-			serverURL = mu
+	installCommand, err := h.buildRemoteInstallCommand(r, server, panelSourceIPs, server.StealSelf, req.FrontService)
+	if err != nil {
+		// Ticket issuance requires the persisted server ID. If it fails, remove the
+		// still-pending record so a failed create response cannot leave an orphan.
+		if cleanupErr := h.repo.DeleteRemoteServer(context.WithoutCancel(ctx), server.ID); cleanupErr != nil {
+			log.Printf("[CreateRemoteServer] remove server after install command failure: %v", cleanupErr)
 		}
-	}
-	if serverURL == "" {
-		host := r.Host
-		scheme := "http"
-		if r.TLS != nil {
-			scheme = "https"
-		}
-		if forwardedProto := r.Header.Get("X-Forwarded-Proto"); forwardedProto != "" {
-			scheme = forwardedProto
-		}
-		if host != "" {
-			serverURL = fmt.Sprintf("%s://%s", scheme, host)
-		}
-	}
-
-	// 根据连接模式构建安装命令
-	frontService := strings.ToLower(strings.TrimSpace(req.FrontService))
-	if frontService != "xray" && frontService != "nginx" {
-		frontService = "xray"
-	}
-	// nginx 前置暂未支持，先强制回退到 xray
-	if frontService == "nginx" {
-		frontService = "xray"
-	}
-
-	installQuery := url.Values{}
-	if req.StealSelf {
-		installQuery.Set("steal_self", "1")
-		installQuery.Set("front_service", frontService)
-	}
-	if xrayMode == "embedded" {
-		installQuery.Set("xray_mode", "embedded")
-	}
-	// 自定义 Agent 端口透传到安装脚本(脚本会写进 /etc/mmw-agent/config.yaml 的 listen_port 字段)
-	if listenPort > 0 {
-		installQuery.Set("listen_port", fmt.Sprintf("%d", listenPort))
-	}
-	installScriptURL := fmt.Sprintf("%s/api/remote/install.sh", serverURL)
-	if encodedQuery := installQuery.Encode(); encodedQuery != "" {
-		installScriptURL += "?" + encodedQuery
-	}
-
-	var installCommand string
-	switch connectionMode {
-	case storage.ConnectionModeWebSocket:
-		installCommand = fmt.Sprintf("curl -fsSL -H 'Authorization: Bearer %s' '%s' | bash -s -- --mode=websocket", token, installScriptURL)
-	case storage.ConnectionModePull:
-		// 对于pull模式，子服务器只需要暴露一个API，不需要安装命令
-		installCommand = fmt.Sprintf("# pull模式：主服务器将从 %s:%d 拉取流量数据\n# 请确保子服务器已配置 MMWX_MODE=child MMWX_CHILD_API_TOKEN=%s", req.PullAddress, req.PullPort, agentToken)
-	default:
-		installCommand = fmt.Sprintf("curl -fsSL -H 'Authorization: Bearer %s' '%s' | bash", token, installScriptURL)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(stdhttp.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: fmt.Sprintf("生成安装命令失败: %v", err)})
+		return
 	}
 
 	// 本机检测：域名解析 IP 与 mmwx_domain 解析 IP 一致则为本机
@@ -666,10 +780,33 @@ func (h *XrayServerHandler) DeleteRemoteServer(w stdhttp.ResponseWriter, r *stdh
 	}
 
 	ctx := r.Context()
+	leasedCtx, release, err := h.repo.AcquireRemoteServerMutationLease(ctx, req.ID)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		if errors.Is(err, storage.ErrRemoteInstallationActive) {
+			w.WriteHeader(stdhttp.StatusConflict)
+			_ = json.NewEncoder(w).Encode(RemoteServerResponse{
+				Success: false,
+				Message: "服务器正在安装，暂不能删除",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(RemoteServerResponse{
+			Success: false,
+			Message: "删除服务器失败",
+		})
+		return
+	}
+	defer release()
+	ctx = leasedCtx
 	if err := h.repo.DeleteRemoteServer(ctx, req.ID); err != nil {
 		msg := "删除服务器失败"
-		if err == storage.ErrRemoteServerNotFound {
+		if errors.Is(err, storage.ErrRemoteServerNotFound) {
 			msg = "服务器不存在"
+		} else if errors.Is(err, storage.ErrRemoteInstallationActive) {
+			msg = "服务器正在安装，暂不能删除"
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(stdhttp.StatusConflict)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(RemoteServerResponse{
@@ -753,6 +890,25 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 	}
 
 	ctx := r.Context()
+	leasedCtx, release, err := h.repo.AcquireRemoteServerMutationLease(ctx, req.ID)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		if errors.Is(err, storage.ErrRemoteInstallationActive) {
+			w.WriteHeader(stdhttp.StatusConflict)
+			_ = json.NewEncoder(w).Encode(RemoteServerResponse{
+				Success: false,
+				Message: "服务器正在安装，暂不能修改",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(RemoteServerResponse{
+			Success: false,
+			Message: "获取服务器信息失败",
+		})
+		return
+	}
+	defer release()
+	ctx = leasedCtx
 
 	// 获取旧的服务器信息，用于检查名称是否变更
 	oldServer, err := h.repo.GetRemoteServer(ctx, req.ID)
@@ -765,6 +921,29 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		json.NewEncoder(w).Encode(RemoteServerResponse{
 			Success: false,
 			Message: msg,
+		})
+		return
+	}
+	oldListenPort := oldServer.ListenPort
+	if oldListenPort <= 0 {
+		oldListenPort = 23889
+	}
+	if req.ListenPort > 0 && req.ListenPort != oldListenPort {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(stdhttp.StatusConflict)
+		json.NewEncoder(w).Encode(RemoteServerResponse{
+			Success: false,
+			Message: "安装后不能单独修改 Agent 端口；请删除并按新端口重新添加服务器",
+		})
+		return
+	}
+	requestedConnectionMode := strings.TrimSpace(req.ConnectionMode)
+	if requestedConnectionMode != "" && requestedConnectionMode != oldServer.ConnectionMode {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(stdhttp.StatusConflict)
+		json.NewEncoder(w).Encode(RemoteServerResponse{
+			Success: false,
+			Message: "安装后不能单独修改连接模式；请删除并按新模式重新添加服务器",
 		})
 		return
 	}
@@ -793,10 +972,14 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 
 	if err := h.repo.UpdateRemoteServer(ctx, req.ID, req.Name, req.Domain, req.TrafficLimit, req.TrafficResetDay, req.ConnectionMode, req.XrayMode, req.TrafficStatsMode, req.TrafficSource, req.IPv6Enabled); err != nil {
 		msg := "更新服务器失败"
-		if err == storage.ErrRemoteServerNotFound {
+		if errors.Is(err, storage.ErrRemoteServerNotFound) {
 			msg = "服务器不存在"
-		} else if err == storage.ErrRemoteServerExists {
+		} else if errors.Is(err, storage.ErrRemoteServerExists) {
 			msg = "服务器名称已存在"
+		} else if errors.Is(err, storage.ErrRemoteInstallationActive) {
+			msg = "服务器正在安装，暂不能修改"
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(stdhttp.StatusConflict)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(RemoteServerResponse{
@@ -926,30 +1109,35 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		}
 	}
 
-	// xray_mode 变更：异步通知 Agent 切换模式
+	// Keep the database and Agent mode in one installation-safe transaction.
+	// The request already holds the server mutation lease, so a new installer
+	// cannot begin between the database write and the remote restart.
 	newXrayMode := req.XrayMode
 	if newXrayMode == "" {
 		newXrayMode = oldServer.XrayMode
 	}
-	if newXrayMode != oldServer.XrayMode && h.remoteManager != nil {
-		go h.switchRemoteXrayMode(req.ID, newXrayMode)
-	}
-
-	// listen_port 变更:**必须先用旧端口通知 agent**(此刻 DB 仍是旧值,ForwardToServer 能连上 agent),
-	// 等 agent 收到并自重启后,**它会用新端口上报心跳给主控,主控收到心跳时会更新 listen_port**。
-	// 这里若立刻落库,会导致 ForwardToServer 读到新端口去连旧 agent 实例,connection refused。
-	// 同步调用是因为 agent 端会先 net.Listen 预检新端口能否 bind,
-	// 失败(被 xray 等占用)会立刻回 409,主控把错误透传给前端,避免重启后死锁。
-	respMsg := "服务器信息已更新"
-	newListenPort := req.ListenPort
-	if newListenPort < 0 || newListenPort > 65535 {
-		newListenPort = oldServer.ListenPort
-	}
-	if newListenPort != oldServer.ListenPort && h.remoteManager != nil {
-		if err := h.switchRemoteListenPort(req.ID, newListenPort); err != nil {
-			respMsg = fmt.Sprintf("服务器信息已更新,但端口切换失败: %v", err)
+	if newXrayMode != oldServer.XrayMode {
+		var switchErr error
+		if h.remoteManager == nil {
+			switchErr = errors.New("remote deployment manager is unavailable")
+		} else {
+			switchErr = h.switchRemoteXrayMode(ctx, req.ID, newXrayMode)
+		}
+		if switchErr != nil {
+			if rollbackErr := h.repo.UpdateRemoteServerXrayMode(ctx, req.ID, oldServer.XrayMode); rollbackErr != nil {
+				log.Printf("[Remote Server] CRITICAL: failed to restore xray_mode for server %d after Agent rejection: %v", req.ID, rollbackErr)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(stdhttp.StatusConflict)
+			_ = json.NewEncoder(w).Encode(RemoteServerResponse{
+				Success: false,
+				Message: fmt.Sprintf("其他服务器信息已保存，但 Xray 模式切换失败并已回滚: %v", switchErr),
+			})
+			return
 		}
 	}
+
+	respMsg := "服务器信息已更新"
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(RemoteServerResponse{
@@ -959,34 +1147,14 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 }
 
 // switchRemoteXrayMode 通知远程 Agent 切换 xray_mode 并重启。
-func (h *XrayServerHandler) switchRemoteXrayMode(serverID int64, newMode string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
+func (h *XrayServerHandler) switchRemoteXrayMode(ctx context.Context, serverID int64, newMode string) error {
 	body, _ := json.Marshal(map[string]string{"xray_mode": newMode})
 	result, err := h.remoteManager.ForwardToServer(ctx, serverID, "POST", "/api/child/agent/switch-xray-mode", body)
 	if err != nil {
 		log.Printf("[Remote Server] Failed to switch xray_mode to %s for server %d: %v", newMode, serverID, err)
-		return
-	}
-	log.Printf("[Remote Server] Xray mode switch to %s for server %d: %s", newMode, serverID, string(result))
-}
-
-// switchRemoteListenPort 通知远程 Agent 改自身监听端口并重启。Agent 重启会短暂断连(~5–15s),
-// 重启后用新端口监听,主控下次重连读 server.ListenPort 自动用新端口。
-// agent 端会先 net.Listen 预检新端口能否 bind,失败立刻回 409 — 这里 error 不为 nil 即代表
-// 切换被 agent 拒绝(端口被占用),DB 不需要回滚因为 agent 也没改 config 也没重启。
-func (h *XrayServerHandler) switchRemoteListenPort(serverID int64, newPort int) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	body, _ := json.Marshal(map[string]int{"listen_port": newPort})
-	result, err := h.remoteManager.ForwardToServer(ctx, serverID, "POST", "/api/child/agent/switch-listen-port", body)
-	if err != nil {
-		log.Printf("[Remote Server] Failed to switch listen_port to %d for server %d: %v", newPort, serverID, err)
 		return err
 	}
-	log.Printf("[Remote Server] Listen port switch to %d for server %d: %s", newPort, serverID, string(result))
+	log.Printf("[Remote Server] Xray mode switch to %s for server %d: %s", newMode, serverID, string(result))
 	return nil
 }
 

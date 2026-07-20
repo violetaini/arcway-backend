@@ -2,14 +2,21 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"miaomiaowux/internal/expiryguard"
 	"miaomiaowux/internal/storage"
 )
 
@@ -20,6 +27,7 @@ func newExpiryGuardAssetHandler(t *testing.T) (*XrayServerHandler, string) {
 		t.Fatalf("NewTrafficRepository: %v", err)
 	}
 	t.Cleanup(func() { _ = repo.Close() })
+	installExpiryGuardAssetFixtures(t)
 	token := "remote-asset-token"
 	server := &storage.RemoteServer{
 		Name: "asset-edge", Token: token, Status: storage.RemoteServerStatusConnected,
@@ -29,6 +37,17 @@ func newExpiryGuardAssetHandler(t *testing.T) (*XrayServerHandler, string) {
 		t.Fatalf("CreateRemoteServer: %v", err)
 	}
 	return NewXrayServerHandler(repo, nil, nil), token
+}
+
+func installExpiryGuardAssetFixtures(t *testing.T) {
+	t.Helper()
+	assetDirectory := t.TempDir()
+	for _, name := range []string{"arcway-expiry-guard-linux-amd64", "arcway-expiry-guard-linux-arm64"} {
+		if err := os.WriteFile(filepath.Join(assetDirectory, name), []byte("\x7fELF-test-"+name), 0755); err != nil {
+			t.Fatalf("write guard fixture: %v", err)
+		}
+	}
+	t.Setenv(expiryGuardAssetDirEnv, assetDirectory)
 }
 
 func requestExpiryGuardAsset(handler *XrayServerHandler, method, arch, authorization string) *httptest.ResponseRecorder {
@@ -114,6 +133,7 @@ func TestExpiryGuardAssetRejectsNonRegularAsset(t *testing.T) {
 }
 
 func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
+	t.Setenv(panelSourceIPsEnv, "203.0.113.10, 2001:db8::10")
 	handler, token := newExpiryGuardAssetHandler(t)
 	request := httptest.NewRequest(http.MethodGet,
 		"https://panel.example/api/remote/install.sh?listen_port=25000", nil)
@@ -133,19 +153,73 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 		"04ba897947923592846d3e57282d5ac80c213892b125c1575a8664abb770168f",
 		"mmw-agent SHA-256 校验失败",
 		"/api/remote/expiry-guard?arch=${ARCH_NAME}",
-		"Authorization: Bearer ${TOKEN}",
+		"/api/remote/management-ready",
+		"/api/remote/install-begin",
+		"/api/remote/install-renew",
+		"/api/remote/install-abort",
+		"/api/remote/install-prepare",
+		"/api/remote/install-finalize",
+		"CURL_AUTH_HEADER_FILE=\"$DOWNLOAD_DIR/curl-auth.header\"",
+		"printf 'Authorization: Bearer %s\\n' \"$TOKEN\"",
+		"chmod 0600 \"$CURL_AUTH_HEADER_FILE\"",
+		"start_install_renewal",
+		"assert_install_lease",
+		"snapshot_quiesced_mutable_state()",
+		"if ! snapshot_quiesced_mutable_state; then",
+		`if [ "$PREPARE_ATTEMPTED" = "1" ] && ! quiesce_remote_installation; then`,
+		`retry_remote_install_post "/api/remote/install-finalize" 120 0`,
+		"flock -n 9",
 		"TRY_GUARD_PORT=$((TRY_PORT + 1))",
-		"ARCWAY_GUARD_LISTEN=[::]:${GUARD_PORT}",
+		"ARCWAY_GUARD_LISTEN=:${GUARD_PORT}",
 		"ARCWAY_GUARD_SECRET=${GUARD_SECRET}",
 		"ARCWAY_AGENT_TOKEN=${TOKEN}",
 		"hide_port_on_ws: false",
+		"if [ \"$(id -u)\" -ne 0 ]",
 		"mktemp -d /tmp/arcway-install.XXXXXX",
 		"validate_elf()",
+		"rollback_install()",
+		"TRACKED_PATHS=(",
+		"MUTATION_STARTED=1",
+		"invalid trusted panel source IP",
+		"existing Arcway services did not stop",
+		"rollback backup retained at $BACKUP_DIR",
+		"automatic rollback was incomplete",
+		"external Xray mode requires a working Xray installation",
+		"takeover mode requires a working Nginx installation",
+		"/var/lib/mmw-agent",
+		"/var/lib/arcway-expiry-guard",
 		"chmod 0600 /var/lib/arcway-expiry-guard/state.json",
-		"ufw allow \"${GUARD_PORT}/tcp\"",
+		"PANEL_SOURCE_IPS='203.0.113.10 2001:db8::10'",
+		"ARCWAY_PANEL_IPS='$PANEL_SOURCE_IPS'",
+		"ufw allow proto tcp from \"$PANEL_IP\" to any port \"$MANAGEMENT_PORT\"",
+		"comment 'arcway-managed'",
+		"/etc/arcway-port-firewall.env",
+		"/usr/local/sbin/arcway-agent-firewall",
+		"ExecStartPre=/usr/local/sbin/arcway-agent-firewall",
+		"table inet arcway",
+		"nft -c -f \"$RULESET\"",
+		"nft -f \"$RULESET\"",
+		"ip saddr %s tcp dport { %s, %s } accept",
+		"ip6 saddr %s tcp dport { %s, %s } accept",
+		"tcp dport { %s, %s } drop",
+		"mmw-agent listen_port drifted from the protected Arcway port",
 		"/etc/systemd/system/arcway-expiry-guard.service",
 		"/etc/init.d/arcway-expiry-guard",
 		"/usr/local/bin/arcway-expiry-guard-supervisor.sh",
+		"/usr/local/sbin/arcway-agent-firewall || return 1",
+		`supervisor="supervise-daemon"`,
+		"respawn_delay=5",
+		"respawn_max=0",
+		"mmw-agent was not registered in the OpenRC default runlevel",
+		"arcway-expiry-guard was not registered in the OpenRC default runlevel",
+		"systemctl disable mmw-agent",
+		"systemctl disable arcway-expiry-guard",
+		"rc-update del mmw-agent default",
+		"rc-update del arcway-expiry-guard default",
+		"cleanup_legacy_firewall()",
+		"SCRIPT_PROTOCOL='https'",
+		"CONNECTION_MODE='websocket'",
+		"connection_mode: ${CONNECTION_MODE}",
 	} {
 		if !strings.Contains(script, expected) {
 			t.Errorf("install script missing %q", expected)
@@ -153,6 +227,60 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 	}
 	if strings.Contains(script, "ARCWAY_GUARD_SECRET=${TOKEN}") {
 		t.Fatal("install script reused the rotating Agent token as the guard secret")
+	}
+	if strings.Contains(script, `-H "Authorization: Bearer ${TOKEN}"`) {
+		t.Fatal("install script exposes the long-lived token in curl argv")
+	}
+	if strings.Contains(script, `command_background="yes"`) {
+		t.Fatal("OpenRC services are not supervised after startup")
+	}
+	if strings.Contains(script, "ufw allow \"${GUARD_PORT}/tcp\"") {
+		t.Fatal("install script exposes the expiry guard to all IPv4 sources")
+	}
+	if strings.Contains(script, "MASTER_HOST=") || strings.Contains(script, "getent ahosts") {
+		t.Fatal("install script derives trusted panel sources from ingress DNS")
+	}
+	if strings.Contains(script, "has_external_ipv6") {
+		t.Fatal("install script makes IPv6 protection depend on address timing")
+	}
+	if strings.Index(script, "nft -c -f \"$RULESET\"") > strings.Index(script, "nft -f \"$RULESET\"") {
+		t.Fatal("install script applies the firewall before validating its transaction")
+	}
+	downloadIndex := strings.Index(script, "Downloading verified mmw-agent")
+	dependencyIndex := strings.Index(script, "firewall_stack_ready()")
+	backupIndex := strings.Index(script, "BACKUP_DIR=\"$DOWNLOAD_DIR/backup\"")
+	mutationIndex := strings.Index(script, "MUTATION_STARTED=1")
+	if downloadIndex < 0 || dependencyIndex < 0 || backupIndex < 0 || mutationIndex < 0 ||
+		downloadIndex > dependencyIndex || dependencyIndex > backupIndex || backupIndex > mutationIndex {
+		t.Fatal("install script mutates the running node before downloads and integrity checks complete")
+	}
+	readyIndex := strings.Index(script, `if [ "$management_ready" != "1" ]`)
+	legacyCleanupIndex := strings.Index(script, `cleanup_legacy_firewall()`)
+	completeIndex := strings.Index(script, "Installation Complete!")
+	if readyIndex < 0 || legacyCleanupIndex < readyIndex || completeIndex < legacyCleanupIndex {
+		t.Fatal("install script reports success or removes rollback-only firewall state before semantic readiness")
+	}
+	firewallBootIndex := strings.LastIndex(script, `/usr/local/sbin/arcway-agent-firewall || exit 1`)
+	agentBootIndex := strings.LastIndex(script, `nohup /usr/local/bin/mmw-agent-supervisor.sh`)
+	guardBootIndex := strings.LastIndex(script, `nohup /usr/local/bin/arcway-expiry-guard-supervisor.sh`)
+	if firewallBootIndex < 0 || agentBootIndex < firewallBootIndex || guardBootIndex < agentBootIndex {
+		t.Fatal("rc.local managed services are not ordered firewall, Agent, expiry guard")
+	}
+	for _, unsafePipe := range []string{
+		`bash -c "$(curl`,
+		`install-nginx.sh | bash`,
+	} {
+		if strings.Contains(script, unsafePipe) {
+			t.Fatalf("install script executes an unchecked streamed installer: %s", unsafePipe)
+		}
+	}
+	for _, packageMutation := range []string{
+		"apt-get install", "apt-get purge", "apk add", "dnf install", "yum install", "pacman -S", "zypper",
+		"XTLS/Xray-install", "install-nginx.sh",
+	} {
+		if strings.Contains(script, packageMutation) {
+			t.Fatalf("generated node installer mutates unmanaged dependencies: %q", packageMutation)
+		}
 	}
 	for _, forbidden := range []string{"gh-proxy.com", "mirror.ghproxy.com", "1ms.cc"} {
 		if strings.Contains(script, forbidden) {
@@ -165,6 +293,497 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("generated install script failed bash -n: %v\n%s", err, output)
 		}
+
+		const helperStart = "cat > /usr/local/sbin/arcway-agent-firewall << 'EOF'\n"
+		_, helperTail, found := strings.Cut(script, helperStart)
+		if !found {
+			t.Fatal("generated install script is missing the firewall helper body")
+		}
+		helper, _, found := strings.Cut(helperTail, "\nEOF\n")
+		if !found {
+			t.Fatal("generated install script has an unterminated firewall helper")
+		}
+		shell, shellErr := exec.LookPath("sh")
+		if shellErr != nil {
+			shell = bash
+		}
+		command = exec.Command(shell, "-n")
+		command.Stdin = strings.NewReader(helper)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("generated firewall helper failed sh -n: %v\n%s", err, output)
+		}
+	}
+}
+
+func TestShellSingleQuotePreventsCommandSubstitution(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is unavailable")
+	}
+	marker := filepath.Join(t.TempDir(), "injected")
+	value := "value'$(touch${IFS}" + marker + ")"
+	command := exec.Command(bash, "-c", "value="+shellSingleQuote(value)+`; printf '%s' "$value"`)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("quoted assignment failed: %v\n%s", err, output)
+	}
+	if string(output) != value {
+		t.Fatalf("quoted value=%q want=%q", output, value)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("command substitution escaped quoting: stat err=%v", err)
+	}
+}
+
+func TestRemoteInstallScriptQuotesStoredToken(t *testing.T) {
+	t.Setenv(panelSourceIPsEnv, "203.0.113.10")
+	installExpiryGuardAssetFixtures(t)
+	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "traffic.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	marker := filepath.Join(t.TempDir(), "injected")
+	token := "remote-'$(touch${IFS}" + marker + ")'"
+	server := &storage.RemoteServer{Name: "quoted-token", Token: token, ConnectionMode: storage.ConnectionModeWebSocket}
+	if err := repo.CreateRemoteServer(context.Background(), server); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "https://panel.example/api/remote/install.sh", nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	NewXrayServerHandler(repo, nil, nil).GetRemoteInstallScript(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	line := ""
+	for _, candidate := range strings.Split(response.Body.String(), "\n") {
+		if strings.HasPrefix(candidate, "TOKEN=") {
+			line = candidate
+			break
+		}
+	}
+	if line == "" {
+		t.Fatal("generated script has no TOKEN assignment")
+	}
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is unavailable")
+	}
+	command := exec.Command(bash, "-c", line+`; printf '%s' "$TOKEN"`)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("generated token assignment failed: %v\n%s", err, output)
+	}
+	if string(output) != token {
+		t.Fatalf("generated token=%q want=%q", output, token)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("generated script executed token content: stat err=%v", err)
+	}
+}
+
+func TestRemoteInstallScriptIgnoresPolicyQueryOverrides(t *testing.T) {
+	t.Setenv(panelSourceIPsEnv, "203.0.113.10")
+	installExpiryGuardAssetFixtures(t)
+	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "traffic.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	server := &storage.RemoteServer{
+		Name: "stored-policy", Token: "stored-policy-token", ConnectionMode: storage.ConnectionModePush,
+		ListenPort: 25000, XrayMode: "external", StealSelf: false, StealMode: "default",
+	}
+	if err := repo.CreateRemoteServer(context.Background(), server); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "https://panel.example/api/remote/install.sh?steal_self=1&xray_mode=embedded&connection_mode=websocket&listen_port=26000", nil)
+	request.Header.Set("Authorization", "Bearer "+server.Token)
+	response := httptest.NewRecorder()
+	NewXrayServerHandler(repo, nil, nil).GetRemoteInstallScript(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	script := response.Body.String()
+	for _, expected := range []string{
+		"AUTO_STEAL_SELF='0'",
+		"XRAY_MODE='external'",
+		"CONNECTION_MODE='http'",
+		"LISTEN_PORT='25000'",
+	} {
+		if !strings.Contains(script, expected) {
+			t.Errorf("generated script missing stored policy %q", expected)
+		}
+	}
+	for _, forbidden := range []string{"AUTO_STEAL_SELF='1'", "XRAY_MODE='embedded'", "LISTEN_PORT='26000'", "INSTALL_ARGUMENT"} {
+		if strings.Contains(script, forbidden) {
+			t.Errorf("generated script accepted query override %q", forbidden)
+		}
+	}
+}
+
+func TestNormalizeMasterURL(t *testing.T) {
+	valid := map[string]string{
+		"":                               "",
+		" HTTPS://Example.COM./ ":        "https://example.com",
+		"http://localhost:12889":         "http://localhost:12889",
+		"http://[2001:db8::1]:8443/":     "http://[2001:db8::1]:8443",
+		"https://xn--bcher-kva.example/": "https://xn--bcher-kva.example",
+	}
+	for input, expected := range valid {
+		got, err := normalizeMasterURL(input)
+		if err != nil {
+			t.Errorf("normalizeMasterURL(%q): %v", input, err)
+			continue
+		}
+		if got != expected {
+			t.Errorf("normalizeMasterURL(%q)=%q want=%q", input, got, expected)
+		}
+	}
+
+	invalid := []string{
+		"ftp://example.com",
+		"https://user:pass@example.com",
+		"https://example.com/path",
+		"https://example.com?query=1",
+		"https://example.com/#fragment",
+		"https://example.com:0",
+		"https://example.com:65536",
+		"https://bad_host.example",
+		"https://example.com\n$(touch /tmp/arcway-injected)",
+		"https://example.com';$(touch${IFS}/tmp/arcway-injected)",
+	}
+	for _, input := range invalid {
+		if got, err := normalizeMasterURL(input); err == nil {
+			t.Errorf("normalizeMasterURL(%q) accepted as %q", input, got)
+		}
+	}
+}
+
+func TestDefaultMasterSchemeNeverDowngradesNonLoopbackHosts(t *testing.T) {
+	tests := []struct {
+		host   string
+		hasTLS bool
+		want   string
+	}{
+		{host: "panel.example", want: "https"},
+		{host: "panel.example:8080", want: "https"},
+		{host: "192.0.2.10:12889", want: "https"},
+		{host: "localhost:12889", want: "http"},
+		{host: "127.0.0.1:12889", want: "http"},
+		{host: "panel.example", hasTLS: true, want: "https"},
+	}
+	for _, tc := range tests {
+		if got := defaultMasterScheme(tc.host, tc.hasTLS); got != tc.want {
+			t.Errorf("defaultMasterScheme(%q, %v)=%q want=%q", tc.host, tc.hasTLS, got, tc.want)
+		}
+	}
+}
+
+func TestNormalizePanelSourceIPs(t *testing.T) {
+	addresses, err := normalizePanelSourceIPs("2001:db8::1, 203.0.113.8;203.0.113.8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(addresses, " "); got != "203.0.113.8 2001:db8::1" {
+		t.Fatalf("normalized addresses = %q", got)
+	}
+	if _, err := normalizePanelSourceIPs("203.0.113.8 invalid"); err == nil {
+		t.Fatal("invalid panel source IP was accepted")
+	}
+}
+
+func TestVerifyRemoteManagementPorts(t *testing.T) {
+	var agentListener, guardListener net.Listener
+	var agentPort int
+	for attempt := 0; attempt < 50; attempt++ {
+		candidate, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := candidate.Addr().(*net.TCPAddr).Port
+		if port >= 65535 {
+			_ = candidate.Close()
+			continue
+		}
+		adjacent, err := net.Listen("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port+1)))
+		if err != nil {
+			_ = candidate.Close()
+			continue
+		}
+		agentListener, guardListener, agentPort = candidate, adjacent, port
+		break
+	}
+	if agentListener == nil {
+		t.Fatal("could not allocate adjacent management ports")
+	}
+	t.Cleanup(func() {
+		_ = agentListener.Close()
+		_ = guardListener.Close()
+	})
+
+	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "traffic.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	server := &storage.RemoteServer{
+		Name: "ready-edge", Token: "ready-token", Status: storage.RemoteServerStatusConnected,
+		ConnectionMode: storage.ConnectionModeWebSocket, IPAddress: "127.0.0.1", ListenPort: agentPort,
+	}
+	if err := repo.CreateRemoteServer(context.Background(), server); err != nil {
+		t.Fatal(err)
+	}
+	guardSecret, err := repo.GetOrCreateRemoteServerGuardSecret(context.Background(), server.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentServer := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/child/system/info" {
+			http.NotFound(w, r)
+			return
+		}
+		if authorization := r.Header.Get("Authorization"); authorization != "" {
+			t.Errorf("public readiness probe exposed Authorization=%q", authorization)
+		}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	})}
+	go func() { _ = agentServer.Serve(agentListener) }()
+	t.Cleanup(func() { _ = agentServer.Close() })
+	guard, err := expiryguard.New(filepath.Join(t.TempDir(), "state.json"), guardSecret, server.Token, "http://127.0.0.1:1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guardServer := &http.Server{Handler: guard.Handler()}
+	go func() { _ = guardServer.Serve(guardListener) }()
+	t.Cleanup(func() { _ = guardServer.Close() })
+	stored, err := repo.GetRemoteServerByToken(context.Background(), "ready-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.IPAddress != "127.0.0.1" || stored.ListenPort != agentPort {
+		t.Fatalf("stored management address=%q port=%d", stored.IPAddress, stored.ListenPort)
+	}
+	handler := NewXrayServerHandler(repo, nil, nil)
+	const installNonce = "ready-installation-nonce"
+	if err := repo.BeginRemoteServerInstallation(context.Background(), server.ID, installNonce, time.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/remote/management-ready", nil)
+	request.RemoteAddr = "127.0.0.1:32123"
+	request.Header.Set("Authorization", "Bearer ready-token")
+	request.Header.Set(remoteInstallationNonceHeader, installNonce)
+	response := httptest.NewRecorder()
+	handler.VerifyRemoteManagementPorts(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("ready status=%d body=%s", response.Code, response.Body.String())
+	}
+	response = httptest.NewRecorder()
+	handler.VerifyRemoteManagementPorts(response, request)
+	if response.Code != http.StatusTooManyRequests || response.Header().Get("Retry-After") != "2" {
+		t.Fatalf("rate limit status=%d headers=%v body=%s", response.Code, response.Header(), response.Body.String())
+	}
+
+	if err := guardListener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	response = httptest.NewRecorder()
+	NewXrayServerHandler(repo, nil, nil).VerifyRemoteManagementPorts(response, request)
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("blocked status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestObservedRemoteAddressOnlyTrustsLocalProxyHeaders(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/api/remote/management-ready", nil)
+	request.RemoteAddr = "198.51.100.20:44321"
+	request.Header.Set("CF-Connecting-IP", "127.0.0.1")
+	request.Header.Set("X-Forwarded-For", "127.0.0.1")
+	request.Header.Set("X-Real-IP", "127.0.0.1")
+	if got := observedRemoteAddress(request); got != "198.51.100.20" {
+		t.Fatalf("direct peer address=%q", got)
+	}
+	request.RemoteAddr = "127.0.0.1:44321"
+	request.Header.Set("CF-Connecting-IP", "10.0.0.1")
+	request.Header.Set("X-Forwarded-For", "10.0.0.2")
+	request.Header.Set("X-Real-IP", "203.0.113.25")
+	if got := observedRemoteAddress(request); got != "203.0.113.25" {
+		t.Fatalf("proxied peer address=%q", got)
+	}
+	request.Header.Set("X-Real-IP", "invalid")
+	if got := observedRemoteAddress(request); got != "127.0.0.1" {
+		t.Fatalf("untrusted forwarded headers changed address to %q", got)
+	}
+}
+
+func TestRemoteInstallationHTTPLifecycleIsNonceBoundAndIdempotent(t *testing.T) {
+	t.Setenv(panelSourceIPsEnv, "203.0.113.10")
+	handler, token := newExpiryGuardAssetHandler(t)
+	server, err := handler.repo.GetRemoteServerByToken(context.Background(), token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policyRequest := httptest.NewRequest(http.MethodPost, "https://panel.example/api/remote/install-begin", nil)
+	policyContext, err := handler.remoteInstallationPolicyContext(context.Background(), policyRequest, []string{"203.0.113.10"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	policyFingerprint, err := storage.RemoteServerInstallationPolicyFingerprintWithContext(server, policyContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const nonce = "http-installation-lifecycle-nonce"
+	request := func(path, requestNonce string) *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "https://panel.example"+path, nil)
+		r.Header.Set("Authorization", "Bearer "+token)
+		r.Header.Set(remoteInstallationNonceHeader, requestNonce)
+		r.Header.Set(remoteInstallationPolicyHeader, policyFingerprint)
+		return r
+	}
+
+	response := httptest.NewRecorder()
+	handler.BeginRemoteInstallation(response, request("/api/remote/install-begin", nonce))
+	if response.Code != http.StatusOK {
+		t.Fatalf("begin status=%d body=%s", response.Code, response.Body.String())
+	}
+	response = httptest.NewRecorder()
+	handler.BeginRemoteInstallation(response, request("/api/remote/install-begin", nonce))
+	if response.Code != http.StatusOK {
+		t.Fatalf("idempotent begin status=%d body=%s", response.Code, response.Body.String())
+	}
+	response = httptest.NewRecorder()
+	handler.RenewRemoteInstallation(response, request("/api/remote/install-renew", nonce))
+	if response.Code != http.StatusOK {
+		t.Fatalf("renew status=%d body=%s", response.Code, response.Body.String())
+	}
+	response = httptest.NewRecorder()
+	handler.BeginRemoteInstallation(response, request("/api/remote/install-begin", "different-installation-nonce"))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("conflicting begin status=%d body=%s", response.Code, response.Body.String())
+	}
+	response = httptest.NewRecorder()
+	handler.PrepareRemoteInstallation(response, request("/api/remote/install-prepare", nonce))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("prepare before ready status=%d body=%s", response.Code, response.Body.String())
+	}
+	if err := handler.repo.MarkRemoteServerInstallationReady(context.Background(), server.ID, nonce); err != nil {
+		t.Fatal(err)
+	}
+	response = httptest.NewRecorder()
+	handler.PrepareRemoteInstallation(response, request("/api/remote/install-prepare", nonce))
+	if response.Code != http.StatusOK {
+		t.Fatalf("prepare status=%d body=%s", response.Code, response.Body.String())
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		response = httptest.NewRecorder()
+		handler.FinalizeRemoteInstallation(response, request("/api/remote/install-finalize", nonce))
+		if response.Code != http.StatusOK {
+			t.Fatalf("finalize attempt %d status=%d body=%s", attempt+1, response.Code, response.Body.String())
+		}
+	}
+	active, err := handler.repo.IsRemoteServerInstallationActive(context.Background(), server.ID)
+	if err != nil || active {
+		t.Fatalf("active after finalize=(%v, %v)", active, err)
+	}
+}
+
+func TestRemoteInstallationBeginRejectsChangedPanelPolicyContext(t *testing.T) {
+	t.Setenv(panelSourceIPsEnv, "203.0.113.10")
+	handler, token := newExpiryGuardAssetHandler(t)
+	server, err := handler.repo.GetRemoteServerByToken(context.Background(), token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "https://panel.example/api/remote/install-begin", nil)
+	originalContext, err := handler.remoteInstallationPolicyContext(context.Background(), request, []string{"203.0.113.10"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := storage.RemoteServerInstallationPolicyFingerprintWithContext(server, originalContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(panelSourceIPsEnv, "203.0.113.11")
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set(remoteInstallationNonceHeader, "changed-panel-policy-nonce")
+	request.Header.Set(remoteInstallationPolicyHeader, fingerprint)
+	response := httptest.NewRecorder()
+	handler.BeginRemoteInstallation(response, request)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status=%d want=%d body=%s", response.Code, http.StatusConflict, response.Body.String())
+	}
+}
+
+func TestRemoteManagementProbesRejectSemanticFailures(t *testing.T) {
+	client := &http.Client{Timeout: time.Second}
+	for _, status := range []int{http.StatusOK, http.StatusForbidden, http.StatusInternalServerError} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(status)
+		}))
+		port := server.Listener.Addr().(*net.TCPAddr).Port
+		err := probeRemoteAgent(context.Background(), client, "127.0.0.1", port)
+		server.Close()
+		if err == nil {
+			t.Fatalf("Agent probe accepted HTTP %d", status)
+		}
+	}
+	authChallenge := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	if err := probeRemoteAgent(context.Background(), client, "127.0.0.1", authChallenge.Listener.Addr().(*net.TCPAddr).Port); err != nil {
+		t.Fatalf("Agent probe rejected authentication challenge: %v", err)
+	}
+	authChallenge.Close()
+
+	for _, body := range []string{
+		`{"client_expiry":false,"durable":true}`,
+		`{"client_expiry":true,"durable":false}`,
+		`{not-json}`,
+	} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(body))
+		}))
+		port := server.Listener.Addr().(*net.TCPAddr).Port
+		err := probeRemoteExpiryGuard(context.Background(), client, "127.0.0.1", port, "probe-secret")
+		server.Close()
+		if err == nil {
+			t.Fatalf("expiry guard probe accepted %q", body)
+		}
+	}
+}
+
+func TestRemoteManagementProbesDoNotFollowRedirects(t *testing.T) {
+	var redirectedRequests atomic.Int32
+	redirectTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		redirectedRequests.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success":       true,
+			"client_expiry": true,
+			"durable":       true,
+		})
+	}))
+	t.Cleanup(redirectTarget.Close)
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, redirectTarget.URL, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(redirector.Close)
+	address := redirector.Listener.Addr().(*net.TCPAddr)
+	client, transport := newRemoteManagementProbeClient()
+	t.Cleanup(transport.CloseIdleConnections)
+
+	if err := probeRemoteAgent(context.Background(), client, address.IP.String(), address.Port); err == nil {
+		t.Fatal("Agent probe accepted a redirect")
+	}
+	if got := redirectedRequests.Load(); got != 0 {
+		t.Fatalf("Agent probe followed redirect; target requests=%d", got)
+	}
+	if err := probeRemoteExpiryGuard(context.Background(), client, address.IP.String(), address.Port, "probe-secret"); err == nil {
+		t.Fatal("expiry guard probe accepted a redirect")
+	}
+	if got := redirectedRequests.Load(); got != 0 {
+		t.Fatalf("expiry guard probe followed redirect; target requests=%d", got)
 	}
 }
 
@@ -176,5 +795,467 @@ func TestRemoteInstallScriptRejectsQueryToken(t *testing.T) {
 	handler.GetRemoteInstallScript(response, request)
 	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("status=%d want=%d", response.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestRemoteInstallScriptConsumesShortLivedTicketOnce(t *testing.T) {
+	t.Setenv(panelSourceIPsEnv, "203.0.113.10")
+	handler, token := newExpiryGuardAssetHandler(t)
+	server, err := handler.repo.GetRemoteServerByToken(context.Background(), token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const ticket = remoteInstallTicketPrefix + "single-consumption-ticket"
+	if err := handler.repo.CreateRemoteServerInstallTicket(context.Background(), server.ID, ticket, time.Now().Add(5*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	request := func() *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "https://panel.example/api/remote/install.sh", nil)
+		r.Header.Set("Authorization", "Bearer "+ticket)
+		return r
+	}
+	response := httptest.NewRecorder()
+	handler.GetRemoteInstallScript(response, request())
+	if response.Code != http.StatusOK {
+		t.Fatalf("first download status=%d body=%s", response.Code, response.Body.String())
+	}
+	response = httptest.NewRecorder()
+	handler.GetRemoteInstallScript(response, request())
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("second download status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestRevealServerTokenReturnsAuthoritativeInstallCommand(t *testing.T) {
+	t.Setenv(panelSourceIPsEnv, "203.0.113.10 2001:db8::10")
+	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "traffic.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	server := &storage.RemoteServer{
+		Name: "reveal-command", Token: "reveal-token", ConnectionMode: storage.ConnectionModeWebSocket,
+		ListenPort: 25000, XrayMode: "embedded", StealSelf: true, StealMode: "tunnel",
+	}
+	if err := repo.CreateRemoteServer(context.Background(), server); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "https://panel.example:8443/api/admin/remote-servers/reveal-token?server_id="+strconv.FormatInt(server.ID, 10), nil)
+	response := httptest.NewRecorder()
+	NewXrayServerHandler(repo, nil, nil).RevealServerToken(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var result struct {
+		Success        bool   `json:"success"`
+		Token          string `json:"token"`
+		InstallCommand string `json:"install_command"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.Success || result.Token != server.Token {
+		t.Fatalf("unexpected reveal response: %+v", result)
+	}
+	for _, expected := range []string{
+		`(set -eu;`,
+		`-o "$installer"`,
+		`https://panel.example:8443/api/remote/install.sh?connection_mode=websocket&front_service=xray&listen_port=25000&steal_self=1&xray_mode=embedded`,
+		`ARCWAY_PANEL_IPS='203.0.113.10 2001:db8::10'`,
+		`bash "$installer"`,
+	} {
+		if !strings.Contains(result.InstallCommand, expected) {
+			t.Errorf("authoritative install command missing %q: %s", expected, result.InstallCommand)
+		}
+	}
+	if strings.Contains(result.InstallCommand, " | bash") {
+		t.Fatalf("authoritative install command streams into bash: %s", result.InstallCommand)
+	}
+	if strings.Contains(result.InstallCommand, server.Token) {
+		t.Fatalf("authoritative install command exposes the long-lived server token: %s", result.InstallCommand)
+	}
+}
+
+func TestRevealServerTokenDoesNotInferTakeoverFromHistoricalStealMode(t *testing.T) {
+	t.Setenv(panelSourceIPsEnv, "203.0.113.10")
+	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "traffic.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	server := &storage.RemoteServer{
+		Name: "historical-mode", Token: "historical-token", ConnectionMode: storage.ConnectionModeWebSocket,
+		StealMode: "tunnel", StealSelf: false,
+	}
+	if err := repo.CreateRemoteServer(context.Background(), server); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "https://panel.example/api/admin/remote-servers/reveal-token?server_id="+strconv.FormatInt(server.ID, 10), nil)
+	response := httptest.NewRecorder()
+	NewXrayServerHandler(repo, nil, nil).RevealServerToken(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var result struct {
+		InstallCommand string `json:"install_command"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(result.InstallCommand, "steal_self=1") {
+		t.Fatalf("historical steal_mode unexpectedly authorized port 443 takeover: %s", result.InstallCommand)
+	}
+}
+
+func TestAuthoritativeInstallCommandDownloadsThenExecutes(t *testing.T) {
+	bash, bashErr := exec.LookPath("bash")
+	if bashErr != nil {
+		t.Skip("bash is unavailable")
+	}
+	if _, curlErr := exec.LookPath("curl"); curlErr != nil {
+		t.Skip("curl is unavailable")
+	}
+	marker := filepath.Join(t.TempDir(), "injected")
+	token := "download-'$(touch${IFS}" + marker + ")'"
+	type requestMetadata struct{ authorization, connectionMode string }
+	requestValues := make(chan requestMetadata, 1)
+	downloadServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestValues <- requestMetadata{r.Header.Get("Authorization"), r.URL.Query().Get("connection_mode")}
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("#!/bin/bash\nprintf '%s\\n%s\\n%s\\n' \"$ARCWAY_PANEL_IPS\" \"${1:-}\" \"$0\"\n"))
+	}))
+	defer downloadServer.Close()
+
+	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "traffic.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	if err := repo.SetSystemSetting(context.Background(), "master_url", downloadServer.URL); err != nil {
+		t.Fatal(err)
+	}
+	server := &storage.RemoteServer{
+		Name: "execute-command", Token: token, ConnectionMode: storage.ConnectionModeWebSocket, ListenPort: 25000,
+	}
+	if err := repo.CreateRemoteServer(context.Background(), server); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "https://ignored.example/api/admin/remote-servers/reveal-token", nil)
+	commandText, err := NewXrayServerHandler(repo, nil, nil).buildRemoteInstallCommand(request, server, []string{"203.0.113.10", "2001:db8::10"}, false, "xray")
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(bash, "-c", commandText)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install command failed: %v\ncommand=%s\n%s", err, commandText, output)
+	}
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(lines) != 3 || lines[0] != "203.0.113.10 2001:db8::10" || lines[1] != "" {
+		t.Fatalf("downloaded installer output=%q", output)
+	}
+	metadata := <-requestValues
+	if metadata.authorization == "Bearer "+token || !strings.HasPrefix(metadata.authorization, "Bearer ") || metadata.connectionMode != "websocket" {
+		t.Fatalf("request metadata=%+v", metadata)
+	}
+	ticket := strings.TrimPrefix(metadata.authorization, "Bearer ")
+	consumed, err := repo.ConsumeRemoteServerInstallTicket(context.Background(), ticket, time.Now())
+	if err != nil || consumed.ID != server.ID {
+		t.Fatalf("install command did not use a valid one-time ticket: server=%+v err=%v", consumed, err)
+	}
+	if _, err := os.Stat(lines[2]); !os.IsNotExist(err) {
+		t.Fatalf("temporary installer was not deleted: %s (stat err=%v)", lines[2], err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("install command executed token content: stat err=%v", err)
+	}
+	server.ConnectionMode = storage.ConnectionModePush
+	pushCommand, err := NewXrayServerHandler(repo, nil, nil).buildRemoteInstallCommand(request, server, []string{"203.0.113.10"}, false, "xray")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(pushCommand, "connection_mode=http") {
+		t.Fatalf("HTTP Push command did not configure Agent HTTP mode: %s", pushCommand)
+	}
+}
+
+func TestRemoteInstallScriptRejectsInvalidPanelSourceConfiguration(t *testing.T) {
+	t.Setenv(panelSourceIPsEnv, "not-an-ip")
+	handler, token := newExpiryGuardAssetHandler(t)
+	request := httptest.NewRequest(http.MethodGet, "https://panel.example/api/remote/install.sh", nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	handler.GetRemoteInstallScript(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d want=%d body=%s", response.Code, http.StatusServiceUnavailable, response.Body.String())
+	}
+}
+
+func TestUpdateRemoteServerRejectsListenPortChange(t *testing.T) {
+	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "traffic.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	server := &storage.RemoteServer{
+		Name: "fixed-port-edge", Token: "fixed-port-token", Status: storage.RemoteServerStatusConnected,
+		ConnectionMode: storage.ConnectionModeWebSocket, ListenPort: 25000,
+	}
+	if err := repo.CreateRemoteServer(context.Background(), server); err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(RemoteServerUpdateRequest{
+		ID: server.ID, Name: server.Name, ListenPort: 25001,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPut, "/api/admin/remote-servers/update", strings.NewReader(string(body)))
+	response := httptest.NewRecorder()
+	NewXrayServerHandler(repo, nil, nil).UpdateRemoteServer(response, request)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status=%d want=%d body=%s", response.Code, http.StatusConflict, response.Body.String())
+	}
+	stored, err := repo.GetRemoteServer(context.Background(), server.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ListenPort != 25000 {
+		t.Fatalf("listen port changed to %d", stored.ListenPort)
+	}
+	body, err = json.Marshal(RemoteServerUpdateRequest{
+		ID: server.ID, Name: server.Name, ListenPort: 25000, ConnectionMode: storage.ConnectionModePush,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request = httptest.NewRequest(http.MethodPut, "/api/admin/remote-servers/update", strings.NewReader(string(body)))
+	response = httptest.NewRecorder()
+	NewXrayServerHandler(repo, nil, nil).UpdateRemoteServer(response, request)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("connection mode status=%d want=%d body=%s", response.Code, http.StatusConflict, response.Body.String())
+	}
+}
+
+func TestCreateRemoteServerRejectsInvalidManagementPortPair(t *testing.T) {
+	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "traffic.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	handler := NewXrayServerHandler(repo, nil, nil)
+	for _, port := range []int{-1, 1, 1023, 65535, 65536} {
+		body, err := json.Marshal(RemoteServerCreateRequest{Name: "invalid-port", ListenPort: port})
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := httptest.NewRequest(http.MethodPost, "/api/admin/remote-servers", strings.NewReader(string(body)))
+		response := httptest.NewRecorder()
+		handler.CreateRemoteServer(response, request)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("port=%d status=%d want=%d body=%s", port, response.Code, http.StatusBadRequest, response.Body.String())
+		}
+	}
+}
+
+func TestCreateRemoteServerAcceptsManagementPortBoundaries(t *testing.T) {
+	t.Setenv(panelSourceIPsEnv, "203.0.113.10 2001:db8::10")
+	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "traffic.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	handler := NewXrayServerHandler(repo, nil, nil)
+	for _, port := range []int{0, 1024, 65534} {
+		body, err := json.Marshal(RemoteServerCreateRequest{
+			Name: "valid-port-" + strconv.Itoa(port), ConnectionMode: storage.ConnectionModeWebSocket, ListenPort: port,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := httptest.NewRequest(http.MethodPost, "https://panel.example/api/admin/remote-servers", strings.NewReader(string(body)))
+		response := httptest.NewRecorder()
+		handler.CreateRemoteServer(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("port=%d status=%d body=%s", port, response.Code, response.Body.String())
+		}
+		var result RemoteServerResponse
+		if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+			t.Fatal(err)
+		}
+		if !result.Success || result.Server == nil || result.Server.ListenPort != port {
+			t.Fatalf("port=%d response=%+v", port, result)
+		}
+		if !strings.Contains(result.InstallCommand, "ARCWAY_PANEL_IPS='203.0.113.10 2001:db8::10'") {
+			t.Fatalf("port=%d command missing trusted panel sources: %s", port, result.InstallCommand)
+		}
+		if !strings.Contains(result.InstallCommand, `-o "$installer"`) || strings.Contains(result.InstallCommand, " | ") {
+			t.Fatalf("port=%d command does not fully download the installer before execution: %s", port, result.InstallCommand)
+		}
+		listenParameter := "listen_port=" + strconv.Itoa(port)
+		if port == 0 && strings.Contains(result.InstallCommand, "listen_port=") {
+			t.Fatalf("default port command unexpectedly contains listen_port: %s", result.InstallCommand)
+		}
+		if port > 0 && !strings.Contains(result.InstallCommand, listenParameter) {
+			t.Fatalf("port=%d command missing %s: %s", port, listenParameter, result.InstallCommand)
+		}
+	}
+}
+
+func TestCreateRemoteServerPersistsConsistentTakeoverSettings(t *testing.T) {
+	t.Setenv(panelSourceIPsEnv, "203.0.113.10")
+	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "traffic.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	handler := NewXrayServerHandler(repo, nil, nil)
+	tests := []struct {
+		name      string
+		stealSelf bool
+		stealMode string
+		domain    string
+	}{
+		{name: "disabled", stealMode: "default"},
+		{name: "tunnel", stealSelf: true, stealMode: "tunnel", domain: "tunnel.example.com"},
+		{name: "fallback", stealSelf: true, stealMode: "fallback", domain: "fallback.example.com"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := json.Marshal(RemoteServerCreateRequest{
+				Name: tc.name, ConnectionMode: storage.ConnectionModeWebSocket,
+				StealSelf: tc.stealSelf, Use443: tc.stealSelf, StealMode: tc.stealMode, Domain: tc.domain,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(http.MethodPost, "https://panel.example/api/admin/remote-servers", strings.NewReader(string(body)))
+			response := httptest.NewRecorder()
+			handler.CreateRemoteServer(response, request)
+			if response.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			var result RemoteServerResponse
+			if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
+			if result.Server == nil || result.Server.StealSelf != tc.stealSelf || result.Server.Use443 != tc.stealSelf || result.Server.StealMode != tc.stealMode {
+				t.Fatalf("server=%+v want steal_self/use_443=%v steal_mode=%s", result.Server, tc.stealSelf, tc.stealMode)
+			}
+			hasQueryOption := strings.Contains(result.InstallCommand, "steal_self=1")
+			if hasQueryOption != tc.stealSelf {
+				t.Fatalf("command takeover option=%v want=%v: %s", hasQueryOption, tc.stealSelf, result.InstallCommand)
+			}
+			stored, err := repo.GetRemoteServer(context.Background(), result.Server.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stored.StealSelf != tc.stealSelf || stored.Use443 != tc.stealSelf || stored.StealMode != tc.stealMode {
+				t.Fatalf("stored=%+v", stored)
+			}
+		})
+	}
+}
+
+func TestCreateRemoteServerRejectsInconsistentTakeoverSettings(t *testing.T) {
+	t.Setenv(panelSourceIPsEnv, "203.0.113.10")
+	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "traffic.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	handler := NewXrayServerHandler(repo, nil, nil)
+	tests := []RemoteServerCreateRequest{
+		{Name: "mode-without-flags", ConnectionMode: storage.ConnectionModeWebSocket, StealMode: "tunnel", Domain: "edge.example.com"},
+		{Name: "missing-use443", ConnectionMode: storage.ConnectionModeWebSocket, StealSelf: true, StealMode: "tunnel", Domain: "edge.example.com"},
+		{Name: "missing-domain", ConnectionMode: storage.ConnectionModeWebSocket, StealSelf: true, Use443: true, StealMode: "fallback"},
+		{Name: "flags-with-default", ConnectionMode: storage.ConnectionModeWebSocket, StealSelf: true, Use443: true, StealMode: "default", Domain: "edge.example.com"},
+		{Name: "unknown-mode", ConnectionMode: storage.ConnectionModeWebSocket, StealMode: "unknown"},
+		{Name: "invalid-domain", ConnectionMode: storage.ConnectionModeWebSocket, Domain: "https://edge.example.com/path"},
+	}
+	for _, requestBody := range tests {
+		t.Run(requestBody.Name, func(t *testing.T) {
+			body, err := json.Marshal(requestBody)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(http.MethodPost, "https://panel.example/api/admin/remote-servers", strings.NewReader(string(body)))
+			response := httptest.NewRecorder()
+			handler.CreateRemoteServer(response, request)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d want=%d body=%s", response.Code, http.StatusBadRequest, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestRemoteServerHeartbeatRejectsListenPortDrift(t *testing.T) {
+	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "traffic.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	server := &storage.RemoteServer{
+		Name: "heartbeat-port-edge", Token: "heartbeat-port-token", Status: storage.RemoteServerStatusConnected,
+		ConnectionMode: storage.ConnectionModeWebSocket, ListenPort: 25000,
+	}
+	if err := repo.CreateRemoteServer(context.Background(), server); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.UpdateRemoteServerHeartbeatWithRestart(context.Background(), storage.HeartbeatUpdate{
+		Token: server.Token, ListenPort: 25001,
+	}); err == nil {
+		t.Fatal("heartbeat listen port drift was accepted")
+	}
+	stored, err := repo.GetRemoteServer(context.Background(), server.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ListenPort != 25000 {
+		t.Fatalf("listen port changed to %d", stored.ListenPort)
+	}
+
+	pending := &storage.RemoteServer{
+		Name: "first-heartbeat-port", Token: "first-heartbeat-token", Status: storage.RemoteServerStatusPending,
+		ConnectionMode: storage.ConnectionModeWebSocket,
+	}
+	if err := repo.CreateRemoteServer(context.Background(), pending); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.UpdateRemoteServerHeartbeatWithRestart(context.Background(), storage.HeartbeatUpdate{
+		Token: pending.Token, ListenPort: 26000,
+	}); err != nil {
+		t.Fatalf("first heartbeat port was rejected: %v", err)
+	}
+	stored, err = repo.GetRemoteServer(context.Background(), pending.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ListenPort != 26000 {
+		t.Fatalf("first heartbeat listen port=%d want=26000", stored.ListenPort)
+	}
+	if _, err := repo.UpdateRemoteServerHeartbeatWithRestart(context.Background(), storage.HeartbeatUpdate{
+		Token: pending.Token, ListenPort: 0, IPAddress: "198.51.100.20",
+	}); err != nil {
+		t.Fatalf("zero-port heartbeat after provisioning was rejected: %v", err)
+	}
+	stored, err = repo.GetRemoteServer(context.Background(), pending.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ListenPort != 26000 || stored.IPAddress != "198.51.100.20" {
+		t.Fatalf("zero-port heartbeat stored port=%d ip=%q", stored.ListenPort, stored.IPAddress)
+	}
+	if _, err := repo.UpdateRemoteServerHeartbeatWithRestart(context.Background(), storage.HeartbeatUpdate{
+		Token: pending.Token, ListenPort: 26001, IPAddress: "198.51.100.99",
+	}); !errors.Is(err, storage.ErrRemoteListenPortMismatch) {
+		t.Fatalf("drift error=%v want ErrRemoteListenPortMismatch", err)
+	}
+	stored, err = repo.GetRemoteServer(context.Background(), pending.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ListenPort != 26000 || stored.IPAddress != "198.51.100.20" {
+		t.Fatalf("rejected drift partially updated server: port=%d ip=%q", stored.ListenPort, stored.IPAddress)
 	}
 }

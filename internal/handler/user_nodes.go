@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -156,6 +157,17 @@ func (h *UserNodesHandler) handleAddOutbound(w http.ResponseWriter, r *http.Requ
 		writeJSONError(w, http.StatusForbidden, err.Error())
 		return
 	}
+	leasedCtx, release, ok := acquireRemoteServerMutationLeaseHTTP(w, h.repo, ctx, serverID)
+	if !ok {
+		return
+	}
+	defer release()
+	ctx = leasedCtx
+	node, lockedServerID, err := h.validateNodeAccess(ctx, username, req.NodeID)
+	if err != nil || lockedServerID != serverID {
+		writeJSONError(w, http.StatusConflict, "节点授权或所属服务器发生变化,请重试")
+		return
+	}
 
 	// 获取用户在该入站中的 email
 	email, err := h.getUserEmailForInbound(ctx, username, serverID, node.InboundTag)
@@ -203,24 +215,35 @@ func (h *UserNodesHandler) handleAddOutbound(w http.ResponseWriter, r *http.Requ
 	})
 	routingResult, err := h.remoteManage.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/routing", routingBody)
 	if err != nil {
-		log.Printf("[UserNodes] 添加路由规则失败 (user=%s, server=%d): %v", username, serverID, err)
-	} else {
-		var routingResp map[string]interface{}
-		json.Unmarshal(routingResult, &routingResp)
-		if success, _ := routingResp["success"].(bool); !success {
-			log.Printf("[UserNodes] 添加路由规则返回失败 (user=%s, server=%d): %v", username, serverID, routingResp)
-		}
+		h.rollbackAddedUserOutbound(ctx, serverID, email, namespacedTag)
+		writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("添加路由规则失败: %v", err))
+		return
+	}
+	var routingResp map[string]interface{}
+	if err := json.Unmarshal(routingResult, &routingResp); err != nil {
+		h.rollbackAddedUserOutbound(ctx, serverID, email, namespacedTag)
+		writeJSONError(w, http.StatusBadGateway, "添加路由规则返回无效")
+		return
+	}
+	if success, _ := routingResp["success"].(bool); !success {
+		h.rollbackAddedUserOutbound(ctx, serverID, email, namespacedTag)
+		writeJSONError(w, http.StatusBadGateway, "添加路由规则未被 Agent 确认")
+		return
 	}
 
 	// 3. 保存记录
 	outboundJSON, _ := json.Marshal(req.Outbound)
-	h.repo.SaveUserOutbound(ctx, storage.UserOutbound{
+	if err := h.repo.SaveUserOutbound(ctx, storage.UserOutbound{
 		Username:     username,
 		ServerID:     serverID,
 		InboundTag:   node.InboundTag,
 		OutboundTag:  namespacedTag,
 		OutboundJSON: string(outboundJSON),
-	})
+	}); err != nil {
+		h.rollbackAddedUserOutbound(ctx, serverID, email, namespacedTag)
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("保存出站记录失败: %v", err))
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -259,6 +282,17 @@ func (h *UserNodesHandler) handleRemoveOutbound(w http.ResponseWriter, r *http.R
 		writeJSONError(w, http.StatusForbidden, err.Error())
 		return
 	}
+	leasedCtx, release, ok := acquireRemoteServerMutationLeaseHTTP(w, h.repo, ctx, serverID)
+	if !ok {
+		return
+	}
+	defer release()
+	ctx = leasedCtx
+	node, lockedServerID, err := h.validateNodeAccess(ctx, username, req.NodeID)
+	if err != nil || lockedServerID != serverID {
+		writeJSONError(w, http.StatusConflict, "节点授权或所属服务器发生变化,请重试")
+		return
+	}
 
 	// 校验出站记录属于该用户
 	existing, err := h.repo.GetUserOutbound(ctx, username, serverID, req.OutboundTag)
@@ -272,7 +306,10 @@ func (h *UserNodesHandler) handleRemoveOutbound(w http.ResponseWriter, r *http.R
 
 	// 1. 先删除路由规则（通过匹配 user+outboundTag）
 	if email != "" {
-		h.removeRoutingRule(ctx, serverID, email, req.OutboundTag)
+		if err := h.removeRoutingRule(ctx, serverID, email, req.OutboundTag); err != nil {
+			writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("删除路由规则失败: %v", err))
+			return
+		}
 	}
 
 	// 2. 删除出站
@@ -280,12 +317,20 @@ func (h *UserNodesHandler) handleRemoveOutbound(w http.ResponseWriter, r *http.R
 		"action": "remove",
 		"tag":    req.OutboundTag,
 	})
-	if _, err := h.remoteManage.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/outbounds", removeBody); err != nil {
-		log.Printf("[UserNodes] 删除出站失败 (user=%s, tag=%s): %v", username, req.OutboundTag, err)
+	removeResult, err := h.remoteManage.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/outbounds", removeBody)
+	if err == nil {
+		err = applyAgentConfigMutationACK(ctx, h.remoteManage, serverID, "UserOutboundRemove", removeResult)
+	}
+	if err != nil {
+		writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("删除出站失败: %v", err))
+		return
 	}
 
 	// 3. 删除数据库记录
-	h.repo.DeleteUserOutbound(ctx, username, serverID, req.OutboundTag)
+	if err := h.repo.DeleteUserOutbound(ctx, username, serverID, req.OutboundTag); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("删除出站记录失败: %v", err))
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -418,11 +463,10 @@ func (h *UserNodesHandler) getUserEmailForInbound(ctx context.Context, username 
 }
 
 // removeRoutingRule 从子服务器的路由配置中删除匹配的规则
-func (h *UserNodesHandler) removeRoutingRule(ctx context.Context, serverID int64, email, outboundTag string) {
+func (h *UserNodesHandler) removeRoutingRule(ctx context.Context, serverID int64, email, outboundTag string) error {
 	result, err := h.remoteManage.forwardToRemoteServer(ctx, serverID, "GET", "/api/child/routing", nil)
 	if err != nil {
-		log.Printf("[UserNodes] 获取路由配置失败: %v", err)
-		return
+		return fmt.Errorf("获取路由配置: %w", err)
 	}
 
 	var resp struct {
@@ -430,7 +474,7 @@ func (h *UserNodesHandler) removeRoutingRule(ctx context.Context, serverID int64
 		Routing map[string]interface{} `json:"routing"`
 	}
 	if err := json.Unmarshal(result, &resp); err != nil || !resp.Success {
-		return
+		return errors.New("Agent 未确认路由配置快照")
 	}
 
 	rules, _ := resp.Routing["rules"].([]interface{})
@@ -457,14 +501,32 @@ func (h *UserNodesHandler) removeRoutingRule(ctx context.Context, serverID int64
 	}
 
 	if removeIndex < 0 {
-		return
+		return nil
 	}
 
 	removeBody, _ := json.Marshal(map[string]interface{}{
 		"action": "remove_rule",
 		"index":  removeIndex,
 	})
-	if _, err := h.remoteManage.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/routing", removeBody); err != nil {
-		log.Printf("[UserNodes] 删除路由规则失败: %v", err)
+	response, err := h.remoteManage.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/routing", removeBody)
+	if err != nil {
+		return err
 	}
+	return applyAgentConfigMutationACK(ctx, h.remoteManage, serverID, "UserOutboundRuleRemove", response)
+}
+
+func (h *UserNodesHandler) rollbackAddedOutbound(ctx context.Context, serverID int64, outboundTag string) {
+	removeBody, _ := json.Marshal(map[string]interface{}{"action": "remove", "tag": outboundTag})
+	if response, err := h.remoteManage.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/outbounds", removeBody); err != nil {
+		log.Printf("[UserNodes] rollback outbound %s on server %d failed: %v", outboundTag, serverID, err)
+	} else if err := applyAgentConfigMutationACK(ctx, h.remoteManage, serverID, "UserOutboundRollback", response); err != nil {
+		log.Printf("[UserNodes] rollback outbound %s on server %d was not acknowledged: %v", outboundTag, serverID, err)
+	}
+}
+
+func (h *UserNodesHandler) rollbackAddedUserOutbound(ctx context.Context, serverID int64, email, outboundTag string) {
+	if err := h.removeRoutingRule(ctx, serverID, email, outboundTag); err != nil {
+		log.Printf("[UserNodes] rollback routing rule for outbound %s on server %d failed: %v", outboundTag, serverID, err)
+	}
+	h.rollbackAddedOutbound(ctx, serverID, outboundTag)
 }

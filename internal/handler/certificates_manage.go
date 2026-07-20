@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -880,38 +881,37 @@ func (h *CertificateHandler) deployRemoteCertificate(cert *storage.Certificate, 
 	h.deployToRemoteServer(server, payload)
 }
 
-// 通过 WS 或 HTTP 将证书发送到特定的远程服务器。
-func (h *CertificateHandler) deployToRemoteServer(server *storage.RemoteServer, payload WSCertDeployPayload) {
-	// 联邦(分享)服务器:agent 归拥有方主控管,消费方既无直连也无该 agent 的 WS,
-	// 必须经 ForwardToAgent → 拥有方 /api/federation/manage → 拥有方 WS RPC → agent 下发。
-	// 不能像下面那样按 server.Token 试 WS 再直连 agent IP(都不可达 → context deadline exceeded)。
-	if server.IsFederated && h.remoteManage != nil {
-		body, _ := json.Marshal(payload)
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-		if _, err := h.remoteManage.ForwardToAgent(ctx, server.ID, http.MethodPost, "/api/child/cert/deploy", body); err != nil {
-			log.Printf("[Certificate] Federation cert_deploy failed for %s: %v", server.Name, err)
-		} else {
-			log.Printf("[Certificate] Sent cert_deploy via federation to %s for %s", server.Name, payload.Domain)
+// deployToRemoteServerSync 在调用方的上下文中持有 server mutation lease，
+// 并等到 Agent 对证书落盘/重载给出明确 ACK 后才返回。多步处理器应该把已持租约的
+// context 传进来；底层租约可重入，不会在同一 server 上再次锁住自己。
+func (h *CertificateHandler) deployToRemoteServerSync(ctx context.Context, server *storage.RemoteServer, payload WSCertDeployPayload) error {
+	return h.repo.WithRemoteServerMutationLease(ctx, server.ID, func(leasedCtx context.Context) error {
+		body, err := json.Marshal(payload)
+		if err != nil {
+			return err
 		}
+		if h.remoteManage != nil {
+			ack, err := h.remoteManage.ForwardToAgent(leasedCtx, server.ID, http.MethodPost, "/api/child/cert/deploy", body)
+			if err != nil {
+				return err
+			}
+			return validateCertificateDeployACK(ack)
+		}
+		return h.deployRemoteCertificateHTTP(leasedCtx, server, payload)
+	})
+}
+
+// 通过 WS 或 HTTP 将证书发送到特定的远程服务器。保留该包装供后台任务使用；
+// HTTP 请求链路应直接调 deployToRemoteServerSync 以获取错误。
+func (h *CertificateHandler) deployToRemoteServer(server *storage.RemoteServer, payload WSCertDeployPayload) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	err := h.deployToRemoteServerSync(ctx, server, payload)
+	if err != nil {
+		log.Printf("[Certificate] cert_deploy failed for %s: %v", server.Name, err)
 		return
 	}
-
-	if h.wsHandler != nil && h.wsHandler.IsConnected(server.Token) {
-		if err := h.wsHandler.SendCertDeploy(server.Token, payload); err == nil {
-			log.Printf("[Certificate] Sent cert_deploy via WS to %s for %s", server.Name, payload.Domain)
-			return
-		}
-		log.Printf("[Certificate] WS cert_deploy failed for %s, falling back to HTTP", server.Name)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if err := h.deployRemoteCertificateHTTP(ctx, server, payload); err != nil {
-		log.Printf("[Certificate] HTTP cert_deploy failed for %s: %v", server.Name, err)
-	} else {
-		log.Printf("[Certificate] Sent cert_deploy via HTTP to %s for %s", server.Name, payload.Domain)
-	}
+	log.Printf("[Certificate] Synchronously deployed certificate to %s for %s", server.Name, payload.Domain)
 }
 
 // DeployCertToServerSync 同步把证书下发到指定 agent 的 xray 证书目录,返回 agent 上的 cert/key 路径。
@@ -922,6 +922,16 @@ func (h *CertificateHandler) deployToRemoteServer(server *storage.RemoteServer, 
 // WS 不可用 / 写失败时 fallback HTTP。WS 写完即返回路径,不等 agent ack — agent 处理是 ms 级,
 // 后续 add inbound 之间的时间差足够 agent 完成 cert 落盘。
 func (h *CertificateHandler) DeployCertToServerSync(ctx context.Context, server *storage.RemoteServer, cert *storage.Certificate) (string, string, error) {
+	var certPath, keyPath string
+	err := h.repo.WithRemoteServerMutationLease(ctx, server.ID, func(leasedCtx context.Context) error {
+		var deployErr error
+		certPath, keyPath, deployErr = h.deployCertToServerSyncLeased(leasedCtx, server, cert)
+		return deployErr
+	})
+	return certPath, keyPath, err
+}
+
+func (h *CertificateHandler) deployCertToServerSyncLeased(ctx context.Context, server *storage.RemoteServer, cert *storage.Certificate) (string, string, error) {
 	name := certDeployFilename(cert.Domain)
 	certPath := "/usr/local/etc/xray/certs/" + name + ".pem"
 	keyPath := "/usr/local/etc/xray/certs/" + name + ".key"
@@ -934,40 +944,25 @@ func (h *CertificateHandler) DeployCertToServerSync(ctx context.Context, server 
 		Reload:   "none",
 	}
 
-	// 0) 联邦(分享)服务器:走拥有方主控转发(消费方无直连/WS)。拥有方 agent 落到同样的确定路径,
-	// 成功即返回该路径;失败透传错误(doFederationRequest 对 owner 非 2xx 会返回 err)。
-	if server.IsFederated && h.remoteManage != nil {
+	// Use the request/response management path whenever available. It selects WS
+	// first (including federation) and keeps the mutation lease until Agent ACK.
+	if h.remoteManage != nil {
 		body, _ := json.Marshal(payload)
-		fctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		fctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 		defer cancel()
-		if _, err := h.remoteManage.ForwardToAgent(fctx, server.ID, http.MethodPost, "/api/child/cert/deploy", body); err != nil {
+		ack, err := h.remoteManage.ForwardToAgent(fctx, server.ID, http.MethodPost, "/api/child/cert/deploy", body)
+		if err != nil {
 			return "", "", err
 		}
-		log.Printf("[Certificate] Sync cert_deploy via federation to %s for %s", server.Name, payload.Domain)
+		if err := validateCertificateDeployACK(ack); err != nil {
+			return "", "", err
+		}
+		log.Printf("[Certificate] Sync cert_deploy to %s for %s", server.Name, payload.Domain)
 		return certPath, keyPath, nil
 	}
 
-	// 1) 优先 WS —— 走请求-响应(ForwardToAgent over WS 命中 agent 同步的 HandleCertDeploy,写完证书返回 200 才继续)。
-	// 旧的 SendCertDeploy 是「主控发完即返回 + agent 侧 go handleCertDeploy 异步落盘」双重异步,会与随后「添加 TLS 入站」
-	// 竞态:证书还没写到磁盘 xray 就加载入站 → "证书文件不存在",首次必失败、重试才成功。payload.Reload="none" 只写不重启。
-	if h.wsHandler != nil && h.wsHandler.IsConnected(server.Token) {
-		if h.remoteManage != nil {
-			body, _ := json.Marshal(payload)
-			fctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-			_, ferr := h.remoteManage.ForwardToAgent(fctx, server.ID, http.MethodPost, "/api/child/cert/deploy", body)
-			cancel()
-			if ferr == nil {
-				log.Printf("[Certificate] Sync cert_deploy via WS(req-resp) to %s for %s", server.Name, payload.Domain)
-				return certPath, keyPath, nil
-			}
-			log.Printf("[Certificate] Sync WS(req-resp) cert_deploy to %s failed: %v, falling back to HTTP", server.Name, ferr)
-		} else if err := h.wsHandler.SendCertDeploy(server.Token, payload); err == nil {
-			log.Printf("[Certificate] Sync cert_deploy via WS(async, no remoteManage) to %s for %s", server.Name, payload.Domain)
-			return certPath, keyPath, nil
-		}
-	}
-
-	// 2) Fallback HTTP — 同步等 agent 200 OK 才返回
+	// Fallback HTTP is still synchronous; no fire-and-forget WS mutation escapes
+	// the installation lease.
 	if err := h.deployRemoteCertificateHTTP(ctx, server, payload); err != nil {
 		return "", "", err
 	}
@@ -1016,12 +1011,42 @@ func (h *CertificateHandler) deployRemoteCertificateHTTP(ctx context.Context, se
 		return err
 	}
 	defer resp.Body.Close()
+	respBody, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return fmt.Errorf("read certificate deploy ACK: %w", readErr)
+	}
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
-	return nil
+	return validateCertificateDeployACK(respBody)
+}
+
+// 旧 Agent 在 2xx 时可能返回空 body 或不带 success 字段，两者都视为 HTTP ACK。
+// 新 Agent 若明确返回 success=false，则必须将远程失败透传给上层。
+func validateCertificateDeployACK(body []byte) error {
+	if len(strings.TrimSpace(string(body))) == 0 {
+		return nil
+	}
+	var ack struct {
+		Success *bool  `json:"success"`
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(body, &ack); err != nil || ack.Success == nil {
+		return nil
+	}
+	if *ack.Success {
+		return nil
+	}
+	message := strings.TrimSpace(ack.Error)
+	if message == "" {
+		message = strings.TrimSpace(ack.Message)
+	}
+	if message == "" {
+		message = "Agent rejected certificate deployment"
+	}
+	return errors.New(message)
 }
 
 // 处理 POST /api/admin/certificates/deploy — 手动部署证书。
@@ -1105,9 +1130,11 @@ func (h *CertificateHandler) DeployAutoDeployCertificates(serverID int64) {
 			KeyPath:  filepath.Join(filepath.Dir(cert.DeployKeyPath), certDeployFilename(cert.Domain)+filepath.Ext(cert.DeployKeyPath)),
 			Reload:   "both",
 		}
-		go h.deployToRemoteServer(server, payload)
+		if err := h.deployToRemoteServerSync(ctx, server, payload); err != nil {
+			log.Printf("[Certificate] Auto-deploy %s to server %s failed: %v", cert.Domain, server.Name, err)
+		}
 	}
-	log.Printf("[Certificate] Triggered auto-deploy of %d cert(s) to server %s", len(certs), server.Name)
+	log.Printf("[Certificate] Completed auto-deploy of %d cert(s) to server %s", len(certs), server.Name)
 }
 
 // --- DNS 提供商 API 处理程序 ---

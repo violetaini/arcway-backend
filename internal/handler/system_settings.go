@@ -2,12 +2,17 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"miaomiaowux/internal/agentlog"
 	"miaomiaowux/internal/storage"
@@ -108,6 +113,117 @@ func (h *SystemSettingsHandler) GetMasterURL(w http.ResponseWriter, r *http.Requ
 	json.NewEncoder(w).Encode(map[string]any{"success": true, "master_url": value})
 }
 
+func normalizeMasterURL(raw string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", nil
+	}
+	if strings.IndexFunc(value, func(r rune) bool { return unicode.IsControl(r) || unicode.IsSpace(r) }) >= 0 {
+		return "", errors.New("地址不能包含空白或控制字符")
+	}
+
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return "", fmt.Errorf("地址格式无效: %w", err)
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", errors.New("地址协议必须为 http 或 https")
+	}
+	if parsed.Opaque != "" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		return "", errors.New("地址只能包含协议、主机和可选端口")
+	}
+	if (parsed.Path != "" && parsed.Path != "/") || parsed.RawPath != "" {
+		return "", errors.New("地址不能包含路径")
+	}
+
+	host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
+	if host == "" {
+		return "", errors.New("地址缺少主机名")
+	}
+	ip := net.ParseIP(host)
+	if ip == nil && !validMasterHostname(host) {
+		return "", errors.New("主机名格式无效")
+	}
+	if ip != nil {
+		host = ip.String()
+	}
+
+	port := parsed.Port()
+	if port == "" && strings.HasSuffix(parsed.Host, ":") {
+		return "", errors.New("端口不能为空")
+	}
+	if port != "" {
+		portNumber, err := strconv.Atoi(port)
+		if err != nil || portNumber < 1 || portNumber > 65535 {
+			return "", errors.New("端口必须为 1-65535")
+		}
+		host = net.JoinHostPort(host, port)
+	} else if ip != nil && strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	return scheme + "://" + host, nil
+}
+
+func validMasterHostname(host string) bool {
+	if len(host) == 0 || len(host) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// defaultMasterScheme keeps loopback development usable without ever placing a
+// node bearer token on plaintext transport to a non-loopback host. Reverse
+// proxies should configure master_url explicitly; forwarded headers are not
+// trusted here because the application may also be reachable directly.
+func defaultMasterScheme(host string, hasTLS bool) string {
+	if hasTLS {
+		return "https"
+	}
+	hostname := host
+	if parsed, err := url.Parse("//" + host); err == nil && parsed.Hostname() != "" {
+		hostname = parsed.Hostname()
+	}
+	hostname = strings.Trim(strings.TrimSpace(hostname), "[]")
+	if strings.EqualFold(hostname, "localhost") {
+		return "http"
+	}
+	if ip := net.ParseIP(hostname); ip != nil && ip.IsLoopback() {
+		return "http"
+	}
+	return "https"
+}
+
+func masterURLAllowsNodeInstall(normalized string) bool {
+	parsed, err := url.Parse(normalized)
+	if err != nil || parsed.Hostname() == "" {
+		return false
+	}
+	if parsed.Scheme == "https" {
+		return true
+	}
+	if parsed.Scheme != "http" {
+		return false
+	}
+	hostname := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
+	if hostname == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(hostname)
+	return ip != nil && ip.IsLoopback()
+}
+
 // 设置主服务器地址
 func (h *SystemSettingsHandler) SetMasterURL(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
@@ -125,7 +241,15 @@ func (h *SystemSettingsHandler) SetMasterURL(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	if err := h.repo.SetSystemSetting(r.Context(), "master_url", req.MasterURL); err != nil {
+	normalized, err := normalizeMasterURL(req.MasterURL)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]any{"success": false, "message": err.Error()})
+		return
+	}
+
+	if err := h.repo.SetSystemSetting(r.Context(), "master_url", normalized); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "保存失败"})

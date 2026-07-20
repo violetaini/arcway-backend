@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"miaomiaowux/internal/storage"
 	"miaomiaowux/templates"
 )
 
@@ -271,7 +272,14 @@ func (h *RemoteManageHandler) HandleSetupSSL(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	server, err := h.repo.GetRemoteServer(r.Context(), id)
+	ctx, release, err := h.repo.AcquireRemoteServerMutationLease(r.Context(), id)
+	if err != nil {
+		remoteWriteForwardError(w, err)
+		return
+	}
+	defer release()
+
+	server, err := h.repo.GetRemoteServer(ctx, id)
 	if err != nil {
 		remoteWriteError(w, http.StatusNotFound, "server not found")
 		return
@@ -297,62 +305,115 @@ func (h *RemoteManageHandler) HandleSetupSSL(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	certName := "_." + rootDomain
-	if h.certHandler != nil {
-		if cert, certErr := h.repo.GetCertificateByDomain(r.Context(), rootDomain, id); certErr == nil && cert != nil {
-			certName = certDeployFilename(cert.Domain)
-		}
+	if h.certHandler == nil {
+		remoteWriteJSON(w, http.StatusConflict, map[string]any{
+			"success":       false,
+			"partial":       false,
+			"cert_deployed": false,
+			"error":         "证书功能未初始化",
+			"message":       "证书功能未初始化",
+		})
+		return
 	}
+	cert, certErr := h.findCertificateForRemoteDomain(ctx, rootDomain, id)
+	if certErr != nil {
+		message := fmt.Sprintf("未找到可部署的 %s 证书: %v", rootDomain, certErr)
+		remoteWriteJSON(w, http.StatusConflict, map[string]any{
+			"success":       false,
+			"partial":       false,
+			"cert_deployed": false,
+			"error":         message,
+			"message":       message,
+		})
+		return
+	}
+	certName := certDeployFilename(cert.Domain)
 	// 第2步：统一渲染 domain conf(伪装站 location / + 该 server 现有 ws location,reality偷自己+WSS 共存)
-	domainConf, derr := renderStealSelfDomainConf(server.StealMode, server.SiteType, server.SiteValue, domain, certName, h.fetchWSSInbounds(r.Context(), id))
+	wssInbounds, wssErr := h.fetchWSSInboundsStrict(ctx, id)
+	if wssErr != nil {
+		remoteWriteError(w, http.StatusBadGateway, fmt.Sprintf("读取 WSS 入站失败: %v", wssErr))
+		return
+	}
+	domainConf, derr := renderStealSelfDomainConf(server.StealMode, server.SiteType, server.SiteValue, domain, certName, wssInbounds)
 	if derr != nil {
 		remoteWriteError(w, http.StatusInternalServerError, fmt.Sprintf("渲染 domain.conf 失败: %v", derr))
 		return
 	}
 
-	sslPayload, _ := json.Marshal(map[string]any{
+	// 先同步落盘证书，再让 setup-ssl 写入引用它的 nginx 配置并重载。
+	// 这样首次配置时不会因证书文件尚不存在而 reload 失败。
+	certPayload := WSCertDeployPayload{
+		Domain:   rootDomain,
+		CertPEM:  cert.CertPEM,
+		KeyPEM:   cert.KeyPEM,
+		CertPath: fmt.Sprintf("/usr/local/nginx/cert/%s.pem", certName),
+		KeyPath:  fmt.Sprintf("/usr/local/nginx/cert/%s.key", certName),
+		Reload:   "none",
+	}
+	if err := h.certHandler.deployToRemoteServerSync(ctx, server, certPayload); err != nil {
+		message := fmt.Sprintf("证书部署未获得 Agent ACK: %v", err)
+		remoteWriteJSON(w, http.StatusConflict, map[string]any{
+			"success":       false,
+			"partial":       true,
+			"cert_deployed": false,
+			"error":         message,
+			"message":       message,
+		})
+		return
+	}
+
+	sslPayload, marshalErr := json.Marshal(map[string]any{
 		"domain":        domain,
 		"nginx_config":  string(nginxConf),
 		"domain_config": domainConf,
 	})
-	_, err = h.forwardToRemoteServer(r.Context(), id, http.MethodPost, "/api/child/nginx/setup-ssl", sslPayload)
-	if err != nil {
-		remoteWriteError(w, http.StatusBadGateway, fmt.Sprintf("配置 Nginx SSL 失败: %v", err))
+	if marshalErr != nil {
+		remoteWriteError(w, http.StatusInternalServerError, fmt.Sprintf("序列化 nginx 配置失败: %v", marshalErr))
 		return
 	}
-
-	// 步骤 3：使用根域查找并部署通配符证书
-	certDeployed := false
-	if h.certHandler != nil {
-		cert, certErr := h.repo.GetCertificateByDomain(r.Context(), rootDomain, id)
-		if certErr == nil && cert != nil && cert.CertPEM != "" && cert.KeyPEM != "" {
-			certPath := fmt.Sprintf("/usr/local/nginx/cert/%s.pem", certDeployFilename(cert.Domain))
-			keyPath := fmt.Sprintf("/usr/local/nginx/cert/%s.key", certDeployFilename(cert.Domain))
-
-			payload := WSCertDeployPayload{
-				Domain:   rootDomain,
-				CertPEM:  cert.CertPEM,
-				KeyPEM:   cert.KeyPEM,
-				CertPath: certPath,
-				KeyPath:  keyPath,
-				Reload:   "nginx",
-			}
-			h.certHandler.deployToRemoteServer(server, payload)
-			certDeployed = true
-		}
-
-		if !certDeployed {
-			// 尝试自动部署证书
-			h.certHandler.DeployAutoDeployCertificates(id)
-			certDeployed = true
-		}
+	_, err = h.forwardToRemoteServer(ctx, id, http.MethodPost, "/api/child/nginx/setup-ssl", sslPayload)
+	if err != nil {
+		message := fmt.Sprintf("证书已部署，但配置 Nginx SSL 失败: %v", err)
+		remoteWriteJSON(w, http.StatusConflict, map[string]any{
+			"success":       false,
+			"partial":       true,
+			"cert_deployed": true,
+			"error":         message,
+			"message":       message,
+		})
+		return
 	}
 
 	remoteWriteJSON(w, http.StatusOK, map[string]any{
 		"success":       true,
 		"message":       fmt.Sprintf("已为 %s 配置 SSL", domain),
-		"cert_deployed": certDeployed,
+		"cert_deployed": true,
 	})
+}
+
+// findCertificateForRemoteDomain 优先使用 server 专属证书，其次使用可以分发到
+// 任意节点的全局证书。只返回已有完整 PEM 的证书，避免把 pending 记录当成可用证书。
+func (h *RemoteManageHandler) findCertificateForRemoteDomain(ctx context.Context, rootDomain string, serverID int64) (*storage.Certificate, error) {
+	candidates := []struct {
+		domain   string
+		serverID int64
+	}{
+		{domain: rootDomain, serverID: serverID},
+		{domain: "*." + rootDomain, serverID: serverID},
+		{domain: "*." + rootDomain, serverID: 0},
+		{domain: rootDomain, serverID: 0},
+	}
+	for _, candidate := range candidates {
+		cert, err := h.repo.GetCertificateByDomain(ctx, candidate.domain, candidate.serverID)
+		if err != nil || cert == nil {
+			continue
+		}
+		if strings.TrimSpace(cert.CertPEM) == "" || strings.TrimSpace(cert.KeyPEM) == "" {
+			continue
+		}
+		return cert, nil
+	}
+	return nil, storage.ErrCertificateNotFound
 }
 
 // 将 nginx.conf + domain.conf + config.json 部署到远程服务器。
@@ -390,6 +451,12 @@ func (h *RemoteManageHandler) HandleDeployStealSelfConfig(w http.ResponseWriter,
 // 历史 BUG:之前 if/else 只识别 fallback,其它(含 default、空)统统走 tunnel,
 // 用户选了"默认"部署模式但 deployStealSelf 实际下发的是 tunnel 配置。
 func (h *RemoteManageHandler) DeployStealSelfConfig(ctx context.Context, serverID int64) error {
+	return h.repo.WithRemoteServerMutationLease(ctx, serverID, func(leasedCtx context.Context) error {
+		return h.deployStealSelfConfigLeased(leasedCtx, serverID)
+	})
+}
+
+func (h *RemoteManageHandler) deployStealSelfConfigLeased(ctx context.Context, serverID int64) error {
 	server, err := h.repo.GetRemoteServer(ctx, serverID)
 	if err != nil {
 		return fmt.Errorf("获取服务器信息失败: %w", err)

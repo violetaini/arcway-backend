@@ -276,9 +276,15 @@ func (h *XraySnapshotHandler) handleRestore(w http.ResponseWriter, r *http.Reque
 // 否则用户在 UI 看到"恢复成功"但 agent 实际还在跑旧配置 — 跟其他下发路径(deploy_tunnel
 // / deploy_fallback / remote_reality_domains)的"PUT + restartXrayWithRecovery"约定一致。
 func (h *XraySnapshotHandler) applyConfigToAgent(r *http.Request, serverID int64, configJSON string) error {
+	ctx, release, err := h.repo.AcquireRemoteServerMutationLease(r.Context(), serverID)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	// 1) agent test-config 验证
 	testBody, _ := json.Marshal(map[string]string{"config": configJSON})
-	raw, err := h.remoteManage.forwardToRemoteServer(r.Context(), serverID, "POST", "/api/child/xray/test-config", testBody)
+	raw, err := h.remoteManage.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/xray/test-config", testBody)
 	if err != nil {
 		return fmt.Errorf("agent test-config failed: %w", err)
 	}
@@ -302,12 +308,12 @@ func (h *XraySnapshotHandler) applyConfigToAgent(r *http.Request, serverID int64
 
 	// 2) PUT config(setXrayConfig 默认会再 test 一次,这里 force=true 跳过 — 上面已经测过)
 	putBody, _ := json.Marshal(map[string]interface{}{"config": configJSON, "force": true})
-	if _, perr := h.remoteManage.forwardToRemoteServer(r.Context(), serverID, "POST", "/api/child/xray/config", putBody); perr != nil {
+	if _, perr := h.remoteManage.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/xray/config", putBody); perr != nil {
 		return fmt.Errorf("agent PUT config failed: %w", perr)
 	}
 
 	// 3) restart xray 让新配置生效
-	if rerr := h.remoteManage.restartXrayWithRecovery(r.Context(), serverID, "XraySnapshotApply"); rerr != nil {
+	if rerr := h.remoteManage.restartXrayWithRecovery(ctx, serverID, "XraySnapshotApply"); rerr != nil {
 		return fmt.Errorf("agent restart xray failed: %w", rerr)
 	}
 	return nil

@@ -538,6 +538,20 @@ func (p *LimiterConfigPusher) listServerInboundTags(ctx context.Context, server 
 }
 
 func (p *LimiterConfigPusher) PushToServer(ctx context.Context, serverID int64) {
+	if p == nil || p.repo == nil {
+		log.Printf("[LimiterPush] Failed to push config for server %d: limiter pusher is not available", serverID)
+		return
+	}
+	err := p.repo.WithRemoteServerMutationLease(ctx, serverID, func(leasedCtx context.Context) error {
+		p.pushToServerLeased(leasedCtx, serverID)
+		return nil
+	})
+	if err != nil {
+		log.Printf("[LimiterPush] Failed to push config for server %d: %v", serverID, err)
+	}
+}
+
+func (p *LimiterConfigPusher) pushToServerLeased(ctx context.Context, serverID int64) {
 	server, configs, err := p.buildServerLimiterSnapshots(ctx, serverID)
 	if err != nil {
 		log.Printf("[LimiterPush] Failed to push config for server %d: %v", serverID, err)
@@ -593,6 +607,15 @@ func (p *LimiterConfigPusher) buildServerLimiterSnapshots(ctx context.Context, s
 // has received an application ACK. A successful WebSocket write is not an ACK.
 // Managed provisioning uses this as the final gate before add-client.
 func (p *LimiterConfigPusher) PushToServerChecked(ctx context.Context, serverID int64) error {
+	if p == nil || p.repo == nil {
+		return fmt.Errorf("limiter pusher is not available")
+	}
+	return p.repo.WithRemoteServerMutationLease(ctx, serverID, func(leasedCtx context.Context) error {
+		return p.pushToServerCheckedLeased(leasedCtx, serverID)
+	})
+}
+
+func (p *LimiterConfigPusher) pushToServerCheckedLeased(ctx context.Context, serverID int64) error {
 	server, configs, err := p.buildServerLimiterSnapshots(ctx, serverID)
 	if err != nil {
 		return err

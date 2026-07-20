@@ -22,8 +22,10 @@ func (h *RemoteManageHandler) deployFallbackConfig(ctx context.Context, server *
 	}
 
 	certName := "_." + rootDomain
+	var selectedCert *storage.Certificate
 	if cert, certErr := h.repo.GetCertificateByDomain(ctx, rootDomain, server.ID); certErr == nil && cert != nil {
 		certName = certDeployFilename(cert.Domain)
+		selectedCert = cert
 	}
 	// 统一渲染:伪装站 location / + 该 server 现有 ws 入站的 location
 	// (reality偷自己 + WSS 共存 —— 下发伪装站时把已有 ws location 一并渲染,避免冲掉)
@@ -55,27 +57,15 @@ func (h *RemoteManageHandler) deployFallbackConfig(ctx context.Context, server *
 	}
 	log.Printf("[DeployFallback] Deployed xray config to server %d (%s)", server.ID, server.Name)
 
-	if h.certHandler != nil {
-		cert, certErr := h.repo.GetCertificateByDomain(ctx, rootDomain, server.ID)
-		if certErr == nil && cert != nil && cert.CertPEM != "" && cert.KeyPEM != "" {
-			payload := WSCertDeployPayload{
-				Domain:   rootDomain,
-				CertPEM:  cert.CertPEM,
-				KeyPEM:   cert.KeyPEM,
-				CertPath: fmt.Sprintf("/usr/local/nginx/cert/%s.pem", certDeployFilename(cert.Domain)),
-				KeyPath:  fmt.Sprintf("/usr/local/nginx/cert/%s.key", certDeployFilename(cert.Domain)),
-				Reload:   "nginx",
-			}
-			h.certHandler.deployToRemoteServer(server, payload)
-			log.Printf("[DeployFallback] Deployed certificate for %s to server %d", rootDomain, server.ID)
-		} else {
-			h.certHandler.DeployAutoDeployCertificates(server.ID)
-			log.Printf("[DeployFallback] Triggered auto-deploy certificates for server %d", server.ID)
+	if selectedCert != nil && selectedCert.CertPEM != "" && selectedCert.KeyPEM != "" {
+		if err := h.deployStealCertificateSync(ctx, server, rootDomain, selectedCert); err != nil {
+			return err
 		}
+		log.Printf("[DeployFallback] Deployed certificate for %s to server %d", rootDomain, server.ID)
 	}
 
 	if err := h.restartXrayWithRecovery(ctx, server.ID, "DeployFallback"); err != nil {
-		log.Printf("[DeployFallback] %v", err)
+		return err
 	}
 
 	log.Printf("[DeployFallback] Completed fallback config deployment for server %d (%s), domain=%s", server.ID, server.Name, domain)

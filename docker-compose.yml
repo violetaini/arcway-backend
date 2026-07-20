@@ -12,6 +12,7 @@ services:
       - PORT=12889
       - DATABASE_PATH=/app/data/arcway.db
       - LOG_LEVEL=info
+      - ARCWAY_PANEL_IPS=${ARCWAY_PANEL_IPS:-}
 
     volumes:
       - ./data:/app/data

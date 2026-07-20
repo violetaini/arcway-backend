@@ -186,6 +186,44 @@ func (h *UserRoutedOutboundHandler) create(w http.ResponseWriter, r *http.Reques
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("无法定位父节点所属 agent: %v", err))
 		return
 	}
+	leasedCtx, release, ok := acquireRemoteServerMutationLeaseHTTP(w, h.repo, ctx, serverID)
+	if !ok {
+		return
+	}
+	defer release()
+	ctx = leasedCtx
+
+	// Re-read all server-bound inputs under the lease. The earlier reads only
+	// discover/validate the request; they must not feed a remote transaction if
+	// the parent was moved or the target changed while the lease was acquired.
+	parent, err = h.repo.GetNodeByID(ctx, req.ParentNodeID)
+	if err != nil || parent.InboundTag == "" || parent.OriginalServer == "" ||
+		(parent.NodeType != "" && parent.NodeType != "physical") || !h.userCanSeeNode(ctx, username, req.ParentNodeID) {
+		writeJSONError(w, http.StatusConflict, "父节点在创建期间发生变化,请重试")
+		return
+	}
+	lockedServerID, err := h.resolveServerIDByName(ctx, parent.OriginalServer)
+	if err != nil || lockedServerID != serverID {
+		writeJSONError(w, http.StatusConflict, "父节点所属服务器在创建期间发生变化,请重试")
+		return
+	}
+	target, err = h.repo.GetNodeByID(ctx, req.TargetNodeID)
+	if err != nil || target.NodeType == "routed" || strings.Contains(target.Protocol, "⇋") ||
+		!h.userCanSeeNode(ctx, username, req.TargetNodeID) {
+		writeJSONError(w, http.StatusConflict, "目标节点在创建期间发生变化,请重试")
+		return
+	}
+	if err := verifyOutboundMatchesTarget(req.Outbound, target.ClashConfig); err != nil {
+		writeJSONError(w, http.StatusConflict, fmt.Sprintf("目标节点在创建期间发生变化: %v", err))
+		return
+	}
+	myExisting, _ = h.repo.ListUserRoutedOutbounds(ctx, username)
+	for _, ex := range myExisting {
+		if ex.RoutedOutboundTag == outboundTag {
+			writeJSONError(w, http.StatusConflict, fmt.Sprintf("已存在相同 label 的路由出站: %s", rawLabel))
+			return
+		}
+	}
 
 	// ====== 执行 ======
 	// 用户子账号 email = `<username>__<short>__<label>`,cred 按父 inbound 协议正确生成主字段(参见 generateRoutedClientCred)
@@ -291,8 +329,8 @@ func (h *UserRoutedOutboundHandler) create(w http.ResponseWriter, r *http.Reques
 	}
 	created, err := h.repo.CreateRoutedNode(ctx, detail)
 	if err != nil {
-		log.Printf("[UserRoutedOutbound] DB insert failed after agent ops succeeded: %v - agent 已变更但 DB 未记录", err)
-		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("DB 写入失败: %v", err))
+		rollbackRoutedOutboundCreate(ctx, h.remoteManage, serverID, parent.InboundTag, marktag, outboundTag, userEmail)
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("DB 写入失败,远端变更已回滚: %v", err))
 		return
 	}
 
@@ -304,7 +342,12 @@ func (h *UserRoutedOutboundHandler) create(w http.ResponseWriter, r *http.Reques
 		CredentialJSON: string(credBytes),
 		IsActive:       true,
 	}); err != nil {
-		log.Printf("[UserRoutedOutbound] UpsertUserSubaccount failed (continue): %v", err)
+		rollbackRoutedOutboundCreate(ctx, h.remoteManage, serverID, parent.InboundTag, marktag, outboundTag, userEmail)
+		if deleteErr := h.repo.DeleteRoutedNode(ctx, created.ID); deleteErr != nil {
+			log.Printf("[UserRoutedOutbound] rollback DB node %d failed: %v", created.ID, deleteErr)
+		}
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("保存用户凭据失败,远端变更已回滚: %v", err))
+		return
 	}
 
 	// 记录每日操作次数(成功路径才计数,失败/校验拒绝不计)
@@ -348,6 +391,22 @@ func (h *UserRoutedOutboundHandler) delete(w http.ResponseWriter, r *http.Reques
 	serverID, err := h.resolveServerIDByName(ctx, detail.OriginalServer)
 	if err != nil {
 		writeJSONError(w, http.StatusBadGateway, fmt.Sprintf("无法定位 Agent: %v", err))
+		return
+	}
+	leasedCtx, release, ok := acquireRemoteServerMutationLeaseHTTP(w, h.repo, ctx, serverID)
+	if !ok {
+		return
+	}
+	defer release()
+	ctx = leasedCtx
+	detail, err = h.repo.GetRoutedNodeDetail(ctx, id)
+	if err != nil || detail.RoutedOwner != "user" || detail.Username != username {
+		writeJSONError(w, http.StatusConflict, "节点在删除期间发生变化,请重试")
+		return
+	}
+	lockedServerID, err := h.resolveServerIDByName(ctx, detail.OriginalServer)
+	if err != nil || lockedServerID != serverID {
+		writeJSONError(w, http.StatusConflict, "节点所属服务器在删除期间发生变化,请重试")
 		return
 	}
 	if err := removeRuleByMarktag(ctx, h.remoteManage, serverID, detail.RoutedRuleMarktag); err != nil {
@@ -526,14 +585,34 @@ func suspendUserPrivateRouted(ctx context.Context, rm *RemoteManageHandler, repo
 			log.Printf("[SuspendUserRouted] resolve server for node %d failed (continue): %v", n.ID, err)
 			continue
 		}
-		// 1. 删 rule
-		removeRuleByMarktag(ctx, rm, serverID, n.RoutedRuleMarktag)
-		// 2. 删 client
-		sa, _ := repo.GetUserSubaccount(ctx, n.ID, username)
-		if sa != nil {
-			removeClientFromInbound(ctx, rm, serverID, n.InboundTag, sa.Email)
-			_ = repo.SetSubaccountActive(ctx, sa.ID, false)
+		leasedCtx, release, err := repo.AcquireRemoteServerMutationLease(ctx, serverID)
+		if err != nil {
+			log.Printf("[SuspendUserRouted] node %d deferred: %v", n.ID, err)
+			continue
 		}
+		func() {
+			defer release()
+			current, err := repo.GetRoutedNodeDetail(leasedCtx, n.ID)
+			if err != nil || current.OriginalServer != n.OriginalServer {
+				log.Printf("[SuspendUserRouted] node %d changed while acquiring lease; retry later", n.ID)
+				return
+			}
+			sa, _ := repo.GetUserSubaccount(leasedCtx, n.ID, username)
+			if sa == nil {
+				return
+			}
+			if err := removeRuleByMarktag(leasedCtx, rm, serverID, current.RoutedRuleMarktag); err != nil {
+				log.Printf("[SuspendUserRouted] remove rule node %d failed: %v", n.ID, err)
+				return
+			}
+			if err := removeClientFromInbound(leasedCtx, rm, serverID, current.InboundTag, sa.Email); err != nil {
+				log.Printf("[SuspendUserRouted] remove client node %d failed: %v", n.ID, err)
+				return
+			}
+			if err := repo.SetSubaccountActive(leasedCtx, sa.ID, false); err != nil {
+				log.Printf("[SuspendUserRouted] mark inactive node %d failed: %v", n.ID, err)
+			}
+		}()
 	}
 }
 
@@ -554,37 +633,53 @@ func resumeUserPrivateRouted(ctx context.Context, rm *RemoteManageHandler, repo 
 			log.Printf("[ResumeUserRouted] resolve server for node %d failed (continue): %v", n.ID, err)
 			continue
 		}
-		sa, err := repo.GetUserSubaccount(ctx, n.ID, username)
-		if err != nil || sa == nil {
-			log.Printf("[ResumeUserRouted] node %d no subaccount for %s, skip", n.ID, username)
+		leasedCtx, release, err := repo.AcquireRemoteServerMutationLease(ctx, serverID)
+		if err != nil {
+			log.Printf("[ResumeUserRouted] node %d deferred: %v", n.ID, err)
 			continue
 		}
-		// 1. 加回 client(用保存的凭据)
-		var cred map[string]interface{}
-		if err := json.Unmarshal([]byte(sa.CredentialJSON), &cred); err != nil {
-			log.Printf("[ResumeUserRouted] parse credential for node %d failed: %v", n.ID, err)
-			continue
-		}
-		if err := addClientToInbound(ctx, rm, serverID, n.InboundTag, cred); err != nil {
-			log.Printf("[ResumeUserRouted] addClient node %d failed (continue): %v", n.ID, err)
-			continue
-		}
-		// 2. 重建 rule
-		rule := map[string]interface{}{
-			"type":        "field",
-			"marktag":     n.RoutedRuleMarktag,
-			"user":        []string{sa.Email},
-			"inboundTag":  []string{n.InboundTag},
-			"outboundTag": n.RoutedOutboundTag,
-		}
-		body, _ := json.Marshal(map[string]interface{}{"action": "add_rule", "rule": rule})
-		if _, err := rm.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/routing", body); err != nil {
-			log.Printf("[ResumeUserRouted] add_rule node %d failed (continue): %v", n.ID, err)
-			// rollback client
-			removeClientFromInbound(ctx, rm, serverID, n.InboundTag, sa.Email)
-			continue
-		}
-		_ = repo.SetSubaccountActive(ctx, sa.ID, true)
+		func() {
+			defer release()
+			current, err := repo.GetRoutedNodeDetail(leasedCtx, n.ID)
+			if err != nil || current.OriginalServer != n.OriginalServer {
+				log.Printf("[ResumeUserRouted] node %d changed while acquiring lease; retry later", n.ID)
+				return
+			}
+			sa, err := repo.GetUserSubaccount(leasedCtx, n.ID, username)
+			if err != nil || sa == nil {
+				log.Printf("[ResumeUserRouted] node %d no subaccount for %s, skip", n.ID, username)
+				return
+			}
+			var cred map[string]interface{}
+			if err := json.Unmarshal([]byte(sa.CredentialJSON), &cred); err != nil {
+				log.Printf("[ResumeUserRouted] parse credential for node %d failed: %v", n.ID, err)
+				return
+			}
+			if err := addClientToInbound(leasedCtx, rm, serverID, current.InboundTag, cred); err != nil {
+				log.Printf("[ResumeUserRouted] addClient node %d failed (continue): %v", n.ID, err)
+				return
+			}
+			rule := map[string]interface{}{
+				"type":        "field",
+				"marktag":     current.RoutedRuleMarktag,
+				"user":        []string{sa.Email},
+				"inboundTag":  []string{current.InboundTag},
+				"outboundTag": current.RoutedOutboundTag,
+			}
+			body, _ := json.Marshal(map[string]interface{}{"action": "add_rule", "rule": rule})
+			response, err := rm.forwardToRemoteServer(leasedCtx, serverID, "POST", "/api/child/routing", body)
+			if err == nil {
+				err = applyAgentConfigMutationACK(leasedCtx, rm, serverID, "ResumeUserRoutedRule", response)
+			}
+			if err != nil {
+				log.Printf("[ResumeUserRouted] add_rule node %d failed (continue): %v", n.ID, err)
+				_ = removeClientFromInbound(leasedCtx, rm, serverID, current.InboundTag, sa.Email)
+				return
+			}
+			if err := repo.SetSubaccountActive(leasedCtx, sa.ID, true); err != nil {
+				log.Printf("[ResumeUserRouted] mark active node %d failed: %v", n.ID, err)
+			}
+		}()
 	}
 }
 
@@ -605,31 +700,46 @@ func deleteUserPrivateRoutedAll(ctx context.Context, rm *RemoteManageHandler, re
 		if err != nil {
 			return fmt.Errorf("resolve server for private routed node %d: %w", n.ID, err)
 		}
-		if err := removeRuleByMarktag(ctx, rm, serverID, n.RoutedRuleMarktag); err != nil {
-			return fmt.Errorf("remove rule for private routed node %d: %w", n.ID, err)
-		}
-		rmOutBody, _ := json.Marshal(map[string]string{"action": "remove", "tag": n.RoutedOutboundTag})
-		outboundResponse, err := rm.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/outbounds", rmOutBody)
+		leasedCtx, release, err := repo.AcquireRemoteServerMutationLease(ctx, serverID)
 		if err != nil {
-			return fmt.Errorf("remove outbound for private routed node %d: %w", n.ID, err)
+			return fmt.Errorf("acquire private routed node %d mutation lease: %w", n.ID, err)
 		}
-		var ack struct {
-			Success bool `json:"success"`
-		}
-		if json.Unmarshal(outboundResponse, &ack) != nil || !ack.Success {
-			return fmt.Errorf("remove outbound for private routed node %d was not acknowledged", n.ID)
-		}
-		sa, subaccountErr := repo.GetUserSubaccount(ctx, n.ID, username)
-		if subaccountErr != nil && !errors.Is(subaccountErr, sql.ErrNoRows) {
-			return fmt.Errorf("load private routed credential for node %d: %w", n.ID, subaccountErr)
-		}
-		if sa != nil {
-			if err := removeClientFromInbound(ctx, rm, serverID, n.InboundTag, sa.Email); err != nil {
-				return fmt.Errorf("remove client for private routed node %d: %w", n.ID, err)
+		err = func() error {
+			defer release()
+			current, err := repo.GetRoutedNodeDetail(leasedCtx, n.ID)
+			if err != nil {
+				return fmt.Errorf("reload private routed node %d: %w", n.ID, err)
 			}
-		}
-		if err := repo.DeleteRoutedNode(ctx, n.ID); err != nil {
-			return fmt.Errorf("delete private routed node %d: %w", n.ID, err)
+			if current.OriginalServer != n.OriginalServer {
+				return fmt.Errorf("private routed node %d server changed; retry required", n.ID)
+			}
+			if err := removeRuleByMarktag(leasedCtx, rm, serverID, current.RoutedRuleMarktag); err != nil {
+				return fmt.Errorf("remove rule for private routed node %d: %w", n.ID, err)
+			}
+			rmOutBody, _ := json.Marshal(map[string]string{"action": "remove", "tag": current.RoutedOutboundTag})
+			outboundResponse, err := rm.forwardToRemoteServer(leasedCtx, serverID, "POST", "/api/child/outbounds", rmOutBody)
+			if err == nil {
+				err = applyAgentConfigMutationACK(leasedCtx, rm, serverID, "DeleteUserRoutedOutbound", outboundResponse)
+			}
+			if err != nil {
+				return fmt.Errorf("remove outbound for private routed node %d: %w", n.ID, err)
+			}
+			sa, subaccountErr := repo.GetUserSubaccount(leasedCtx, n.ID, username)
+			if subaccountErr != nil && !errors.Is(subaccountErr, sql.ErrNoRows) {
+				return fmt.Errorf("load private routed credential for node %d: %w", n.ID, subaccountErr)
+			}
+			if sa != nil {
+				if err := removeClientFromInbound(leasedCtx, rm, serverID, current.InboundTag, sa.Email); err != nil {
+					return fmt.Errorf("remove client for private routed node %d: %w", n.ID, err)
+				}
+			}
+			if err := repo.DeleteRoutedNode(leasedCtx, n.ID); err != nil {
+				return fmt.Errorf("delete private routed node %d: %w", n.ID, err)
+			}
+			return nil
+		}()
+		if err != nil {
+			return err
 		}
 	}
 	return nil

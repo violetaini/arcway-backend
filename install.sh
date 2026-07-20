@@ -9,12 +9,30 @@ set -e
 GITHUB_REPO="violetaini/arcway-backend"
 VERSION=""  # 将自动获取最新版本
 BINARY_NAME=""  # 将根据架构自动设置
-INSTALL_DIR="/usr/local/bin"
+INSTALL_DIR="${ARCWAY_INSTALL_DIR:-/usr/local/bin}"
 SERVICE_NAME="arcway"
-DATA_DIR="/etc/arcway"
-CONFIG_DIR="/etc/arcway"
-GUARD_ASSET_DIR="/usr/local/lib/arcway/guard-assets"
+DATA_DIR="${ARCWAY_DATA_DIR:-/etc/arcway}"
+CONFIG_DIR="${ARCWAY_CONFIG_DIR:-$DATA_DIR}"
+GUARD_ASSET_DIR="${ARCWAY_GUARD_ASSET_DIR:-/usr/local/lib/arcway/guard-assets}"
+SYSTEMD_UNIT_DIR="${ARCWAY_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+SERVICE_FILE="$SYSTEMD_UNIT_DIR/${SERVICE_NAME}.service"
+INSTALL_LOCK_FILE="${ARCWAY_INSTALL_LOCK_FILE:-/run/arcway-install.lock}"
+PANEL_SOURCE_IPS="${ARCWAY_PANEL_IPS:-}"
+DATABASE_PATH="${ARCWAY_DATABASE_PATH:-}"
 TMP_DIR=""
+UPDATE_TRANSACTION_ACTIVE=false
+UPDATE_BACKUP_DIR=""
+OLD_SERVICE_ACTIVE=false
+OLD_SERVICE_PRESENT=false
+OLD_SERVICE_ENABLE_STATE=""
+UPDATE_TRACKED_PATHS=()
+UPDATE_MANAGED_DIRS=()
+UPDATE_MANAGED_DIR_STATES=()
+UPDATE_MANAGED_DIR_MODES=()
+ATOMIC_STAGE_PATHS=()
+GUARD_PARENT_DIR=""
+OLD_GUARD_PARENT_PRESENT=false
+PRESERVE_TMP_DIR=false
 
 # 颜色输出
 RED='\033[0;31m'
@@ -32,6 +50,81 @@ echo_warn() {
 
 echo_error() {
     echo -e "${RED}[ERROR]${NC} $1"
+}
+
+acquire_install_lock() {
+    if ! command -v flock >/dev/null 2>&1; then
+        echo_error "系统缺少 flock，无法安全执行安装事务"
+        return 1
+    fi
+    if ! { exec 9>"$INSTALL_LOCK_FILE"; }; then
+        echo_error "无法打开安装锁: $INSTALL_LOCK_FILE"
+        return 1
+    fi
+    if ! flock -n 9; then
+        echo_error "另一个 Arcway 安装或更新进程正在运行"
+        return 1
+    fi
+}
+
+register_atomic_stage() {
+    ATOMIC_STAGE_PATHS+=("$1")
+}
+
+new_atomic_stage() {
+    target=$1
+    suffix=${2:-file}
+    target_dir=$(dirname "$target")
+    target_base=$(basename "$target")
+    ATOMIC_STAGE_PATH="$target_dir/.${target_base}.arcway-stage.$$.$RANDOM.$suffix"
+    register_atomic_stage "$ATOMIC_STAGE_PATH"
+}
+
+atomic_install_file() {
+    source_path=$1
+    target_path=$2
+    target_mode=$3
+    mkdir -p "$(dirname "$target_path")" || return 1
+    new_atomic_stage "$target_path" || return 1
+    install -m "$target_mode" "$source_path" "$ATOMIC_STAGE_PATH" || return 1
+    mv -fT -- "$ATOMIC_STAGE_PATH" "$target_path"
+}
+
+atomic_copy_file() {
+    source_path=$1
+    target_path=$2
+    mkdir -p "$(dirname "$target_path")" || return 1
+    new_atomic_stage "$target_path" || return 1
+    cp -a -- "$source_path" "$ATOMIC_STAGE_PATH" || return 1
+    mv -fT -- "$ATOMIC_STAGE_PATH" "$target_path"
+}
+
+atomic_write_version() {
+    target_path=$1
+    mkdir -p "$(dirname "$target_path")" || return 1
+    new_atomic_stage "$target_path" || return 1
+    if ! printf '%s\n' "$VERSION" > "$ATOMIC_STAGE_PATH"; then
+        return 1
+    fi
+    chmod 0644 "$ATOMIC_STAGE_PATH" || return 1
+    mv -fT -- "$ATOMIC_STAGE_PATH" "$target_path"
+}
+
+atomic_remove_file() {
+    target_path=$1
+    if [ ! -e "$target_path" ] && [ ! -L "$target_path" ]; then
+        return 0
+    fi
+    new_atomic_stage "$target_path" removed || return 1
+    mv -fT -- "$target_path" "$ATOMIC_STAGE_PATH" || return 1
+    rm -f -- "$ATOMIC_STAGE_PATH"
+}
+
+arcway_test_failpoint() {
+    if [ "${ARCWAY_TEST_FAILPOINT:-}" = "$1" ]; then
+        echo_error "触发安装事务测试故障点: $1"
+        return 1
+    fi
 }
 
 # 检查是否为 root 用户
@@ -126,12 +219,24 @@ download_binary() {
 # 安装二进制文件
 install_binary() {
     echo_info "安装二进制文件..."
-    install -m 0755 "$TMP_DIR/$BINARY_NAME" "$INSTALL_DIR/.${SERVICE_NAME}.new"
-    mv -f "$INSTALL_DIR/.${SERVICE_NAME}.new" "$INSTALL_DIR/$SERVICE_NAME"
+    if ! atomic_install_file "$TMP_DIR/$BINARY_NAME" "$INSTALL_DIR/$SERVICE_NAME" 0755; then
+        return 1
+    fi
+    if ! arcway_test_failpoint after_binary_swap; then
+        return 1
+    fi
     install -d -m 0755 "$GUARD_ASSET_DIR"
+    guard_index=0
     for guard in arcway-expiry-guard-linux-amd64 arcway-expiry-guard-linux-arm64; do
-        install -m 0755 "$TMP_DIR/$guard" "$GUARD_ASSET_DIR/.${guard}.new"
-        mv -f "$GUARD_ASSET_DIR/.${guard}.new" "$GUARD_ASSET_DIR/$guard"
+        if ! atomic_install_file "$TMP_DIR/$guard" "$GUARD_ASSET_DIR/$guard" 0755; then
+            return 1
+        fi
+        guard_index=$((guard_index + 1))
+        if [ "$guard_index" -eq 1 ]; then
+            if ! arcway_test_failpoint after_first_guard_swap; then
+                return 1
+            fi
+        fi
     done
     echo_info "已安装到 $INSTALL_DIR/$SERVICE_NAME"
 }
@@ -145,15 +250,276 @@ create_directories() {
     chmod 700 "$CONFIG_DIR"
 }
 
+track_transaction_directory() {
+    managed_dir=$1
+    for existing_dir in "${UPDATE_MANAGED_DIRS[@]}"; do
+        if [ "$existing_dir" = "$managed_dir" ]; then
+            return 0
+        fi
+    done
+
+    UPDATE_MANAGED_DIRS+=("$managed_dir")
+    if [ -d "$managed_dir" ]; then
+        UPDATE_MANAGED_DIR_STATES+=("directory")
+        UPDATE_MANAGED_DIR_MODES+=("$(stat -c '%a' "$managed_dir")")
+    elif [ -e "$managed_dir" ] || [ -L "$managed_dir" ]; then
+        UPDATE_MANAGED_DIR_STATES+=("other")
+        UPDATE_MANAGED_DIR_MODES+=("")
+    else
+        UPDATE_MANAGED_DIR_STATES+=("missing")
+        UPDATE_MANAGED_DIR_MODES+=("")
+    fi
+}
+
+begin_update_transaction() {
+    if [ -z "$TMP_DIR" ] || [ ! -d "$TMP_DIR" ]; then
+        echo_error "更新临时目录不存在，拒绝修改当前安装"
+        return 1
+    fi
+    UPDATE_BACKUP_DIR="$TMP_DIR/rollback"
+    mkdir -p "$UPDATE_BACKUP_DIR"
+    PRESERVE_TMP_DIR=false
+    OLD_SERVICE_ACTIVE=false
+    OLD_SERVICE_PRESENT=false
+    OLD_SERVICE_ENABLE_STATE=""
+    if systemctl cat "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+        OLD_SERVICE_PRESENT=true
+        OLD_SERVICE_ENABLE_STATE=$(systemctl is-enabled "${SERVICE_NAME}.service" 2>/dev/null || true)
+        case "$OLD_SERVICE_ENABLE_STATE" in
+            enabled|enabled-runtime|disabled|static)
+                ;;
+            *)
+                echo_error "服务启用状态不受支持: ${OLD_SERVICE_ENABLE_STATE:-unknown}"
+                echo_error "仅允许 enabled、enabled-runtime、disabled 或 static，尚未修改现有安装"
+                return 1
+                ;;
+        esac
+        if systemctl is-active --quiet "${SERVICE_NAME}.service" 2>/dev/null; then
+            OLD_SERVICE_ACTIVE=true
+        fi
+    fi
+
+    UPDATE_TRACKED_PATHS=(
+        "$INSTALL_DIR/$SERVICE_NAME"
+        "$INSTALL_DIR/${SERVICE_NAME}.bak"
+        "$GUARD_ASSET_DIR/arcway-expiry-guard-linux-amd64"
+        "$GUARD_ASSET_DIR/arcway-expiry-guard-linux-arm64"
+        "$SERVICE_FILE"
+        "$DATA_DIR/.version"
+    )
+    UPDATE_MANAGED_DIRS=()
+    UPDATE_MANAGED_DIR_STATES=()
+    UPDATE_MANAGED_DIR_MODES=()
+    track_transaction_directory "$DATA_DIR"
+    track_transaction_directory "$CONFIG_DIR"
+    track_transaction_directory "$GUARD_ASSET_DIR"
+    GUARD_PARENT_DIR=$(dirname "$GUARD_ASSET_DIR")
+    OLD_GUARD_PARENT_PRESENT=false
+    if [ -d "$GUARD_PARENT_DIR" ]; then
+        OLD_GUARD_PARENT_PRESENT=true
+    fi
+
+    for tracked_path in "${UPDATE_TRACKED_PATHS[@]}"; do
+        backup_path="$UPDATE_BACKUP_DIR$tracked_path"
+        mkdir -p "$(dirname "$backup_path")"
+        if [ -e "$tracked_path" ] || [ -L "$tracked_path" ]; then
+            cp -a "$tracked_path" "$backup_path"
+        else
+            : > "$backup_path.arcway-missing"
+        fi
+    done
+    UPDATE_TRANSACTION_ACTIVE=true
+}
+
+stop_service_for_transaction() {
+    service_unit="${SERVICE_NAME}.service"
+    if ! systemctl cat "$service_unit" >/dev/null 2>&1; then
+        echo_info "服务未加载，无需停止"
+        return 0
+    fi
+
+    echo_info "停止服务..."
+    if ! systemctl stop "$service_unit"; then
+        echo_error "停止服务失败，拒绝继续替换文件"
+        return 1
+    fi
+
+    stop_attempt=0
+    while [ "$stop_attempt" -lt 10 ]; do
+        if ! active_state=$(systemctl show --property=ActiveState --value "$service_unit" 2>/dev/null); then
+            echo_error "无法确认服务停止状态，拒绝继续替换文件"
+            return 1
+        fi
+        case "$active_state" in
+            inactive|failed)
+                echo_info "服务已停止（状态: $active_state）"
+                return 0
+                ;;
+        esac
+        stop_attempt=$((stop_attempt + 1))
+        sleep 1
+    done
+
+    echo_error "服务停止超时（当前状态: ${active_state:-unknown}），拒绝继续替换文件"
+    return 1
+}
+
+snapshot_database_after_stop() {
+    if [ -z "$DATABASE_PATH" ] && [ -f "$SERVICE_FILE" ]; then
+        DATABASE_PATH=$(sed -n 's/^Environment="DATABASE_PATH=\(.*\)"$/\1/p' "$SERVICE_FILE" | head -n 1)
+    fi
+    DATABASE_PATH=${DATABASE_PATH:-$DATA_DIR/arcway.db}
+    case "$DATABASE_PATH" in
+        /*) ;;
+        *)
+            echo_error "数据库路径必须是绝对路径: $DATABASE_PATH"
+            return 1
+            ;;
+    esac
+    case "$DATABASE_PATH" in
+        *$'\n'*|*$'\r'*)
+            echo_error "数据库路径包含非法换行"
+            return 1
+            ;;
+    esac
+
+    for tracked_path in "$DATABASE_PATH" "$DATABASE_PATH-wal" "$DATABASE_PATH-shm"; do
+        UPDATE_TRACKED_PATHS+=("$tracked_path")
+        backup_path="$UPDATE_BACKUP_DIR$tracked_path"
+        mkdir -p "$(dirname "$backup_path")" || return 1
+        if [ -e "$tracked_path" ] || [ -L "$tracked_path" ]; then
+            cp -a -- "$tracked_path" "$backup_path" || return 1
+        else
+            : > "$backup_path.arcway-missing" || return 1
+        fi
+    done
+}
+
+rollback_update_transaction() {
+    echo_error "安装或更新失败，正在恢复原状态..."
+    rollback_failed=false
+    if systemctl cat "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+        if ! stop_service_for_transaction >/dev/null 2>&1; then
+            rollback_failed=true
+        fi
+        # 先移除本次事务可能创建的持久/runtime 链接及 mask，再恢复旧 unit 和精确启用状态。
+        if ! systemctl disable "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+            rollback_failed=true
+        fi
+        if ! systemctl disable --runtime "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+            rollback_failed=true
+        fi
+        if ! systemctl unmask "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+            rollback_failed=true
+        fi
+    fi
+    for tracked_path in "${UPDATE_TRACKED_PATHS[@]}"; do
+        backup_path="$UPDATE_BACKUP_DIR$tracked_path"
+        if [ -e "$backup_path.arcway-missing" ]; then
+            if ! atomic_remove_file "$tracked_path"; then
+                rollback_failed=true
+            fi
+        elif [ -e "$backup_path" ] || [ -L "$backup_path" ]; then
+            if ! atomic_copy_file "$backup_path" "$tracked_path"; then
+                rollback_failed=true
+            fi
+        fi
+    done
+
+    managed_dir_index=0
+    while [ "$managed_dir_index" -lt "${#UPDATE_MANAGED_DIRS[@]}" ]; do
+        managed_dir=${UPDATE_MANAGED_DIRS[$managed_dir_index]}
+        managed_dir_state=${UPDATE_MANAGED_DIR_STATES[$managed_dir_index]}
+        managed_dir_mode=${UPDATE_MANAGED_DIR_MODES[$managed_dir_index]}
+        if [ "$managed_dir_state" = "missing" ]; then
+            if ! rm -rf "$managed_dir"; then
+                rollback_failed=true
+            fi
+        elif [ "$managed_dir_state" = "directory" ]; then
+            if [ ! -d "$managed_dir" ] || ! chmod "$managed_dir_mode" "$managed_dir"; then
+                rollback_failed=true
+            fi
+        fi
+        managed_dir_index=$((managed_dir_index + 1))
+    done
+    if [ "$OLD_GUARD_PARENT_PRESENT" = false ] && [ -n "$GUARD_PARENT_DIR" ]; then
+        rmdir "$GUARD_PARENT_DIR" >/dev/null 2>&1 || true
+    fi
+
+    if ! systemctl daemon-reload >/dev/null 2>&1; then
+        rollback_failed=true
+    fi
+    if [ "$OLD_SERVICE_PRESENT" = true ]; then
+        case "$OLD_SERVICE_ENABLE_STATE" in
+            enabled)
+                if ! systemctl enable "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+                    rollback_failed=true
+                fi
+                ;;
+            enabled-runtime)
+                if ! systemctl enable --runtime "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+                    rollback_failed=true
+                fi
+                ;;
+            disabled|static)
+                ;;
+            *)
+                rollback_failed=true
+                ;;
+        esac
+        restored_enable_state=$(systemctl is-enabled "${SERVICE_NAME}.service" 2>/dev/null || true)
+        if [ "$restored_enable_state" != "$OLD_SERVICE_ENABLE_STATE" ]; then
+            rollback_failed=true
+        fi
+        if [ "$OLD_SERVICE_ACTIVE" = true ]; then
+            if ! systemctl start "${SERVICE_NAME}.service" >/dev/null 2>&1 ||
+                ! systemctl is-active --quiet "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+                rollback_failed=true
+            fi
+        elif systemctl is-active --quiet "${SERVICE_NAME}.service" >/dev/null 2>&1; then
+            rollback_failed=true
+        fi
+    fi
+    UPDATE_TRANSACTION_ACTIVE=false
+    if [ "$rollback_failed" = true ]; then
+        echo_error "自动恢复未完全成功，请立即检查文件和服务状态"
+        return 1
+    fi
+    echo_error "已恢复原状态；请查看日志: journalctl -u $SERVICE_NAME -n 50"
+    return 0
+}
+
+commit_update_transaction() {
+    UPDATE_TRANSACTION_ACTIVE=false
+}
+
+verify_and_commit_systemd_unit() {
+    staged_unit=$1
+    if ! command -v systemd-analyze >/dev/null 2>&1; then
+        echo_error "系统缺少 systemd-analyze，拒绝替换服务 unit"
+        return 1
+    fi
+    if ! systemd-analyze verify "$staged_unit"; then
+        echo_error "systemd unit 校验失败，拒绝替换当前 unit"
+        return 1
+    fi
+    chmod 0644 "$staged_unit" || return 1
+    mv -fT -- "$staged_unit" "$SERVICE_FILE"
+}
+
 # 创建 systemd 服务
 create_systemd_service() {
     echo_info "创建 systemd 服务..."
+
+    if [ "${ARCWAY_PANEL_IPS+x}" != "x" ] && [ -z "$PANEL_SOURCE_IPS" ] && [ -f "$SERVICE_FILE" ]; then
+        PANEL_SOURCE_IPS=$(sed -n 's/^Environment="ARCWAY_PANEL_IPS=\(.*\)"$/\1/p' "$SERVICE_FILE" | head -n 1)
+    fi
 
     # 询问端口号（支持非交互式环境）
     echo ""
     if [ -t 0 ]; then
         # 交互式环境，可以读取用户输入
-        read -p "请输入端口号（默认 12889，直接回车使用默认值）: " PORT_INPUT
+        read -r -p "请输入端口号（默认 12889，直接回车使用默认值）: " PORT_INPUT
         if [ -z "$PORT_INPUT" ]; then
             PORT_INPUT=12889
         fi
@@ -163,7 +529,10 @@ create_systemd_service() {
         echo_info "使用端口: $PORT_INPUT"
     fi
 
-    cat > /etc/systemd/system/${SERVICE_NAME}.service <<EOF
+    mkdir -p "$(dirname "$SERVICE_FILE")"
+    new_atomic_stage "$SERVICE_FILE" service
+    staged_unit=$ATOMIC_STAGE_PATH
+    cat > "$staged_unit" <<EOF
 [Unit]
 Description=Arcway shared-node control plane
 After=network.target
@@ -186,6 +555,7 @@ Environment="PORT=$PORT_INPUT"
 Environment="DATABASE_PATH=$DATA_DIR/arcway.db"
 Environment="LOG_LEVEL=info"
 Environment="ARCWAY_GUARD_ASSET_DIR=$GUARD_ASSET_DIR"
+Environment="ARCWAY_PANEL_IPS=$PANEL_SOURCE_IPS"
 
 # 安全选项
 NoNewPrivileges=true
@@ -195,18 +565,66 @@ PrivateTmp=true
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
+    if ! verify_and_commit_systemd_unit "$staged_unit"; then
+        return 1
+    fi
+    if ! systemctl daemon-reload; then
+        echo_error "systemd daemon-reload 失败"
+        return 1
+    fi
     echo_info "systemd 服务已创建（端口: $PORT_INPUT）"
+}
+
+update_systemd_service_settings() {
+    port_value=$1
+    if [ ! -f "$SERVICE_FILE" ]; then
+        echo_error "现有 systemd unit 不存在: $SERVICE_FILE"
+        return 1
+    fi
+
+    new_atomic_stage "$SERVICE_FILE" service
+    staged_unit=$ATOMIC_STAGE_PATH
+    cp -a -- "$SERVICE_FILE" "$staged_unit" || return 1
+    sed -i "s/Environment=\"PORT=[0-9]*\"/Environment=\"PORT=$port_value\"/" "$staged_unit" || return 1
+
+    panel_ips_env_exists=false
+    if grep -q '^Environment="ARCWAY_PANEL_IPS=' "$staged_unit"; then
+        panel_ips_env_exists=true
+    fi
+    if [ "${ARCWAY_PANEL_IPS+x}" = "x" ] || [ "$panel_ips_env_exists" = false ]; then
+        escaped_panel_source_ips=$(printf '%s' "$PANEL_SOURCE_IPS" | sed 's/[&|\\]/\\&/g')
+        if [ "$panel_ips_env_exists" = true ]; then
+            sed -i "s|^Environment=\"ARCWAY_PANEL_IPS=.*\"$|Environment=\"ARCWAY_PANEL_IPS=$escaped_panel_source_ips\"|" "$staged_unit"
+        elif grep -q '^Environment="ARCWAY_GUARD_ASSET_DIR=' "$staged_unit"; then
+            sed -i "/^Environment=\"ARCWAY_GUARD_ASSET_DIR=/a Environment=\"ARCWAY_PANEL_IPS=$escaped_panel_source_ips\"" "$staged_unit"
+        else
+            sed -i "/^\[Install\]/i Environment=\"ARCWAY_PANEL_IPS=$escaped_panel_source_ips\"" "$staged_unit"
+        fi
+    fi
+
+    if ! verify_and_commit_systemd_unit "$staged_unit"; then
+        return 1
+    fi
+    if ! systemctl daemon-reload; then
+        echo_error "systemd daemon-reload 失败"
+        return 1
+    fi
 }
 
 # 启动服务
 start_service() {
     echo_info "启动服务..."
-    systemctl enable ${SERVICE_NAME}.service
-    systemctl start ${SERVICE_NAME}.service
+    if ! systemctl enable "${SERVICE_NAME}.service"; then
+        echo_error "设置服务开机启动失败"
+        return 1
+    fi
+    if ! systemctl start "${SERVICE_NAME}.service"; then
+        echo_error "启动服务命令执行失败"
+        return 1
+    fi
     sleep 2
 
-    if systemctl is-active --quiet ${SERVICE_NAME}.service; then
+    if systemctl is-active --quiet "${SERVICE_NAME}.service"; then
         echo_info "服务启动成功！"
         return 0
     else
@@ -218,7 +636,7 @@ start_service() {
 # 显示状态
 show_status() {
     # 从 systemd 服务文件中读取端口号
-    CONFIGURED_PORT=$(grep "Environment=\"PORT=" /etc/systemd/system/${SERVICE_NAME}.service | sed 's/.*PORT=\([0-9]*\).*/\1/')
+    CONFIGURED_PORT=$(grep "Environment=\"PORT=" "$SERVICE_FILE" | sed 's/.*PORT=\([0-9]*\).*/\1/')
     CONFIGURED_PORT=${CONFIGURED_PORT:-12889}
 
     echo ""
@@ -265,30 +683,32 @@ update_service() {
 
     # 下载和校验必须先完成，网络失败时保持当前服务运行。
     download_binary
+    begin_update_transaction
 
-    # 停止服务
-    echo_info "停止服务..."
-    systemctl stop ${SERVICE_NAME}.service || true
+    if ! stop_service_for_transaction; then
+        return 1
+    fi
+    snapshot_database_after_stop
 
     # 备份当前二进制文件
     if [ -f "$INSTALL_DIR/$SERVICE_NAME" ]; then
         echo_info "备份当前版本..."
-        cp "$INSTALL_DIR/$SERVICE_NAME" "$INSTALL_DIR/${SERVICE_NAME}.bak"
+        atomic_copy_file "$INSTALL_DIR/$SERVICE_NAME" "$INSTALL_DIR/${SERVICE_NAME}.bak"
     fi
 
     # 安装已校验的新版本
     install_binary
 
     # 保存版本信息
-    echo "$VERSION" > "$DATA_DIR/.version"
+    atomic_write_version "$DATA_DIR/.version"
 
     # 询问是否修改端口（支持非交互式环境）
-    CURRENT_PORT=$(grep "Environment=\"PORT=" /etc/systemd/system/${SERVICE_NAME}.service 2>/dev/null | sed 's/.*PORT=\([0-9]*\).*/\1/')
+    CURRENT_PORT=$(grep "Environment=\"PORT=" "$SERVICE_FILE" 2>/dev/null | sed 's/.*PORT=\([0-9]*\).*/\1/')
     CURRENT_PORT=${CURRENT_PORT:-12889}
     echo ""
     if [ -t 0 ]; then
         # 交互式环境
-        read -p "请输入端口号（默认 $CURRENT_PORT，直接回车使用默认值）: " PORT_INPUT
+        read -r -p "请输入端口号（默认 $CURRENT_PORT，直接回车使用默认值）: " PORT_INPUT
         if [ -z "$PORT_INPUT" ]; then
             PORT_INPUT=$CURRENT_PORT
         fi
@@ -298,34 +718,23 @@ update_service() {
         echo_info "使用端口: $PORT_INPUT"
     fi
 
-    # 更新 systemd 服务文件中的端口
-    sed -i "s/Environment=\"PORT=[0-9]*\"/Environment=\"PORT=$PORT_INPUT\"/" /etc/systemd/system/${SERVICE_NAME}.service
+    # 在同目录暂存并校验 unit 后原子替换。
+    update_systemd_service_settings "$PORT_INPUT"
 
-    # 重新加载 systemd 配置
-    systemctl daemon-reload
-
-    # 启动服务
-    if start_service; then
-        echo ""
-        echo "======================================"
-        echo_info "更新完成！"
-        echo "======================================"
-        echo ""
-        echo "📦 版本: $VERSION"
-        echo "🌐 访问地址: http://$(hostname -I | awk '{print $1}'):$PORT_INPUT"
-        echo ""
-        echo "如遇问题可回滚到备份版本:"
-        echo "  sudo systemctl stop $SERVICE_NAME"
-        echo "  sudo mv $INSTALL_DIR/${SERVICE_NAME}.bak $INSTALL_DIR/$SERVICE_NAME"
-        echo "  sudo systemctl start $SERVICE_NAME"
-        echo ""
-    else
-        echo_error "更新后服务启动失败，正在回滚..."
-        mv "$INSTALL_DIR/${SERVICE_NAME}.bak" "$INSTALL_DIR/$SERVICE_NAME"
-        systemctl start ${SERVICE_NAME}.service
-        echo_error "已回滚到之前版本，请查看日志: journalctl -u $SERVICE_NAME -n 50"
-        exit 1
+    if ! start_service; then
+        return 1
     fi
+    commit_update_transaction
+    echo ""
+    echo "======================================"
+    echo_info "更新完成！"
+    echo "======================================"
+    echo ""
+    echo "📦 版本: $VERSION"
+    echo "🌐 访问地址: http://$(hostname -I | awk '{print $1}'):$PORT_INPUT"
+    echo ""
+    echo "上一版本二进制备份: $INSTALL_DIR/${SERVICE_NAME}.bak"
+    echo ""
 }
 
 # 卸载服务
@@ -360,7 +769,7 @@ uninstall_service() {
         echo "是否保留配置和数据？"
         echo "  1) 完全删除（删除所有文件和数据）"
         echo "  2) 保留数据（保留 $DATA_DIR 和 $CONFIG_DIR 目录）"
-        read -p "请选择 (1/2，默认 2): " CHOICE
+        read -r -p "请选择 (1/2，默认 2): " CHOICE
 
         if [ "$CHOICE" = "1" ]; then
             KEEP_DATA=false
@@ -382,7 +791,7 @@ uninstall_service() {
 
     # 删除 systemd 服务文件
     echo_info "删除 systemd 服务..."
-    rm -f /etc/systemd/system/${SERVICE_NAME}.service
+    rm -f "$SERVICE_FILE"
     systemctl daemon-reload
     echo_info "✓ systemd 服务已删除"
     echo ""
@@ -390,7 +799,7 @@ uninstall_service() {
     # 删除二进制文件
     echo_info "删除程序文件..."
     rm -f "$INSTALL_DIR/$SERVICE_NAME" "$INSTALL_DIR/${SERVICE_NAME}.bak"
-    rm -f "$INSTALL_DIR/.${SERVICE_NAME}.new"
+    rm -f "$INSTALL_DIR"/.arcway.arcway-stage.*
     rm -rf "$GUARD_ASSET_DIR"
     echo_info "✓ 程序文件已删除"
     echo ""
@@ -425,17 +834,17 @@ reinstall_service() {
 
     # 下载和校验必须先完成，网络失败时保持当前服务运行。
     download_binary
+    begin_update_transaction
 
-    # 停止已有服务
-    if systemctl is-active --quiet ${SERVICE_NAME}.service 2>/dev/null; then
-        echo_info "停止现有服务..."
-        systemctl stop ${SERVICE_NAME}.service || true
+    if ! stop_service_for_transaction; then
+        return 1
     fi
+    snapshot_database_after_stop
 
     # 备份当前二进制文件
     if [ -f "$INSTALL_DIR/$SERVICE_NAME" ]; then
         echo_info "备份当前版本..."
-        cp "$INSTALL_DIR/$SERVICE_NAME" "$INSTALL_DIR/${SERVICE_NAME}.bak"
+        atomic_copy_file "$INSTALL_DIR/$SERVICE_NAME" "$INSTALL_DIR/${SERVICE_NAME}.bak"
     fi
 
     # 全量覆盖：安装、重建目录和服务
@@ -444,80 +853,97 @@ reinstall_service() {
     create_systemd_service
 
     # 保存版本信息
-    echo "$VERSION" > "$DATA_DIR/.version"
+    atomic_write_version "$DATA_DIR/.version"
 
-    if start_service; then
-        show_status
-        echo_info "覆盖安装完成！数据已保留。"
-        echo ""
-        echo "如遇问题可回滚到备份版本:"
-        echo "  sudo systemctl stop $SERVICE_NAME"
-        echo "  sudo mv $INSTALL_DIR/${SERVICE_NAME}.bak $INSTALL_DIR/$SERVICE_NAME"
-        echo "  sudo systemctl start $SERVICE_NAME"
-        echo ""
-    else
-        echo_error "覆盖安装后服务启动失败，正在回滚..."
-        if [ -f "$INSTALL_DIR/${SERVICE_NAME}.bak" ]; then
-            mv "$INSTALL_DIR/${SERVICE_NAME}.bak" "$INSTALL_DIR/$SERVICE_NAME"
-            systemctl start ${SERVICE_NAME}.service || true
-            echo_error "已回滚到之前版本"
-        fi
-        echo_error "请查看日志: journalctl -u $SERVICE_NAME -n 50"
-        exit 1
+    if ! start_service; then
+        return 1
     fi
+    commit_update_transaction
+    show_status
+    echo_info "覆盖安装完成！数据已保留。"
+    echo ""
+    echo "上一版本二进制备份: $INSTALL_DIR/${SERVICE_NAME}.bak"
+    echo ""
 }
 
 # 主函数
 main() {
+    check_root
+    acquire_install_lock
+
     # 检查命令行参数
     if [ "$1" = "update" ]; then
         echo_info "进入更新模式..."
-        check_root
         check_architecture
         install_dependencies
         get_latest_version
         update_service
     elif [ "$1" = "reinstall" ]; then
         echo_info "进入覆盖安装模式..."
-        check_root
         check_architecture
         install_dependencies
         get_latest_version
         reinstall_service
     elif [ "$1" = "uninstall" ]; then
         echo_info "进入卸载模式..."
-        check_root
         uninstall_service
     else
         echo_info "开始安装 Arcway..."
         echo ""
 
-        check_root
         check_architecture
         install_dependencies
         get_latest_version
         download_binary
+        begin_update_transaction
+        if ! stop_service_for_transaction; then
+            return 1
+        fi
+        snapshot_database_after_stop
         install_binary
         create_directories
         create_systemd_service
 
         # 保存版本信息
-        echo "$VERSION" > "$DATA_DIR/.version"
+        atomic_write_version "$DATA_DIR/.version"
 
-        if start_service; then
-            show_status
-        else
+        if ! start_service; then
             echo_error "安装过程中出现错误，请查看日志: journalctl -u $SERVICE_NAME -n 50"
-            exit 1
+            return 1
         fi
+        commit_update_transaction
+        show_status
     fi
 }
 
 cleanup() {
+    for atomic_stage in "${ATOMIC_STAGE_PATHS[@]}"; do
+        if [ -n "$atomic_stage" ]; then
+            rm -f -- "$atomic_stage" || true
+        fi
+    done
+    if [ "$PRESERVE_TMP_DIR" = true ]; then
+        echo_warn "事务备份已保留: $UPDATE_BACKUP_DIR"
+        return 0
+    fi
     if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then
         rm -rf "$TMP_DIR"
     fi
 }
 
-trap cleanup EXIT
+finish() {
+    status=$?
+    trap - EXIT HUP INT TERM
+    if [ "$status" -ne 0 ] && [ "$UPDATE_TRANSACTION_ACTIVE" = true ]; then
+        if ! rollback_update_transaction; then
+            PRESERVE_TMP_DIR=true
+            echo_error "回滚需要人工处理，原始退出状态: $status"
+        fi
+    fi
+    cleanup
+    exit "$status"
+}
+
+trap finish EXIT
+trap 'exit 130' HUP INT TERM
 main "$@"

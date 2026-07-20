@@ -1,18 +1,68 @@
 package handler
 
 import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
+
+	"miaomiaowux/internal/guardwire"
+	"miaomiaowux/internal/storage"
+	"miaomiaowux/internal/version"
 )
 
 const expiryGuardAssetDirEnv = "ARCWAY_GUARD_ASSET_DIR"
 
+const remoteManagementProbeInterval = 2 * time.Second
+const remoteInstallationTTL = 30 * time.Minute
+const remoteInstallationMaxLifetime = 2 * time.Hour
+const remoteInstallTicketTTL = 5 * time.Minute
+const remoteInstallTicketPrefix = "arcway-install-"
+const remoteInstallationNonceHeader = "X-Arcway-Install-Nonce"
+const remoteInstallationPolicyHeader = "X-Arcway-Install-Policy-SHA256"
+
 var errExpiryGuardAssetNotFound = errors.New("expiry guard asset not found")
+
+func (h *XrayServerHandler) allowRemoteManagementProbe(serverID int64, now time.Time) bool {
+	h.managementProbeMu.Lock()
+	defer h.managementProbeMu.Unlock()
+	if h.managementProbes == nil {
+		h.managementProbes = make(map[int64]time.Time)
+	}
+	if previous := h.managementProbes[serverID]; !previous.IsZero() && now.Sub(previous) < remoteManagementProbeInterval {
+		return false
+	}
+	h.managementProbes[serverID] = now
+	return true
+}
+
+// observedRemoteAddress binds the panel callback to the address that initiated
+// this authenticated request. Only X-Real-IP is accepted from a loopback peer;
+// the bundled Nginx config overwrites that header with its observed client.
+// CF-Connecting-IP and X-Forwarded-For are intentionally ignored because an
+// origin reachable outside Cloudflare can receive attacker-supplied values.
+func observedRemoteAddress(r *http.Request) string {
+	peer := net.ParseIP(agentStripPort(strings.TrimSpace(r.RemoteAddr)))
+	if peer == nil {
+		return ""
+	}
+	if peer.IsLoopback() {
+		if parsed := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); parsed != nil {
+			return parsed.String()
+		}
+	}
+	return peer.String()
+}
 
 // GetExpiryGuardAsset serves the panel-built expiry guard to an authenticated
 // remote server. The architecture allow-list also makes the requested filename
@@ -76,6 +126,389 @@ func remoteBearerToken(authorization string) (string, bool) {
 	return token, true
 }
 
+func probeRemoteAgent(ctx context.Context, client *http.Client, address string, port int) error {
+	target := "http://" + net.JoinHostPort(address, strconv.Itoa(port)) + "/api/child/system/info"
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return err
+	}
+	request.Header.Set("User-Agent", version.AgentUserAgent)
+	response, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	// Deliberately send no long-lived node token over the public plaintext
+	// management socket. A correctly configured Agent proves its identity by
+	// returning the known authentication challenge status; data-plane health is
+	// checked locally by the installer, and guard readiness is HMAC protected.
+	if response.StatusCode != http.StatusUnauthorized {
+		return fmt.Errorf("Agent authentication challenge returned HTTP %d", response.StatusCode)
+	}
+	return nil
+}
+
+func probeRemoteExpiryGuard(ctx context.Context, client *http.Client, address string, port int, secret string) error {
+	const path = "/v1/capabilities"
+	body, metadata, err := guardwire.Seal(secret, http.MethodGet, path, []byte(`{}`), time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	target := "http://" + net.JoinHostPort(address, strconv.Itoa(port)) + path
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", "application/octet-stream")
+	request.Header.Set(guardwire.HeaderTimestamp, metadata.Timestamp)
+	request.Header.Set(guardwire.HeaderNonce, metadata.Nonce)
+	request.Header.Set(guardwire.HeaderSignature, metadata.Signature)
+	request.Header.Set("User-Agent", version.AgentUserAgent)
+	response, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+	if err != nil {
+		return err
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("expiry guard returned HTTP %d", response.StatusCode)
+	}
+	var capabilities managedExpiryGuardCapabilities
+	if err := json.Unmarshal(responseBody, &capabilities); err != nil || !capabilities.ClientExpiry || !capabilities.Durable {
+		return errors.New("invalid expiry guard readiness response")
+	}
+	return nil
+}
+
+func newRemoteManagementProbeClient() (*http.Client, *http.Transport) {
+	dialer := &net.Dialer{Timeout: 1500 * time.Millisecond}
+	transport := &http.Transport{
+		Proxy:       nil,
+		DialContext: dialer.DialContext,
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   2 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	return client, transport
+}
+
+func remoteInstallationNonce(r *http.Request) (string, bool) {
+	nonce := strings.TrimSpace(r.Header.Get(remoteInstallationNonceHeader))
+	if len(nonce) < 20 || len(nonce) > 256 || strings.ContainsAny(nonce, " \t\r\n") {
+		return "", false
+	}
+	return nonce, true
+}
+
+func (h *XrayServerHandler) authenticatedRemoteInstallation(w http.ResponseWriter, r *http.Request) (*storage.RemoteServer, string, bool) {
+	token, tokenOK := remoteBearerToken(r.Header.Get("Authorization"))
+	nonce, nonceOK := remoteInstallationNonce(r)
+	if !tokenOK || !nonceOK || h == nil || h.repo == nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "unauthorized"})
+		return nil, "", false
+	}
+	server, err := h.repo.GetRemoteServerByToken(r.Context(), token)
+	if err != nil || (server.TokenExpiresAt != nil && !server.TokenExpiresAt.After(time.Now())) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "unauthorized"})
+		return nil, "", false
+	}
+	return server, nonce, true
+}
+
+func (h *XrayServerHandler) BeginRemoteInstallation(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	server, nonce, ok := h.authenticatedRemoteInstallation(w, r)
+	if !ok {
+		return
+	}
+	panelSourceIPs, err := configuredPanelSourceIPs()
+	if err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "installation policy is unavailable"})
+		return
+	}
+	policyContext, err := h.remoteInstallationPolicyContext(r.Context(), r, panelSourceIPs)
+	if err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "installation policy is unavailable"})
+		return
+	}
+	policyFingerprint := strings.TrimSpace(r.Header.Get(remoteInstallationPolicyHeader))
+	if err := h.repo.BeginRemoteServerInstallationWithPolicyContext(r.Context(), server.ID, nonce, time.Now().Add(remoteInstallationTTL), policyFingerprint, policyContext); err != nil {
+		status := http.StatusInternalServerError
+		message := "unable to begin installation transaction"
+		if errors.Is(err, storage.ErrRemoteInstallationActive) {
+			status = http.StatusConflict
+			message = "another installation transaction is active"
+		} else if errors.Is(err, storage.ErrRemoteInstallationPolicy) {
+			status = http.StatusConflict
+			message = "installation policy changed; download a new install command"
+		} else if errors.Is(err, storage.ErrRemoteInstallationAborted) || errors.Is(err, storage.ErrRemoteInstallationInvalid) {
+			status = http.StatusConflict
+			message = "installation transaction cannot be started"
+		}
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": message})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+}
+
+// RenewRemoteInstallation extends a live installer lease by 30 minutes while
+// preserving the hard two-hour deadline anchored at the first successful Begin.
+func (h *XrayServerHandler) RenewRemoteInstallation(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	server, nonce, ok := h.authenticatedRemoteInstallation(w, r)
+	if !ok {
+		return
+	}
+	if err := h.repo.RenewRemoteServerInstallation(r.Context(), server.ID, nonce, time.Now(), remoteInstallationTTL, remoteInstallationMaxLifetime); err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, storage.ErrRemoteInstallationInvalid) || errors.Is(err, storage.ErrRemoteInstallationAborted) ||
+			errors.Is(err, storage.ErrRemoteInstallationRollingBack) {
+			status = http.StatusConflict
+		}
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "installation transaction cannot be renewed"})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+}
+
+// QuiesceRemoteInstallation waits for any in-flight Prepare to finish and then
+// durably blocks later Prepare calls before the installer restores local state.
+func (h *XrayServerHandler) QuiesceRemoteInstallation(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	server, nonce, ok := h.authenticatedRemoteInstallation(w, r)
+	if !ok {
+		return
+	}
+	if err := h.repo.MarkRemoteServerInstallationRollingBack(r.Context(), server.ID, nonce); err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, storage.ErrRemoteInstallationInvalid) || errors.Is(err, storage.ErrRemoteInstallationAborted) {
+			status = http.StatusConflict
+		}
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "installation transaction cannot enter rollback"})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+}
+
+func (h *XrayServerHandler) AbortRemoteInstallation(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	server, nonce, ok := h.authenticatedRemoteInstallation(w, r)
+	if !ok {
+		return
+	}
+	if err := h.repo.AbortRemoteServerInstallation(r.Context(), server.ID, nonce); err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, storage.ErrRemoteInstallationInvalid) {
+			status = http.StatusConflict
+		}
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "installation transaction cannot be aborted"})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+}
+
+func (h *XrayServerHandler) PrepareRemoteInstallation(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	server, nonce, ok := h.authenticatedRemoteInstallation(w, r)
+	if !ok {
+		return
+	}
+	ready, err := h.repo.ValidateRemoteServerInstallationReady(r.Context(), server.ID, nonce)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "installation transaction is unavailable"})
+		return
+	}
+	if !ready {
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "installation transaction is not ready"})
+		return
+	}
+	if server.StealSelf && h.remoteManager == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "remote deployment manager is unavailable"})
+		return
+	}
+	bypassCtx := h.repo.RemoteServerMutationLeaseBypassContext(r.Context(), server.ID)
+	err = h.repo.WithRemoteServerMutationLease(bypassCtx, server.ID, func(exclusiveCtx context.Context) error {
+		ready, validateErr := h.repo.ValidateRemoteServerInstallationReady(exclusiveCtx, server.ID, nonce)
+		if validateErr != nil {
+			return validateErr
+		}
+		if !ready {
+			return storage.ErrRemoteInstallationNotReady
+		}
+		if server.StealSelf {
+			deployer := h.remoteManager.DeployStealSelfConfig
+			if h.remoteManager.stealSelfDeployer != nil {
+				deployer = h.remoteManager.stealSelfDeployer
+			}
+			if err := deployer(exclusiveCtx, server.ID); err != nil {
+				return fmt.Errorf("deploy desired state: %w", err)
+			}
+		}
+		return h.repo.MarkRemoteServerInstallationPrepared(exclusiveCtx, server.ID, nonce)
+	})
+	if err != nil {
+		status := http.StatusBadGateway
+		message := "final desired-state deployment failed"
+		if errors.Is(err, storage.ErrRemoteInstallationInvalid) || errors.Is(err, storage.ErrRemoteInstallationNotReady) || errors.Is(err, storage.ErrRemoteInstallationRollingBack) {
+			status = http.StatusConflict
+			message = "installation transaction is no longer ready"
+		}
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": message})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+}
+
+func (h *XrayServerHandler) FinalizeRemoteInstallation(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	server, nonce, ok := h.authenticatedRemoteInstallation(w, r)
+	if !ok {
+		return
+	}
+	if err := h.repo.FinalizeRemoteServerInstallation(r.Context(), server.ID, nonce); err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, storage.ErrRemoteInstallationInvalid) || errors.Is(err, storage.ErrRemoteInstallationNotReady) ||
+			errors.Is(err, storage.ErrRemoteInstallationNotPrepared) || errors.Is(err, storage.ErrRemoteInstallationAborted) ||
+			errors.Is(err, storage.ErrRemoteInstallationRollingBack) {
+			status = http.StatusConflict
+		}
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "installation transaction is not ready"})
+		return
+	}
+	// The installer ACK depends only on the durable tombstone. Agent scan events
+	// and the regular reconciler converge nodes afterward; doing that work here
+	// would make response-loss retries launch duplicate mutating jobs.
+	_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+}
+
+// VerifyRemoteManagementPorts is called by a node after installation. The
+// callback makes the panel prove that authenticated HTTP fallback and expiry
+// enforcement are reachable through the effective host/cloud firewall.
+func (h *XrayServerHandler) VerifyRemoteManagementPorts(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	server, nonce, ok := h.authenticatedRemoteInstallation(w, r)
+	if !ok {
+		return
+	}
+	valid, err := h.repo.ValidateRemoteServerInstallation(r.Context(), server.ID, nonce)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "installation transaction is unavailable"})
+		return
+	}
+	if !valid {
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "installation transaction is invalid or expired"})
+		return
+	}
+	if !h.allowRemoteManagementProbe(server.ID, time.Now()) {
+		w.Header().Set("Retry-After", "2")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "management readiness probe rate limited"})
+		return
+	}
+	address := observedRemoteAddress(r)
+	if address == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "unable to determine node address"})
+		return
+	}
+	agentPort := server.ListenPort
+	if agentPort <= 0 {
+		agentPort = 23889
+	}
+	if !storage.IsValidRemoteManagementListenPort(agentPort) || agentPort == 0 {
+		w.WriteHeader(http.StatusBadGateway)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "invalid management ports"})
+		return
+	}
+	guardSecret, err := h.repo.GetOrCreateRemoteServerGuardSecret(r.Context(), server.ID)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "expiry guard is unavailable"})
+		return
+	}
+
+	client, transport := newRemoteManagementProbeClient()
+	defer transport.CloseIdleConnections()
+	if err := probeRemoteAgent(r.Context(), client, address, agentPort); err == nil {
+		if err := probeRemoteExpiryGuard(r.Context(), client, address, agentPort+managedExpiryGuardPortOffset, guardSecret); err == nil {
+			if err := h.repo.MarkRemoteServerInstallationReady(r.Context(), server.ID, nonce); err != nil {
+				w.WriteHeader(http.StatusConflict)
+				_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "installation transaction is no longer valid"})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "address": address, "agent_port": agentPort, "guard_port": agentPort + managedExpiryGuardPortOffset})
+			return
+		}
+	}
+
+	w.WriteHeader(http.StatusBadGateway)
+	_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "panel cannot reach the node management ports"})
+}
+
 func expiryGuardAssetDirectories() []string {
 	directories := make([]string, 0, 4)
 	if configured := strings.TrimSpace(os.Getenv(expiryGuardAssetDirEnv)); configured != "" {
@@ -134,4 +567,17 @@ func openExpiryGuardAsset(name string) (*os.File, error) {
 		return asset, nil
 	}
 	return nil, errExpiryGuardAssetNotFound
+}
+
+func expiryGuardAssetSHA256(name string) (string, error) {
+	asset, err := openExpiryGuardAsset(name)
+	if err != nil {
+		return "", err
+	}
+	defer asset.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, asset); err != nil {
+		return "", fmt.Errorf("hash expiry guard asset: %w", err)
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil)), nil
 }

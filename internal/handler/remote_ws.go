@@ -833,6 +833,50 @@ func (h *RemoteWSHandler) sendEncryptedMessage(wsConn *RemoteWSConnection, msg W
 	return h.sendMessage(wsConn.Conn, msg)
 }
 
+func (h *RemoteWSHandler) scheduleFirstConnectAutoDeploy(server *storage.RemoteServer, delay time.Duration) {
+	lockCtx, lockCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	mayDeploy := remoteInstallationAllowsAutoDeploy(lockCtx, h.repo, server.ID, "Remote WS")
+	lockCancel()
+	if !mayDeploy {
+		return
+	}
+
+	go func() {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		<-timer.C
+		deployCtx, deployCancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer deployCancel()
+		// Hold the shared lease across the entire deployer call. Begin must wait
+		// for this mutation to finish before it can establish the durable lock.
+		if err := withRemoteInstallationSafeMutation(deployCtx, h.repo, server.ID, "Remote WS", func(actionCtx context.Context) error {
+			return h.stealSelfDeployer(actionCtx, server.ID)
+		}); err != nil {
+			log.Printf("[Remote WS] Failed to auto-deploy steal-self config for server %s (%d): %v", server.Name, server.ID, err)
+		} else {
+			log.Printf("[Remote WS] Auto-deployed steal-self config for server %s (%d)", server.Name, server.ID)
+		}
+	}()
+}
+
+func (h *RemoteWSHandler) scheduleInstallationSafeAutoAction(serverID int64, source string, action func(context.Context)) {
+	lockCtx, lockCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	mayRun := remoteInstallationAllowsAutoDeploy(lockCtx, h.repo, serverID, source)
+	lockCancel()
+	if !mayRun {
+		return
+	}
+
+	go func() {
+		lockCtx, lockCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer lockCancel()
+		if !remoteInstallationAllowsAutoDeploy(lockCtx, h.repo, serverID, source) {
+			return
+		}
+		action(context.Background())
+	}()
+}
+
 // 处理认证消息
 func (h *RemoteWSHandler) handleAuth(conn *websocket.Conn, preAuthConn *RemoteWSConnection, remoteAddr string, payload json.RawMessage) (*RemoteWSConnection, bool) {
 	var authPayload WSAuthPayload
@@ -1061,27 +1105,21 @@ func (h *RemoteWSHandler) handleAuth(conn *websocket.Conn, preAuthConn *RemoteWS
 	// (上面 644 行 update 实际是异步,但 server 这个对象是 GetRemoteServerByToken 拿到的快照,字段不会被改写)。
 	// prevStatus == "offline" → 写 pending_recovery(VPS 跑路换机场景);其它 → upsert current(SSH 修复 / 首连)
 	if h.xrayConfigSyncCallback != nil {
-		go h.xrayConfigSyncCallback(context.Background(), server.ID, server.Status)
+		h.scheduleInstallationSafeAutoAction(server.ID, "Xray snapshot sync", func(ctx context.Context) {
+			h.xrayConfigSyncCallback(ctx, server.ID, server.Status)
+		})
 	}
 
 	// embedded 漂移校正:agent 随 auth 上报当前实际 xray_mode,与 DB 不一致时自动下发切回 embedded。
 	if h.xrayModeCorrectCallback != nil && authPayload.XrayMode != "" {
-		go h.xrayModeCorrectCallback(context.Background(), server.ID, authPayload.XrayMode)
+		h.scheduleInstallationSafeAutoAction(server.ID, "Xray mode drift", func(ctx context.Context) {
+			h.xrayModeCorrectCallback(ctx, server.ID, authPayload.XrayMode)
+		})
 	}
 
 	// 在第一次连接时自动部署窃取配置（服务器处于挂起状态）
 	if server.Use443 && server.Domain != "" && server.Status == "pending" && h.stealSelfDeployer != nil {
-		go func() {
-			// 等待代理完全初始化
-			time.Sleep(5 * time.Second)
-			deployCtx, deployCancel := context.WithTimeout(context.Background(), 60*time.Second)
-			defer deployCancel()
-			if err := h.stealSelfDeployer(deployCtx, server.ID); err != nil {
-				log.Printf("[Remote WS] Failed to auto-deploy steal-self config for server %s (%d): %v", server.Name, server.ID, err)
-			} else {
-				log.Printf("[Remote WS] Auto-deployed steal-self config for server %s (%d)", server.Name, server.ID)
-			}
-		}()
+		h.scheduleFirstConnectAutoDeploy(server, 5*time.Second)
 	}
 
 	return wsConn, true
@@ -1199,6 +1237,21 @@ func (h *RemoteWSHandler) handleHeartbeat(wsConn *RemoteWSConnection, payload js
 
 	if hbResult, err := h.repo.UpdateRemoteServerHeartbeatWithRestart(ctx, update); err != nil {
 		log.Printf("[Remote WS] Failed to update heartbeat for server %s: %v", wsConn.ServerName, err)
+		ackPayload, _ := json.Marshal(map[string]any{
+			"server_time": time.Now().Unix(),
+			"success":     false,
+			"error":       "heartbeat_rejected",
+		})
+		_ = h.sendEncryptedMessage(wsConn, WSMessage{Type: WSMsgTypeHeartbeatAck, Payload: json.RawMessage(ackPayload)})
+		if errors.Is(err, storage.ErrRemoteListenPortMismatch) {
+			_ = wsConn.Conn.WriteControl(
+				websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "Agent listen port does not match the provisioned port"),
+				time.Now().Add(time.Second),
+			)
+			_ = wsConn.Conn.Close()
+		}
+		return
 	} else if hbResult != nil && hbResult.IPChanged && hbResult.Server != nil {
 		// agent 换 IP 后,把已存在节点的 clash_config.server 跟着刷成新的 effective host
 		if newHost := chooseClashServerHost(hbResult.Server); newHost != "" {
@@ -1226,7 +1279,7 @@ func (h *RemoteWSHandler) handleHeartbeat(wsConn *RemoteWSConnection, payload js
 		log.Printf("[Remote WS] Failed to update warp_installed for server %s: %v", wsConn.ServerName, err)
 	}
 
-	ackPayload, _ := json.Marshal(map[string]int64{"server_time": time.Now().Unix()})
+	ackPayload, _ := json.Marshal(map[string]any{"server_time": time.Now().Unix(), "success": true})
 	h.sendEncryptedMessage(wsConn, WSMessage{Type: WSMsgTypeHeartbeatAck, Payload: json.RawMessage(ackPayload)})
 }
 

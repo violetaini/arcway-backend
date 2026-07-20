@@ -3,6 +3,8 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -190,6 +192,19 @@ func TestManagedReconcileProvisionsLimiterBeforeExpiringClient(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("limiter request did not reach Agent")
 	}
+	beginAttempted := make(chan struct{})
+	beginDone := make(chan error, 1)
+	go func() {
+		close(beginAttempted)
+		beginDone <- repo.BeginRemoteServerInstallation(context.Background(), server.ID,
+			"managed-reconcile-drain", time.Now().Add(time.Minute))
+	}()
+	<-beginAttempted
+	select {
+	case err := <-beginDone:
+		t.Fatalf("installation Begin split an in-flight managed reconcile: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
 	fakeAgent.mu.Lock()
 	callsBeforeACK := append([]string(nil), fakeAgent.calls...)
 	fakeAgent.mu.Unlock()
@@ -199,6 +214,17 @@ func TestManagedReconcileProvisionsLimiterBeforeExpiringClient(t *testing.T) {
 	close(fakeAgent.limiterACK)
 	if err := <-reconcileResult; err != nil {
 		t.Fatalf("reconcile managed source: %v", err)
+	}
+	select {
+	case err := <-beginDone:
+		if err != nil {
+			t.Fatalf("installation Begin after managed reconcile: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("installation Begin remained blocked after managed reconcile")
+	}
+	if err := repo.AbortRemoteServerInstallation(context.Background(), server.ID, "managed-reconcile-drain"); err != nil {
+		t.Fatalf("abort test installation: %v", err)
 	}
 
 	fakeAgent.mu.Lock()
@@ -243,6 +269,64 @@ func TestManagedReconcileProvisionsLimiterBeforeExpiringClient(t *testing.T) {
 	case <-fakeAgent.snapshotHit:
 	case <-time.After(time.Second):
 		t.Fatal("background xray snapshot refresh did not finish")
+	}
+}
+
+func TestLimiterAndManagedReconcileRejectActiveRemoteInstallationBeforeNetwork(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	fixture := newManagedUserHTTPFixture(t, "alice")
+	servers, err := fixture.repo.ListRemoteServers(ctx)
+	if err != nil || len(servers) != 1 {
+		t.Fatalf("resolve fixture server: servers=%v err=%v", servers, err)
+	}
+	server := servers[0]
+
+	requested := make(chan struct{}, 1)
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case requested <- struct{}{}:
+		default:
+		}
+		http.Error(w, "unexpected request", http.StatusInternalServerError)
+	}))
+	t.Cleanup(agent.Close)
+	agentURL, err := url.Parse(agent.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, portText, err := net.SplitHostPort(agentURL.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := net.LookupPort("tcp", portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := fixture.repo.UpdateRemoteServerHeartbeat(ctx, server.Token, host, ""); err != nil {
+		t.Fatalf("point fixture server at fake Agent: %v", err)
+	}
+	if err := fixture.repo.UpdateRemoteServerListenPort(ctx, server.ID, port); err != nil {
+		t.Fatalf("update fake Agent port: %v", err)
+	}
+	if err := fixture.repo.BeginRemoteServerInstallation(ctx, server.ID, "active-managed-install", time.Now().Add(time.Minute)); err != nil {
+		t.Fatalf("begin installation: %v", err)
+	}
+
+	pusher := NewLimiterConfigPusher(fixture.repo, nil)
+	pusher.PushToServer(ctx, server.ID)
+	if err := pusher.PushToServerChecked(ctx, server.ID); !errors.Is(err, storage.ErrRemoteInstallationActive) {
+		t.Fatalf("checked limiter error=%v, want active installation", err)
+	}
+	remote := managedRemoteWithCapabilities(fixture.repo, server.ID, managedReadyAgentCapabilities())
+	handler := NewManagedNodesHandler(fixture.repo, remote, pusher)
+	if err := handler.reconcileSource(ctx, fixture.activation.Source); !errors.Is(err, storage.ErrRemoteInstallationActive) {
+		t.Fatalf("managed reconcile error=%v, want active installation", err)
+	}
+	select {
+	case <-requested:
+		t.Fatal("active installation allowed limiter or managed reconcile network mutation")
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 
@@ -385,5 +469,108 @@ func TestManagedReconcileDoesNotAddClientWithoutLimiterACK(t *testing.T) {
 	}
 	if source.ObservedState == storage.ManagedObservedActive || source.LastError == "" {
 		t.Fatalf("source did not remain pending after missing ACK: %#v", source)
+	}
+}
+
+func TestAdminManagedNodeLimitsQueuesRetryWithoutLimiterACK(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	fixture := newManagedUserHTTPFixture(t, "alice")
+	servers, err := fixture.repo.ListRemoteServers(ctx)
+	if err != nil || len(servers) != 1 {
+		t.Fatalf("resolve fixture server: servers=%v err=%v", servers, err)
+	}
+	server := servers[0]
+
+	ack := false
+	fakeAgent := &managedFakeAgent{
+		limiterOK:  &ack,
+		inboundTag: fixture.offer.InboundTag,
+		token:      server.Token,
+	}
+	agentServer := httptest.NewServer(fakeAgent)
+	t.Cleanup(agentServer.Close)
+	agentURL, err := url.Parse(agentServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, portText, err := net.SplitHostPort(agentURL.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := net.LookupPort("tcp", portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := fixture.repo.UpdateRemoteServerHeartbeat(ctx, server.Token, host, ""); err != nil {
+		t.Fatalf("point fixture server at fake Agent: %v", err)
+	}
+	if err := fixture.repo.UpdateRemoteServerListenPort(ctx, server.ID, port); err != nil {
+		t.Fatalf("update fake Agent port: %v", err)
+	}
+
+	baseline, err := fixture.repo.MarkUserInboundAccessSourceApplied(ctx, fixture.activation.Source.ID,
+		fixture.activation.Source.Generation, storage.ManagedObservedActive, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("mark baseline source applied: %v", err)
+	}
+	remote := managedRemoteWithCapabilities(fixture.repo, server.ID, managedReadyAgentCapabilities())
+	handler := NewManagedNodesHandler(fixture.repo, remote, NewLimiterConfigPusher(fixture.repo, nil))
+	response := httptest.NewRecorder()
+	request := managedUserHTTPRequest(http.MethodPut, "/api/admin/users/alice/managed-nodes/1/limits", "owner",
+		`{"speed_limit_override_mbps":12}`)
+	request.SetPathValue("username", "alice")
+	request.SetPathValue("id", fmt.Sprintf("%d", fixture.activation.Selection.ID))
+
+	handler.HandleAdminManagedNodeLimits(response, request)
+
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status=%d want=%d body=%s", response.Code, http.StatusAccepted, response.Body.String())
+	}
+	var payload struct {
+		Success      bool   `json:"success"`
+		Pending      bool   `json:"pending"`
+		PendingError string `json:"pending_error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, response.Body.String())
+	}
+	if !payload.Success || !payload.Pending || !strings.Contains(payload.PendingError, "not acknowledged") {
+		t.Fatalf("response did not report pending limiter ACK: %#v", payload)
+	}
+
+	selection, err := fixture.repo.GetUserNodeSelection(ctx, fixture.activation.Selection.ID)
+	if err != nil {
+		t.Fatalf("reload selection: %v", err)
+	}
+	if selection.SpeedLimitOverrideMbps == nil || *selection.SpeedLimitOverrideMbps != 12 {
+		t.Fatalf("persisted limit override=%v, want 12", selection.SpeedLimitOverrideMbps)
+	}
+	source, err := fixture.repo.GetUserInboundAccessSource(ctx, fixture.activation.Source.ID)
+	if err != nil {
+		t.Fatalf("reload source: %v", err)
+	}
+	if source.Generation != baseline.Generation+1 || source.AppliedGeneration != baseline.AppliedGeneration ||
+		source.LastError == "" || source.NextRetryAt == nil {
+		t.Fatalf("failed ACK did not retain a retryable generation: %#v", source)
+	}
+	pending, err := fixture.repo.ListPendingUserInboundAccessSources(ctx, source.NextRetryAt.Add(time.Millisecond), 10, server.ID)
+	if err != nil {
+		t.Fatalf("list retryable sources: %v", err)
+	}
+	if len(pending) != 1 || pending[0].ID != source.ID {
+		t.Fatalf("source is not eligible for reconciler retry: %#v", pending)
+	}
+
+	fakeAgent.mu.Lock()
+	calls := append([]string(nil), fakeAgent.calls...)
+	limiter := fakeAgent.limiter
+	fakeAgent.mu.Unlock()
+	if len(calls) != 1 || calls[0] != "limiter" {
+		t.Fatalf("Agent mutations without limiter ACK=%v, want limiter only", calls)
+	}
+	userLimit := findLimiterUser(t, []WSLimiterConfigPayload{limiter}, fixture.offer.InboundTag, "alice__"+fixture.offer.InboundTag)
+	if userLimit.SpeedLimit != 1_500_000 {
+		t.Fatalf("pushed speed limit=%d want=1500000", userLimit.SpeedLimit)
 	}
 }

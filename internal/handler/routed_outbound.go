@@ -123,6 +123,31 @@ func (h *RoutedOutboundHandler) create(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("无法定位父节点所属 agent server: %v", err))
 		return
 	}
+	leasedCtx, release, ok := acquireRemoteServerMutationLeaseHTTP(w, h.repo, ctx, serverID)
+	if !ok {
+		return
+	}
+	defer release()
+	ctx = leasedCtx
+
+	// The lookup above is only used to discover serverID. Re-read the parent
+	// under the lease so every decision that feeds the remote transaction is
+	// stable until the final DB commit (or rollback) completes.
+	parent, err = h.repo.GetNodeByID(ctx, req.ParentNodeID)
+	if err != nil {
+		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("父节点不存在: %v", err))
+		return
+	}
+	if parent.OriginalServer == "" || parent.InboundTag == "" ||
+		(parent.NodeType != "" && parent.NodeType != "physical") {
+		writeJSONError(w, http.StatusConflict, "父节点在创建期间发生变化,请重试")
+		return
+	}
+	lockedServerID, err := h.resolveServerIDByName(ctx, parent.OriginalServer)
+	if err != nil || lockedServerID != serverID {
+		writeJSONError(w, http.StatusConflict, "父节点所属服务器在创建期间发生变化,请重试")
+		return
+	}
 
 	// 命名空间生成:用父节点 ID + label 保唯一,前缀清晰
 	shortID := fmt.Sprintf("p%d", parent.ID)
@@ -272,8 +297,8 @@ func (h *RoutedOutboundHandler) create(w http.ResponseWriter, r *http.Request) {
 	}
 	created, err := h.repo.CreateRoutedNode(ctx, detail)
 	if err != nil {
-		log.Printf("[RoutedOutbound] DB insert failed after agent ops succeeded: %v - agent 已变更但 DB 未记录,需人工清理", err)
-		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("DB 写入失败,agent 已修改,需人工修复: %v", err))
+		rollbackRoutedOutboundCreate(ctx, h.remoteManage, serverID, parent.InboundTag, marktag, outboundTag, adminEmail)
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("DB 写入失败,远端变更已回滚: %v", err))
 		return
 	}
 
@@ -287,7 +312,12 @@ func (h *RoutedOutboundHandler) create(w http.ResponseWriter, r *http.Request) {
 		CredentialJSON: string(credBytes),
 		IsActive:       true,
 	}); suErr != nil {
-		log.Printf("[RoutedOutbound] creator subaccount upsert failed (node %d, creator %s): %v — 节点已创建,流量归属需手动修复", created.ID, creatorUsername, suErr)
+		rollbackRoutedOutboundCreate(ctx, h.remoteManage, serverID, parent.InboundTag, marktag, outboundTag, adminEmail)
+		if deleteErr := h.repo.DeleteRoutedNode(ctx, created.ID); deleteErr != nil {
+			log.Printf("[RoutedOutbound] rollback DB node %d failed: %v", created.ID, deleteErr)
+		}
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("保存创建者凭据失败,远端变更已回滚: %v", suErr))
+		return
 	}
 
 	log.Printf("[RoutedOutbound] created routed node id=%d tag=%s parent=%d creator=%s", created.ID, outboundTag, parent.ID, creatorUsername)
@@ -314,6 +344,22 @@ func (h *RoutedOutboundHandler) delete(w http.ResponseWriter, r *http.Request) {
 	serverID, err := h.resolveServerIDByName(ctx, detail.OriginalServer)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("无法定位 agent server: %v", err))
+		return
+	}
+	leasedCtx, release, ok := acquireRemoteServerMutationLeaseHTTP(w, h.repo, ctx, serverID)
+	if !ok {
+		return
+	}
+	defer release()
+	ctx = leasedCtx
+	detail, err = h.repo.GetRoutedNodeDetail(ctx, id)
+	if err != nil {
+		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("routed 节点不存在: %v", err))
+		return
+	}
+	lockedServerID, err := h.resolveServerIDByName(ctx, detail.OriginalServer)
+	if err != nil || lockedServerID != serverID {
+		writeJSONError(w, http.StatusConflict, "节点所属服务器在删除期间发生变化,请重试")
 		return
 	}
 
@@ -370,6 +416,45 @@ func (h *RoutedOutboundHandler) resolveServerIDByName(ctx context.Context, serve
 	return 0, errors.New("server not found in remote_servers by name " + serverName)
 }
 
+func acquireRemoteServerMutationLeaseHTTP(w http.ResponseWriter, repo *storage.TrafficRepository, ctx context.Context, serverID int64) (context.Context, func(), bool) {
+	if repo == nil {
+		writeJSONError(w, http.StatusInternalServerError, "服务器安装锁不可用")
+		return nil, nil, false
+	}
+	leasedCtx, release, err := repo.AcquireRemoteServerMutationLease(ctx, serverID)
+	if err == nil {
+		return leasedCtx, release, true
+	}
+	if errors.Is(err, storage.ErrRemoteInstallationActive) {
+		writeJSONError(w, http.StatusConflict, "服务器正在安装或接管,请完成后重试")
+	} else {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("获取服务器变更锁失败: %v", err))
+	}
+	return nil, nil, false
+}
+
+func acquireRemoteMutationLease(ctx context.Context, rm *RemoteManageHandler, serverID int64) (context.Context, func(), error) {
+	if rm == nil || rm.repo == nil {
+		return nil, nil, errors.New("remote server mutation lease repository is unavailable")
+	}
+	return rm.repo.AcquireRemoteServerMutationLease(ctx, serverID)
+}
+
+func rollbackRoutedOutboundCreate(ctx context.Context, rm *RemoteManageHandler, serverID int64, inboundTag, marktag, outboundTag, email string) {
+	if err := removeRuleByMarktag(ctx, rm, serverID, marktag); err != nil {
+		log.Printf("[RoutedCreateRollback] remove rule %s failed: %v", marktag, err)
+	}
+	removeOutBody, _ := json.Marshal(map[string]string{"action": "remove", "tag": outboundTag})
+	if response, err := rm.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/outbounds", removeOutBody); err != nil {
+		log.Printf("[RoutedCreateRollback] remove outbound %s failed: %v", outboundTag, err)
+	} else if err := applyAgentConfigMutationACK(ctx, rm, serverID, "RoutedOutboundCreateRollback", response); err != nil {
+		log.Printf("[RoutedCreateRollback] remove outbound %s was not acknowledged: %v", outboundTag, err)
+	}
+	if err := removeClientFromInbound(ctx, rm, serverID, inboundTag, email); err != nil {
+		log.Printf("[RoutedCreateRollback] remove client %s failed: %v", email, err)
+	}
+}
+
 // 读父 inbound,返回第一个 client 的 flow 字段(VLESS Reality 子 client 必须继承)。
 func (h *RoutedOutboundHandler) peekInboundFirstClientFlow(ctx context.Context, serverID int64, inboundTag string) (string, error) {
 	return peekInboundFirstClientFlow(ctx, h.remoteManage, serverID, inboundTag)
@@ -380,6 +465,13 @@ func (h *RoutedOutboundHandler) peekInboundFirstClientFlow(ctx context.Context, 
 // 用途:auto-detected routed 节点没有 marktag,agent 的 add_user_to_rule 需要 marktag,绕开它。
 // add=true 表示新增 email(去重 append);add=false 表示移除。
 func mutateRoutingRuleUserByOutboundTag(ctx context.Context, rm *RemoteManageHandler, serverID int64, outboundTag, userEmail string, add bool) error {
+	leasedCtx, release, err := acquireRemoteMutationLease(ctx, rm, serverID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	ctx = leasedCtx
+
 	// 串行化同服务器的 GET-modify-SET,防止并发覆盖。
 	mu := acquireRoutingMutateLock(serverID)
 	defer mu.Unlock()
@@ -728,6 +820,13 @@ func removeClientFromInbound(ctx context.Context, rm *RemoteManageHandler, serve
 
 // 按 marktag 找到 rule 并删除。GET routing → 找 index → POST remove_rule {index}。
 func removeRuleByMarktag(ctx context.Context, rm *RemoteManageHandler, serverID int64, marktag string) error {
+	leasedCtx, release, err := acquireRemoteMutationLease(ctx, rm, serverID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	ctx = leasedCtx
+
 	result, err := rm.forwardToRemoteServer(ctx, serverID, "GET", "/api/child/routing", nil)
 	if err != nil {
 		return err
@@ -883,34 +982,64 @@ func computeRoutedNodeUserCred(ctx context.Context, rm *RemoteManageHandler, rep
 	}, nil
 }
 
+func resolveRoutedNodeServerID(ctx context.Context, repo *storage.TrafficRepository, routedNodeID int64) (int64, error) {
+	routed, err := repo.GetRoutedNodeDetail(ctx, routedNodeID)
+	if err != nil {
+		return 0, fmt.Errorf("get routed node %d: %w", routedNodeID, err)
+	}
+	server, err := repo.GetRemoteServerByName(ctx, routed.OriginalServer)
+	if err != nil {
+		return 0, fmt.Errorf("server %s not found: %w", routed.OriginalServer, err)
+	}
+	return server.ID, nil
+}
+
 // prepareRoutedNodeForUser 做 addUserToRoutedNode 的前置工作:算 email/cred、加 client 到 inbound、
 // UPSERT user_subaccounts。返回 routing rule 改动描述,**不动 routing**。
 // 调用方负责把所有 addition 聚合后调 applyRoutingAdditionsBatch(per-server 锁内一次 GET+SET)。
 func prepareRoutedNodeForUser(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, user storage.User, routedNodeID int64) (*routingRuleAddition, error) {
+	var addition *routingRuleAddition
+	err := repo.WithUserProvisioningLease(ctx, user.Username, func() error {
+		serverID, err := resolveRoutedNodeServerID(ctx, repo, routedNodeID)
+		if err != nil {
+			return err
+		}
+		leasedCtx, release, err := repo.AcquireRemoteServerMutationLease(ctx, serverID)
+		if err != nil {
+			return err
+		}
+		defer release()
+		addition, err = prepareRoutedNodeForUserLocked(leasedCtx, rm, repo, user, routedNodeID, serverID)
+		return err
+	})
+	return addition, err
+}
+
+// prepareRoutedNodeForUserLocked requires the caller to hold both the user
+// provisioning lease and server mutation lease, in that order.
+func prepareRoutedNodeForUserLocked(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, user storage.User, routedNodeID, serverID int64) (*routingRuleAddition, error) {
 	info, err := computeRoutedNodeUserCred(ctx, rm, repo, user, routedNodeID)
 	if err != nil {
 		return nil, err
 	}
+	if info.ServerID != serverID {
+		return nil, errors.New("routed node server changed while provisioning; retry required")
+	}
 
-	if err := repo.WithUserProvisioningLease(ctx, info.Username, func() error {
-		if err := repo.ReserveUserSubaccount(ctx, storage.UserSubaccount{
-			Username: info.Username, RoutedNodeID: info.RoutedNodeID,
-			Email: info.UserEmail, CredentialJSON: info.CredentialJSON,
-		}); err != nil {
-			return fmt.Errorf("reserve subaccount: %w", err)
-		}
-		if err := addClientToInbound(ctx, rm, info.ServerID, info.InboundTag, info.Credential); err != nil {
-			return fmt.Errorf("add client to inbound: %w", err)
-		}
-		if _, err := repo.UpsertUserSubaccount(ctx, storage.UserSubaccount{
-			Username: info.Username, RoutedNodeID: info.RoutedNodeID,
-			Email: info.UserEmail, CredentialJSON: info.CredentialJSON, IsActive: true,
-		}); err != nil {
-			return fmt.Errorf("activate subaccount: %w", err)
-		}
-		return nil
+	if err := repo.ReserveUserSubaccount(ctx, storage.UserSubaccount{
+		Username: info.Username, RoutedNodeID: info.RoutedNodeID,
+		Email: info.UserEmail, CredentialJSON: info.CredentialJSON,
 	}); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("reserve subaccount: %w", err)
+	}
+	if err := addClientToInbound(ctx, rm, info.ServerID, info.InboundTag, info.Credential); err != nil {
+		return nil, fmt.Errorf("add client to inbound: %w", err)
+	}
+	if _, err := repo.UpsertUserSubaccount(ctx, storage.UserSubaccount{
+		Username: info.Username, RoutedNodeID: info.RoutedNodeID,
+		Email: info.UserEmail, CredentialJSON: info.CredentialJSON, IsActive: true,
+	}); err != nil {
+		return nil, fmt.Errorf("activate subaccount: %w", err)
 	}
 
 	return &routingRuleAddition{
@@ -937,9 +1066,21 @@ type routedBatchItem struct {
 
 // collectRoutedBatchItem 算 cred,**不调 agent、不写 DB**,返回 batch 描述。
 func collectRoutedBatchItem(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, user storage.User, routedNodeID int64) (*routedBatchItem, error) {
-	info, err := computeRoutedNodeUserCred(ctx, rm, repo, user, routedNodeID)
+	serverID, err := resolveRoutedNodeServerID(ctx, repo, routedNodeID)
 	if err != nil {
 		return nil, err
+	}
+	leasedCtx, release, err := repo.AcquireRemoteServerMutationLease(ctx, serverID)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	info, err := computeRoutedNodeUserCred(leasedCtx, rm, repo, user, routedNodeID)
+	if err != nil {
+		return nil, err
+	}
+	if info.ServerID != serverID {
+		return nil, errors.New("routed node server changed while collecting batch item; retry required")
 	}
 	return &routedBatchItem{
 		ServerID:       info.ServerID,
@@ -965,39 +1106,55 @@ func applyRoutedBatchOrFallback(ctx context.Context, rm *RemoteManageHandler, re
 	if len(items) == 0 {
 		return nil
 	}
-	// 把 batchItem → user(主要拿 Username,fallback 时 prepareRoutedNodeForUser 需要 User 对象)。
-	// 简单起见这里只用 Username 字段,prepareRoutedNodeForUser 内部不依赖 user 的其它字段。
-	err := applyRoutedBatchToAgent(ctx, rm, repo, serverID, items)
-	if err == nil {
-		return nil
+	usernames := make([]string, 0, len(items))
+	for _, item := range items {
+		usernames = append(usernames, item.Username)
 	}
-	if !errors.Is(err, ErrAgentBatchNotSupported) {
-		log.Printf("[%s] batch-apply server=%d failed: %v", label, serverID, err)
-		return []string{fmt.Sprintf("服务器 %d 批量绑定失败", serverID)}
-	}
-
-	// 老 agent fallback:逐项 prepareRoutedNodeForUser(每项各发 1 次 add-client + 写 DB),
-	// 然后一次 applyRoutingAdditionsBatch 把所有 routing 改动 GET+SET 推回。
-	log.Printf("[%s] agent server=%d 不支持 batch-apply,fallback per-item", label, serverID)
 	var warnings []string
-	var routingAdds []routingRuleAddition
-	for _, it := range items {
-		user := storage.User{Username: it.Username}
-		add, perr := prepareRoutedNodeForUser(ctx, rm, repo, user, it.RoutedNodeID)
-		if perr != nil {
-			log.Printf("[%s] fallback prepare failed user=%s node=%d: %v", label, it.Username, it.RoutedNodeID, perr)
-			warnings = append(warnings, fmt.Sprintf("用户 %s 路由出站绑定失败", it.Username))
-			continue
+	leaseErr := repo.WithUsersProvisioningLease(ctx, usernames, func() error {
+		leasedCtx, release, err := repo.AcquireRemoteServerMutationLease(ctx, serverID)
+		if err != nil {
+			return err
 		}
-		if add != nil {
-			routingAdds = append(routingAdds, *add)
+		defer release()
+
+		err = applyRoutedBatchToAgentLocked(leasedCtx, rm, repo, serverID, items)
+		if err == nil {
+			return nil
 		}
-	}
-	if len(routingAdds) > 0 {
-		if rerr := applyRoutingAdditionsBatch(ctx, rm, serverID, routingAdds); rerr != nil {
-			log.Printf("[%s] fallback routing batch server=%d failed: %v", label, serverID, rerr)
-			warnings = append(warnings, fmt.Sprintf("服务器 %d 路由规则批量更新失败", serverID))
+		if !errors.Is(err, ErrAgentBatchNotSupported) {
+			log.Printf("[%s] batch-apply server=%d failed: %v", label, serverID, err)
+			warnings = append(warnings, fmt.Sprintf("服务器 %d 批量绑定失败", serverID))
+			return nil
 		}
+
+		// Old-agent fallback remains in the same server lease, including every
+		// per-item add, routing update, DB activation, and compensation.
+		log.Printf("[%s] agent server=%d 不支持 batch-apply,fallback per-item", label, serverID)
+		var routingAdds []routingRuleAddition
+		for _, it := range items {
+			user := storage.User{Username: it.Username}
+			add, perr := prepareRoutedNodeForUserLocked(leasedCtx, rm, repo, user, it.RoutedNodeID, serverID)
+			if perr != nil {
+				log.Printf("[%s] fallback prepare failed user=%s node=%d: %v", label, it.Username, it.RoutedNodeID, perr)
+				warnings = append(warnings, fmt.Sprintf("用户 %s 路由出站绑定失败", it.Username))
+				continue
+			}
+			if add != nil {
+				routingAdds = append(routingAdds, *add)
+			}
+		}
+		if len(routingAdds) > 0 {
+			if rerr := applyRoutingAdditionsBatch(leasedCtx, rm, serverID, routingAdds); rerr != nil {
+				log.Printf("[%s] fallback routing batch server=%d failed: %v", label, serverID, rerr)
+				warnings = append(warnings, fmt.Sprintf("服务器 %d 路由规则批量更新失败", serverID))
+			}
+		}
+		return nil
+	})
+	if leaseErr != nil {
+		log.Printf("[%s] server=%d mutation blocked: %v", label, serverID, leaseErr)
+		return []string{fmt.Sprintf("服务器 %d 正在安装或暂不可变更", serverID)}
 	}
 	return warnings
 }
@@ -1016,7 +1173,12 @@ func applyRoutedBatchToAgent(ctx context.Context, rm *RemoteManageHandler, repo 
 		usernames = append(usernames, item.Username)
 	}
 	return repo.WithUsersProvisioningLease(ctx, usernames, func() error {
-		return applyRoutedBatchToAgentLocked(ctx, rm, repo, serverID, items)
+		leasedCtx, release, err := repo.AcquireRemoteServerMutationLease(ctx, serverID)
+		if err != nil {
+			return err
+		}
+		defer release()
+		return applyRoutedBatchToAgentLocked(leasedCtx, rm, repo, serverID, items)
 	})
 }
 
@@ -1126,6 +1288,13 @@ func applyRoutingAdditionsBatch(ctx context.Context, rm *RemoteManageHandler, se
 	if len(additions) == 0 {
 		return nil
 	}
+	leasedCtx, release, err := acquireRemoteMutationLease(ctx, rm, serverID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	ctx = leasedCtx
+
 	mu := acquireRoutingMutateLock(serverID)
 	defer mu.Unlock()
 
@@ -1206,24 +1375,32 @@ func applyRoutingAdditionsBatch(ctx context.Context, rm *RemoteManageHandler, se
 // addUserToRoutedNode 是单节点版的包装,给非套餐路径(单用户加路由出站等)用,
 // 保留 prepare 失败时已加 client 不回滚的语义 — 调用方按需 removeClient + remove subaccount。
 func addUserToRoutedNode(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, user storage.User, routedNodeID int64) error {
-	add, err := prepareRoutedNodeForUser(ctx, rm, repo, user, routedNodeID)
-	if err != nil {
-		return err
-	}
-	if add == nil {
-		return nil
-	}
-	if err := applyRoutingAdditionsBatch(ctx, rm, add.ServerID, []routingRuleAddition{*add}); err != nil {
-		// routing 失败 → 回滚 client(保留旧语义,单节点路径用户期望"失败即清理")。
-		// DB 里 UpsertUserSubaccount 已写入 is_active=true,这里只 remove client;
-		// 下次手动重试 batch 可幂等补全 routing,DB 记录复用。
-		routed, gerr := repo.GetRoutedNodeDetail(ctx, routedNodeID)
-		if gerr == nil && routed.InboundTag != "" {
-			removeClientFromInbound(ctx, rm, add.ServerID, routed.InboundTag, add.UserEmail)
+	return repo.WithUserProvisioningLease(ctx, user.Username, func() error {
+		serverID, err := resolveRoutedNodeServerID(ctx, repo, routedNodeID)
+		if err != nil {
+			return err
 		}
-		return err
-	}
-	return nil
+		leasedCtx, release, err := repo.AcquireRemoteServerMutationLease(ctx, serverID)
+		if err != nil {
+			return err
+		}
+		defer release()
+
+		add, err := prepareRoutedNodeForUserLocked(leasedCtx, rm, repo, user, routedNodeID, serverID)
+		if err != nil || add == nil {
+			return err
+		}
+		if err := applyRoutingAdditionsBatch(leasedCtx, rm, add.ServerID, []routingRuleAddition{*add}); err != nil {
+			// Keep rollback inside the same lease so installation cannot snapshot
+			// the transient client/routing state.
+			routed, gerr := repo.GetRoutedNodeDetail(leasedCtx, routedNodeID)
+			if gerr == nil && routed.InboundTag != "" {
+				_ = removeClientFromInbound(leasedCtx, rm, add.ServerID, routed.InboundTag, add.UserEmail)
+			}
+			return err
+		}
+		return nil
+	})
 }
 
 // removeUserFromRoutedNode 把用户从 routing rule.user[] 移除 + 从 inbound 移除 client。
@@ -1233,11 +1410,6 @@ func removeUserFromRoutedNode(ctx context.Context, rm *RemoteManageHandler, repo
 	if err != nil {
 		return fmt.Errorf("get routed node %d: %w", routedNodeID, err)
 	}
-	sa, err := repo.GetUserSubaccount(ctx, routedNodeID, username)
-	if err != nil || sa == nil {
-		return nil // 没有子账号,无事可做
-	}
-
 	servers, err := repo.ListRemoteServers(ctx)
 	if err != nil {
 		return fmt.Errorf("list servers: %w", err)
@@ -1251,6 +1423,25 @@ func removeUserFromRoutedNode(ctx context.Context, rm *RemoteManageHandler, repo
 	}
 	if serverID == 0 {
 		return fmt.Errorf("server %s not found", routed.OriginalServer)
+	}
+	leasedCtx, release, err := repo.AcquireRemoteServerMutationLease(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	ctx = leasedCtx
+
+	routed, err = repo.GetRoutedNodeDetail(ctx, routedNodeID)
+	if err != nil {
+		return fmt.Errorf("get routed node %d: %w", routedNodeID, err)
+	}
+	lockedServer, err := repo.GetRemoteServerByName(ctx, routed.OriginalServer)
+	if err != nil || lockedServer.ID != serverID {
+		return errors.New("routed node server changed while removing user; retry required")
+	}
+	sa, err := repo.GetUserSubaccount(ctx, routedNodeID, username)
+	if err != nil || sa == nil {
+		return nil // 没有子账号,无事可做
 	}
 
 	// 1. 从 rule.user[] 移除。远端未确认时保留 active 本地记录供重试。

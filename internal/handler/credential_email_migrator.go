@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -22,8 +23,8 @@ import (
 // 不等于新格式 `<username>__<inbound_tag>` 即视为老格式,对该行:
 //  1. 解析旧 cred(保留 uuid/password)
 //  2. 构造新 cred:email 字段改成新格式,其他不动
-//  3. agent add-client(新) — 先加,避免空窗期连接掉线
-//  4. agent remove-client(老)
+//  3. agent remove-client(老)
+//  4. agent add-client(新),失败时立即恢复老 client
 //  5. UPDATE user_inbound_configs.credential_json
 //
 // 失败的行:记 log + 跳过(不阻断其他行)。不写 done 标记 — 下次启动重试。
@@ -166,6 +167,13 @@ func classifyCredentialEmail(c storage.UserInboundConfig, userEmailByName map[st
 
 // migrateOne 切换单条凭据的 email。失败原子:任一步失败就 abort,不更新 DB。
 func (m *CredentialEmailMigrator) migrateOne(ctx context.Context, c storage.UserInboundConfig) error {
+	leasedCtx, release, err := m.repo.AcquireRemoteServerMutationLease(ctx, c.ServerID)
+	if err != nil {
+		return fmt.Errorf("acquire server mutation lease: %w", err)
+	}
+	defer release()
+	ctx = leasedCtx
+
 	var oldCred map[string]interface{}
 	if err := json.Unmarshal([]byte(c.CredentialJSON), &oldCred); err != nil {
 		return fmt.Errorf("parse old cred: %w", err)
@@ -195,7 +203,11 @@ func (m *CredentialEmailMigrator) migrateOne(ctx context.Context, c storage.User
 		"tag":    c.InboundTag,
 		"client": oldCred,
 	})
-	if _, err := m.rm.forwardToRemoteServer(ctx, c.ServerID, "POST", "/api/child/inbounds", rmBody); err != nil {
+	rmResponse, err := m.rm.forwardToRemoteServer(ctx, c.ServerID, "POST", "/api/child/inbounds", rmBody)
+	if err == nil {
+		err = validateCredentialMigrationACK(rmResponse)
+	}
+	if err != nil {
 		// 孤儿数据:user_inbound_configs 里有记录但 agent xray 已经没这个 inbound 了
 		// (历史 inbound 删除时没级联清理 user_inbound_configs)。这条 client 在 agent 端不存在,
 		// add/remove 都没意义 — 直接 UPDATE DB 把 credential_json 的 email 改成新格式,
@@ -216,7 +228,11 @@ func (m *CredentialEmailMigrator) migrateOne(ctx context.Context, c storage.User
 		"tag":    c.InboundTag,
 		"client": newCred,
 	})
-	if _, err := m.rm.forwardToRemoteServer(ctx, c.ServerID, "POST", "/api/child/inbounds", addBody); err != nil {
+	addResponse, err := m.rm.forwardToRemoteServer(ctx, c.ServerID, "POST", "/api/child/inbounds", addBody)
+	if err == nil {
+		err = validateCredentialMigrationACK(addResponse)
+	}
+	if err != nil {
 		// add 失败:老 client 已 remove,新 client 没加 → 用户失联。
 		// agent /api/child/inbounds 实现是写文件 + runtime apply,失败前通常已经写盘,
 		// 但保险起见这里把老 cred 再 add 回去,恢复原状。
@@ -225,7 +241,11 @@ func (m *CredentialEmailMigrator) migrateOne(ctx context.Context, c storage.User
 			"tag":    c.InboundTag,
 			"client": oldCred,
 		})
-		if _, rbErr := m.rm.forwardToRemoteServer(ctx, c.ServerID, "POST", "/api/child/inbounds", rollback); rbErr != nil {
+		rollbackResponse, rbErr := m.rm.forwardToRemoteServer(ctx, c.ServerID, "POST", "/api/child/inbounds", rollback)
+		if rbErr == nil {
+			rbErr = validateCredentialMigrationACK(rollbackResponse)
+		}
+		if rbErr != nil {
 			log.Printf("[CredEmailMigrate] CRITICAL: rollback add-client failed user=%s server=%d tag=%s: %v (manual fix needed)",
 				c.Username, c.ServerID, c.InboundTag, rbErr)
 		}
@@ -233,9 +253,61 @@ func (m *CredentialEmailMigrator) migrateOne(ctx context.Context, c storage.User
 	}
 
 	if err := m.repo.UpdateUserInboundCredentialJSONByID(ctx, c.ID, string(newCredJSON)); err != nil {
+		// The Agent already has the new email. Restore the old client before
+		// releasing the server lease so an installation can never snapshot a
+		// remote/DB split-brain state.
+		removeNew, _ := json.Marshal(map[string]interface{}{
+			"action": "remove-client",
+			"tag":    c.InboundTag,
+			"client": newCred,
+		})
+		removeResponse, removeErr := m.rm.forwardToRemoteServer(ctx, c.ServerID, "POST", "/api/child/inbounds", removeNew)
+		if removeErr == nil {
+			removeErr = validateCredentialMigrationACK(removeResponse)
+		}
+		if removeErr != nil {
+			log.Printf("[CredEmailMigrate] CRITICAL: DB update and remove-new rollback failed user=%s server=%d tag=%s: %v",
+				c.Username, c.ServerID, c.InboundTag, removeErr)
+		} else {
+			restoreOld, _ := json.Marshal(map[string]interface{}{
+				"action": "add-client",
+				"tag":    c.InboundTag,
+				"client": oldCred,
+			})
+			restoreResponse, restoreErr := m.rm.forwardToRemoteServer(ctx, c.ServerID, "POST", "/api/child/inbounds", restoreOld)
+			if restoreErr == nil {
+				restoreErr = validateCredentialMigrationACK(restoreResponse)
+			}
+			if restoreErr != nil {
+				log.Printf("[CredEmailMigrate] CRITICAL: DB update and restore-old rollback failed user=%s server=%d tag=%s: %v",
+					c.Username, c.ServerID, c.InboundTag, restoreErr)
+			}
+		}
 		return fmt.Errorf("update db: %w", err)
 	}
 	return nil
+}
+
+func validateCredentialMigrationACK(body []byte) error {
+	var response struct {
+		Success bool   `json:"success"`
+		Message string `json:"message"`
+		Error   string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return fmt.Errorf("invalid Agent credential mutation ACK: %w", err)
+	}
+	if response.Success {
+		return nil
+	}
+	detail := strings.TrimSpace(response.Error)
+	if detail == "" {
+		detail = strings.TrimSpace(response.Message)
+	}
+	if detail == "" {
+		detail = "Agent did not acknowledge credential mutation"
+	}
+	return errors.New(detail)
 }
 
 // isInboundNotFoundErr 检测 forwardToRemoteServer 返回的"inbound 不存在"错误。

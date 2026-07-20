@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -11,8 +12,8 @@ import (
 	"miaomiaowux/internal/storage"
 )
 
-// collectInboundClientAddItem 从 master InboundCache 拿 protocol/settings,算好 cred,
-// 返回 batch item。**不调 agent / 不写 DB**。
+// collectInboundClientAddItem 从 master InboundCache 拿 protocol/settings，返回尚未
+// 预留凭据的 batch item。**不调 agent / 不写 DB**；预留必须在 server lease 内完成。
 //
 // 返回 (nil, false, err):缓存 miss、已有凭据需刷新 deadline、入站不存在等 → fallback
 // 返回 (nil, false, err):缓存 miss / 入站不存在等 → 调用方应 fallback 到逐个 addUserToInbound
@@ -33,13 +34,6 @@ func collectInboundClientAddItem(ctx context.Context, cache *InboundCache, repo 
 		return nil, false, fmt.Errorf("existing credential requires deadline refresh")
 	}
 
-	// DB 无记录 → 走 getOrCreateInboundCredential:全局锁内按 email 复用 agent 已有 client / 生成新凭据 + 立即写 DB。
-	// 并发时两条路径拿到同一份 canonical 凭据(同 uuid),batch-apply / add-client 按 id 幂等,永不产生重复子账户。
-	// flow(VLESS Reality)继承 + 写 DB 都在其内部完成。
-	credential, credJSON, _, err := getOrCreateInboundCredential(ctx, repo, user, serverID, inboundTag, ib.Protocol, ib.Settings)
-	if err != nil {
-		return nil, false, fmt.Errorf("generate credential: %w", err)
-	}
 	// The legacy batch endpoint has no acknowledged deadline contract. Any
 	// expiring source must use add-client so an old Agent cannot silently accept
 	// the credential while ignoring not_after.
@@ -57,12 +51,11 @@ func collectInboundClientAddItem(ctx context.Context, cache *InboundCache, repo 
 		return nil, false, fmt.Errorf("expiring credential requires atomic add-client")
 	}
 	return &InboundClientAddItem{
-		Username:       user.Username,
-		ServerID:       serverID,
-		InboundTag:     inboundTag,
-		Protocol:       ib.Protocol,
-		Credential:     credential,
-		CredentialJSON: credJSON,
+		Username:   user.Username,
+		ServerID:   serverID,
+		InboundTag: inboundTag,
+		Protocol:   ib.Protocol,
+		Settings:   ib.Settings,
 	}, true, nil
 }
 
@@ -73,23 +66,40 @@ func applyInboundBatchOrFallback(ctx context.Context, rm *RemoteManageHandler, r
 	if len(items) == 0 {
 		return nil
 	}
-	err := applyInboundClientsBatchToAgent(ctx, rm, repo, serverID, items)
-	if err == nil {
-		return nil
-	}
-	if err != ErrAgentBatchNotSupported {
-		log.Printf("[%s] inbound batch-apply server=%d failed: %v — falling back to per-item", label, serverID, err)
-	} else {
-		log.Printf("[%s] agent server=%d 不支持 batch-apply,fallback per-item", label, serverID)
-	}
-
 	var warnings []string
-	for _, it := range items {
-		user := storage.User{Username: it.Username}
-		if ferr := addUserToInbound(ctx, rm, repo, user, it.ServerID, it.InboundTag); ferr != nil {
-			log.Printf("[%s] fallback addUserToInbound user=%s server=%d tag=%s: %v",
-				label, it.Username, it.ServerID, it.InboundTag, ferr)
-			warnings = append(warnings, fmt.Sprintf("节点 %s 添加用户 %s 失败", it.InboundTag, it.Username))
+	err := withPreparedInboundBatchMutation(ctx, repo, serverID, items, func(leasedCtx context.Context, prepared []InboundClientAddItem) error {
+		batchErr := applyInboundClientsBatchToAgentLocked(leasedCtx, rm, serverID, prepared)
+		if batchErr == nil {
+			return nil
+		}
+		if !errors.Is(batchErr, ErrAgentBatchNotSupported) {
+			return batchErr
+		}
+
+		// The old-Agent fallback remains under the same user and server leases.
+		// It is only used for an explicitly unsupported endpoint; a rejected or
+		// malformed batch must surface as a failure instead of being retried as a
+		// different mutation protocol.
+		log.Printf("[%s] agent server=%d 不支持 batch-apply,fallback per-item", label, serverID)
+		var fallbackErrs []error
+		for _, it := range prepared {
+			if ferr := applyPreparedInboundCredential(leasedCtx, rm, serverID, it.InboundTag, it.Credential, nil); ferr != nil {
+				log.Printf("[%s] fallback add-client user=%s server=%d tag=%s: %v",
+					label, it.Username, serverID, it.InboundTag, ferr)
+				warnings = append(warnings, fmt.Sprintf("节点 %s 添加用户 %s 失败", it.InboundTag, it.Username))
+				fallbackErrs = append(fallbackErrs, ferr)
+			}
+		}
+		return errors.Join(fallbackErrs...)
+	})
+	if err != nil {
+		log.Printf("[%s] inbound mutation server=%d failed: %v", label, serverID, err)
+		if len(warnings) == 0 {
+			if errors.Is(err, storage.ErrRemoteInstallationActive) {
+				warnings = append(warnings, fmt.Sprintf("服务器 %d 正在安装，未执行套餐节点变更", serverID))
+			} else {
+				warnings = append(warnings, fmt.Sprintf("服务器 %d 套餐节点变更失败", serverID))
+			}
 		}
 	}
 	return warnings
@@ -109,8 +119,47 @@ type InboundClientAddItem struct {
 	ServerID       int64
 	InboundTag     string
 	Protocol       string
+	Settings       map[string]interface{}
 	Credential     map[string]interface{}
 	CredentialJSON string
+}
+
+// withPreparedInboundBatchMutation holds exactly one server mutation lease for
+// credential reservation, Agent publication, and any required restart. Do not
+// nest the repository's user provisioning mutex here: SaveUserInboundConfig
+// uses that mutex to reject deletion tombstones, and taking both locks in the
+// opposite order used by deletion/routed flows would deadlock. A deletion that
+// starts after reservation must acquire this same server lease before it can
+// revoke the newly published credential.
+func withPreparedInboundBatchMutation(ctx context.Context, repo *storage.TrafficRepository, serverID int64, items []InboundClientAddItem, action func(context.Context, []InboundClientAddItem) error) error {
+	for _, item := range items {
+		if item.ServerID != serverID {
+			return fmt.Errorf("inbound batch item server=%d does not match transaction server=%d", item.ServerID, serverID)
+		}
+	}
+	leasedCtx, release, err := repo.AcquireRemoteServerMutationLease(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	prepared := make([]InboundClientAddItem, len(items))
+	copy(prepared, items)
+	for i := range prepared {
+		user, err := repo.GetUser(leasedCtx, prepared[i].Username)
+		if err != nil {
+			return fmt.Errorf("load user %s: %w", prepared[i].Username, err)
+		}
+		credential, credentialJSON, _, err := getOrCreateInboundCredential(
+			leasedCtx, repo, user, serverID, prepared[i].InboundTag, prepared[i].Protocol, prepared[i].Settings,
+		)
+		if err != nil {
+			return fmt.Errorf("reserve credential user=%s inbound=%s: %w", prepared[i].Username, prepared[i].InboundTag, err)
+		}
+		prepared[i].Credential = credential
+		prepared[i].CredentialJSON = credentialJSON
+	}
+	return action(leasedCtx, prepared)
 }
 
 // applyInboundClientsBatchToAgent 把同一 server 上多个用户加 client 的操作合并成 1 次
@@ -119,18 +168,14 @@ type InboundClientAddItem struct {
 //   - 改造:0 次 GET(cred 用 master InboundCache 算)+ 1 次 batch-apply → 整 server 1 次 round-trip
 //
 // 老 agent(无 batch-apply 端点)→ 返回 ErrAgentBatchNotSupported,caller 应 fallback 逐个 addUserToInbound。
-// 全成功 → 批量 SaveUserInboundConfig 写 DB,返回 nil。
-// agent 个别 item 报 err(如 inbound 不存在)→ 跳过该 item 的 DB 写入,其它仍写入,函数仍返回 nil。
+// 凭据预留、Agent ACK 和必要重启都在同一台服务器的 mutation lease 内完成。
+// Agent 任一 item 未确认即返回错误，不把部分失败伪装成成功。
 func applyInboundClientsBatchToAgent(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, serverID int64, items []InboundClientAddItem) error {
 	if len(items) == 0 {
 		return nil
 	}
-	usernames := make([]string, 0, len(items))
-	for _, item := range items {
-		usernames = append(usernames, item.Username)
-	}
-	return repo.WithUsersProvisioningLease(ctx, usernames, func() error {
-		return applyInboundClientsBatchToAgentLocked(ctx, rm, serverID, items)
+	return withPreparedInboundBatchMutation(ctx, repo, serverID, items, func(leasedCtx context.Context, prepared []InboundClientAddItem) error {
+		return applyInboundClientsBatchToAgentLocked(leasedCtx, rm, serverID, prepared)
 	})
 }
 
@@ -149,6 +194,9 @@ func applyInboundClientsBatchToAgentLocked(ctx context.Context, rm *RemoteManage
 
 	req := batchReq{NoRestart: true}
 	for _, it := range items {
+		if it.Credential == nil {
+			return fmt.Errorf("inbound batch item user=%s tag=%s has no reserved credential", it.Username, it.InboundTag)
+		}
 		req.InboundClients = append(req.InboundClients, batchInboundClient{
 			Tag:    it.InboundTag,
 			Client: it.Credential,

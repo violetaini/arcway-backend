@@ -70,8 +70,45 @@ func (h *RemoteManageHandler) SetStealSelfDeployer(deployer func(ctx context.Con
 	h.stealSelfDeployer = deployer
 }
 
-func (h *RemoteManageHandler) deployDefaultConfig(serverID int64) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+// remoteInstallationAllowsAutoDeploy is deliberately fail-closed: an active
+// install may still roll back Xray/Nginx, and an unreadable lock state must not
+// be treated as permission to race that rollback.
+func remoteInstallationAllowsAutoDeploy(ctx context.Context, repo *storage.TrafficRepository, serverID int64, source string) bool {
+	if repo == nil {
+		log.Printf("[%s] Skip automatic deployment for server %d: installation lock repository unavailable", source, serverID)
+		return false
+	}
+	active, err := repo.IsRemoteServerInstallationActive(ctx, serverID)
+	if err != nil {
+		log.Printf("[%s] Skip automatic deployment for server %d: cannot read installation lock: %v", source, serverID, err)
+		return false
+	}
+	if active {
+		log.Printf("[%s] Skip automatic deployment for server %d: installation transaction is active", source, serverID)
+		return false
+	}
+	return true
+}
+
+func withRemoteInstallationSafeMutation(ctx context.Context, repo *storage.TrafficRepository, serverID int64, source string, action func(context.Context) error) error {
+	if repo == nil {
+		err := errors.New("installation lock repository unavailable")
+		log.Printf("[%s] Skip mutation for server %d: %v", source, serverID, err)
+		return err
+	}
+	err := repo.WithRemoteServerMutationLease(ctx, serverID, action)
+	if err != nil {
+		if errors.Is(err, storage.ErrRemoteInstallationActive) {
+			log.Printf("[%s] Skip mutation for server %d: installation transaction is active", source, serverID)
+		} else {
+			log.Printf("[%s] Mutation for server %d failed closed: %v", source, serverID, err)
+		}
+	}
+	return err
+}
+
+func (h *RemoteManageHandler) deployDefaultConfig(parentCtx context.Context, serverID int64) {
+	ctx, cancel := context.WithTimeout(parentCtx, 30*time.Second)
 	defer cancel()
 
 	// 已存在配置则不下发 — 保护现网 inbound/outbound/routing,只在全新装机时初始化默认模板。
@@ -212,6 +249,15 @@ func (h *RemoteManageHandler) handleConnLimitKickDelta(ctx context.Context, serv
 func (h *RemoteManageHandler) HandleScanResult(serverID int64, payload WSScanResultPayload) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	leasedCtx, release, err := h.repo.AcquireRemoteServerMutationLease(ctx, serverID)
+	if err != nil {
+		if !errors.Is(err, storage.ErrRemoteInstallationActive) {
+			log.Printf("[Remote Manage] Failed to acquire scan-result lease for server %d: %v", serverID, err)
+		}
+		return
+	}
+	defer release()
+	ctx = leasedCtx
 
 	// 更新数据库中的 X 射线状态;若状态翻转则发 TG 通知(复用服务器上下线开关)
 	prevRunning, err := h.repo.UpdateRemoteServerXrayStatus(ctx, serverID, payload.XrayRunning, payload.XrayVersion)
@@ -231,13 +277,25 @@ func (h *RemoteManageHandler) HandleScanResult(serverID int64, payload WSScanRes
 	}
 
 	if payload.XrayRunning {
-		result := h.syncInboundsToNodesInternal(ctx, serverID)
+		// Installation may be observing a temporary Xray config that will be
+		// rolled back. Do not create/claim database nodes from that transient
+		// state. The shared lease covers every remote/DB mutation in auto-sync.
+		var result SyncInboundsToNodesResponse
+		if err := withRemoteInstallationSafeMutation(ctx, h.repo, serverID, "Remote Manage inbound sync", func(actionCtx context.Context) error {
+			result = h.syncInboundsToNodesInternal(actionCtx, serverID)
+			return nil
+		}); err != nil {
+			return
+		}
 		log.Printf("[Remote Manage] Auto-sync from scan_result for server %d: synced=%d (claimed=%d, created=%d), skipped=%d",
 			serverID, result.SyncedCount, result.ClaimedCount, result.CreatedCount, result.SkippedCount)
 	} else {
 		// xray 未运行，自动下发配置
 		server, err := h.repo.GetRemoteServer(ctx, serverID)
 		if err == nil && server != nil {
+			if !remoteInstallationAllowsAutoDeploy(ctx, h.repo, serverID, "Remote Manage") {
+				return
+			}
 			useStealSelf := server.Use443 && server.Domain != "" && h.stealSelfDeployer != nil
 			go func() {
 				deployCtx, deployCancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -249,14 +307,21 @@ func (h *RemoteManageHandler) HandleScanResult(serverID int64, payload WSScanRes
 					log.Printf("[Remote Manage] server %d xray 未运行但配置已有用户内容,跳过自动下发(避免覆盖 nginx/config)", serverID)
 					return
 				}
-				if useStealSelf {
-					if err := h.stealSelfDeployer(deployCtx, serverID); err != nil {
-						log.Printf("[Remote Manage] Auto-deploy steal-self config failed for server %d: %v", serverID, err)
-					} else {
-						log.Printf("[Remote Manage] Auto-deployed steal-self config for server %d", serverID)
+				mutationErr := withRemoteInstallationSafeMutation(deployCtx, h.repo, serverID, "Remote Manage", func(actionCtx context.Context) error {
+					if useStealSelf {
+						return h.stealSelfDeployer(actionCtx, serverID)
 					}
-				} else {
-					h.deployDefaultConfig(serverID)
+					h.deployDefaultConfig(actionCtx, serverID)
+					return nil
+				})
+				if mutationErr != nil {
+					if !errors.Is(mutationErr, storage.ErrRemoteInstallationActive) {
+						log.Printf("[Remote Manage] Auto-deploy config failed for server %d: %v", serverID, mutationErr)
+					}
+					return
+				}
+				if useStealSelf {
+					log.Printf("[Remote Manage] Auto-deployed steal-self config for server %d", serverID)
 				}
 			}()
 		}
@@ -288,6 +353,26 @@ func remoteWriteError(w http.ResponseWriter, status int, message string) {
 	})
 }
 
+func remoteWriteForwardError(w http.ResponseWriter, err error) {
+	status := http.StatusBadGateway
+	if errors.Is(err, storage.ErrRemoteInstallationActive) {
+		status = http.StatusConflict
+	}
+	remoteWriteError(w, status, err.Error())
+}
+
+// remoteWritePartialError 表示远程多步操作的主动作已经生效，但后置同步未完成。
+// 用 409 保证 CDN 不替换 body，并让客户端明确知道不应把该请求当成全部成功。
+func remoteWritePartialError(w http.ResponseWriter, message string) {
+	remoteWriteJSON(w, http.StatusConflict, map[string]any{
+		"success": false,
+		"partial": true,
+		"error":   message,
+		"message": message,
+		"status":  http.StatusBadGateway,
+	})
+}
+
 // 代理对远程服务器的服务状态请求
 func (h *RemoteManageHandler) HandleServicesStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -309,7 +394,7 @@ func (h *RemoteManageHandler) HandleServicesStatus(w http.ResponseWriter, r *htt
 
 	result, err := h.forwardToRemoteServer(r.Context(), id, "GET", "/api/child/services/status", nil)
 	if err != nil {
-		remoteWriteError(w, http.StatusBadGateway, err.Error())
+		remoteWriteForwardError(w, err)
 		return
 	}
 
@@ -353,7 +438,7 @@ func (h *RemoteManageHandler) HandleServiceControl(w http.ResponseWriter, r *htt
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 		if err := h.restartXrayWithRecovery(ctx, id, "ServiceControl"); err != nil {
-			remoteWriteError(w, http.StatusBadGateway, err.Error())
+			remoteWriteForwardError(w, err)
 			return
 		}
 		remoteWriteJSON(w, http.StatusOK, map[string]any{
@@ -365,7 +450,7 @@ func (h *RemoteManageHandler) HandleServiceControl(w http.ResponseWriter, r *htt
 
 	result, err := h.forwardToRemoteServer(r.Context(), id, "POST", "/api/child/services/control", body)
 	if err != nil {
-		remoteWriteError(w, http.StatusBadGateway, err.Error())
+		remoteWriteForwardError(w, err)
 		return
 	}
 
@@ -395,7 +480,7 @@ func (h *RemoteManageHandler) HandleXrayInstall(w http.ResponseWriter, r *http.R
 
 	result, err := h.forwardToRemoteServer(r.Context(), id, "POST", "/api/child/xray/install", nil)
 	if err != nil {
-		remoteWriteError(w, http.StatusBadGateway, err.Error())
+		remoteWriteForwardError(w, err)
 		return
 	}
 
@@ -414,7 +499,9 @@ func (h *RemoteManageHandler) HandleXrayInstall(w http.ResponseWriter, r *http.R
 		case <-deployCtx.Done():
 			return
 		}
-		if err := h.DeployStealSelfConfig(deployCtx, id); err != nil {
+		if err := withRemoteInstallationSafeMutation(deployCtx, h.repo, id, "Post-Xray-install deploy", func(actionCtx context.Context) error {
+			return h.DeployStealSelfConfig(actionCtx, id)
+		}); err != nil {
 			log.Printf("[Remote Manage] Post-install auto-deploy failed for server %d: %v (user can retry via UI 下发配置)", id, err)
 			return
 		}
@@ -452,7 +539,7 @@ func (h *RemoteManageHandler) HandleXrayRemove(w http.ResponseWriter, r *http.Re
 
 	result, err := h.forwardToRemoteServer(r.Context(), id, "POST", "/api/child/xray/remove", nil)
 	if err != nil {
-		remoteWriteError(w, http.StatusBadGateway, err.Error())
+		remoteWriteForwardError(w, err)
 		return
 	}
 
@@ -486,7 +573,7 @@ func (h *RemoteManageHandler) HandleXrayConfig(w http.ResponseWriter, r *http.Re
 
 	result, err := h.forwardToRemoteServer(r.Context(), id, r.Method, "/api/child/xray/config", body)
 	if err != nil {
-		remoteWriteError(w, http.StatusBadGateway, err.Error())
+		remoteWriteForwardError(w, err)
 		return
 	}
 
@@ -520,7 +607,7 @@ func (h *RemoteManageHandler) HandleXrayTestConfig(w http.ResponseWriter, r *htt
 	}
 	result, err := h.forwardToRemoteServer(r.Context(), id, http.MethodPost, "/api/child/xray/test-config", body)
 	if err != nil {
-		remoteWriteError(w, http.StatusBadGateway, err.Error())
+		remoteWriteForwardError(w, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -560,7 +647,7 @@ func (h *RemoteManageHandler) HandleNginxInstall(w http.ResponseWriter, r *http.
 
 	result, err := h.forwardToRemoteServer(r.Context(), id, "POST", "/api/child/nginx/install", body)
 	if err != nil {
-		remoteWriteError(w, http.StatusBadGateway, err.Error())
+		remoteWriteForwardError(w, err)
 		return
 	}
 
@@ -595,7 +682,7 @@ func (h *RemoteManageHandler) HandleNginxRemove(w http.ResponseWriter, r *http.R
 
 	result, err := h.forwardToRemoteServer(r.Context(), id, "POST", "/api/child/nginx/remove", nil)
 	if err != nil {
-		remoteWriteError(w, http.StatusBadGateway, err.Error())
+		remoteWriteForwardError(w, err)
 		return
 	}
 
@@ -617,6 +704,25 @@ func remoteSSEError(w http.ResponseWriter, msg string) {
 }
 
 func (h *RemoteManageHandler) forwardStreamToRemote(w http.ResponseWriter, r *http.Request, serverID int64, agentPath string) {
+	h.forwardStreamToRemoteWithin(w, r, serverID, agentPath, 5*time.Minute)
+}
+
+func (h *RemoteManageHandler) forwardStreamToRemoteWithin(w http.ResponseWriter, r *http.Request, serverID int64, agentPath string, timeout time.Duration) {
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
+
+	err := h.repo.WithRemoteServerMutationLease(ctx, serverID, func(leasedCtx context.Context) error {
+		h.forwardStreamToRemoteLeased(w, r.WithContext(leasedCtx), serverID, agentPath)
+		return nil
+	})
+	if errors.Is(err, storage.ErrRemoteInstallationActive) {
+		remoteWriteError(w, http.StatusConflict, "server installation is active; retry after it completes")
+	} else if err != nil {
+		remoteSSEError(w, "unable to acquire server mutation lease: "+err.Error())
+	}
+}
+
+func (h *RemoteManageHandler) forwardStreamToRemoteLeased(w http.ResponseWriter, r *http.Request, serverID int64, agentPath string) {
 	server, err := h.repo.GetRemoteServer(r.Context(), serverID)
 	if err != nil {
 		remoteSSEError(w, "server not found: "+err.Error())
@@ -634,7 +740,8 @@ func (h *RemoteManageHandler) forwardStreamToRemote(w http.ResponseWriter, r *ht
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	flusher, _ := w.(http.Flusher)
-	// 5 分钟硬超时跟 forwardUpgradeStream 对齐 — install/nginx 大部分场景几十秒内完成,够用。
+	// forwardStreamToRemote 给整个操作设置了 5 分钟上限，包括租约等待、
+	// WS 尝试、HTTP 回退和响应读取；这里继续把同一 context 传给传输层。
 	if ok, err := h.tryWSRPCStream(r.Context(), serverID, http.MethodPost, agentPath, nil, w, flusher, 5*time.Minute); ok {
 		if err != nil {
 			log.Printf("[Remote Manage] WS stream %s for server %s ended with error (no fallback): %v", agentPath, server.Name, err)
@@ -666,7 +773,7 @@ func (h *RemoteManageHandler) forwardStreamToRemote(w http.ResponseWriter, r *ht
 		req.Header.Set("Authorization", "Bearer "+server.Token)
 		req.Header.Set("User-Agent", version.AgentUserAgent)
 
-		client := &http.Client{} // SSE 没有超时
+		client := &http.Client{} // SSE 生命周期由请求 context 的硬上限控制。
 		r2, err := client.Do(req)
 		if err != nil {
 			if i+1 < len(candidates) {
@@ -753,6 +860,15 @@ func (h *RemoteManageHandler) refreshXrayStatus(serverID int64) {
 	time.Sleep(2 * time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	leasedCtx, release, err := h.repo.AcquireRemoteServerMutationLease(ctx, serverID)
+	if err != nil {
+		if !errors.Is(err, storage.ErrRemoteInstallationActive) {
+			log.Printf("[Remote Manage] refreshXrayStatus lease failed for server %d: %v", serverID, err)
+		}
+		return
+	}
+	defer release()
+	ctx = leasedCtx
 
 	result, err := h.forwardToRemoteServer(ctx, serverID, "GET", "/api/child/services/status", nil)
 	if err != nil {
@@ -849,6 +965,18 @@ func (h *RemoteManageHandler) HandleAgentUpgradeStream(w http.ResponseWriter, r 
 //  3. 失败时往 SSE 末尾追一条 {type:"result", success:false, hint:"..."} — 前端可据此提示
 //     用户哪几台需要手工 ssh 上去跑 upgrade-agent.sh
 func (h *RemoteManageHandler) forwardUpgradeStream(w http.ResponseWriter, r *http.Request, serverID int64) {
+	err := h.repo.WithRemoteServerMutationLease(r.Context(), serverID, func(leasedCtx context.Context) error {
+		h.forwardUpgradeStreamLeased(w, r.WithContext(leasedCtx), serverID)
+		return nil
+	})
+	if errors.Is(err, storage.ErrRemoteInstallationActive) {
+		remoteSSEError(w, "server installation is active; retry after it completes")
+	} else if err != nil {
+		remoteSSEError(w, "unable to acquire server mutation lease: "+err.Error())
+	}
+}
+
+func (h *RemoteManageHandler) forwardUpgradeStreamLeased(w http.ResponseWriter, r *http.Request, serverID int64) {
 	const upgradeTimeout = 5 * time.Minute
 
 	server, err := h.repo.GetRemoteServer(r.Context(), serverID)
@@ -1135,7 +1263,7 @@ func (h *RemoteManageHandler) HandleNginxConfig(w http.ResponseWriter, r *http.R
 
 	result, err := h.forwardToRemoteServer(r.Context(), id, r.Method, "/api/child/nginx/config", body)
 	if err != nil {
-		remoteWriteError(w, http.StatusBadGateway, err.Error())
+		remoteWriteForwardError(w, err)
 		return
 	}
 
@@ -1165,7 +1293,7 @@ func (h *RemoteManageHandler) HandleSystemInfo(w http.ResponseWriter, r *http.Re
 
 	result, err := h.forwardToRemoteServer(r.Context(), id, "GET", "/api/child/system/info", nil)
 	if err != nil {
-		remoteWriteError(w, http.StatusBadGateway, err.Error())
+		remoteWriteForwardError(w, err)
 		return
 	}
 
@@ -1229,7 +1357,20 @@ func isSessionInvalidErr(err error) bool {
 		strings.Contains(s, "decrypt")
 }
 
-func (h *RemoteManageHandler) forwardToRemoteServer(ctx context.Context, serverID int64, method, path string, body []byte) (respBody []byte, err error) {
+func (h *RemoteManageHandler) forwardToRemoteServer(ctx context.Context, serverID int64, method, path string, body []byte) ([]byte, error) {
+	if method == http.MethodGet || method == http.MethodHead {
+		return h.forwardToRemoteServerLeased(ctx, serverID, method, path, body)
+	}
+	var response []byte
+	err := h.repo.WithRemoteServerMutationLease(ctx, serverID, func(leasedCtx context.Context) error {
+		var forwardErr error
+		response, forwardErr = h.forwardToRemoteServerLeased(leasedCtx, serverID, method, path, body)
+		return forwardErr
+	})
+	return response, err
+}
+
+func (h *RemoteManageHandler) forwardToRemoteServerLeased(ctx context.Context, serverID int64, method, path string, body []byte) (respBody []byte, err error) {
 	// 写操作成功 + path 命中 xray 配置修改清单 → 异步 refresh snapshot
 	// (用 defer + named return 统一处理所有 return 分支,无需在每个 return 点重复)
 	defer func() {
@@ -1633,7 +1774,7 @@ func (h *RemoteManageHandler) HandleXrayConfigFiles(w http.ResponseWriter, r *ht
 
 	result, err := h.forwardToRemoteServer(r.Context(), id, r.Method, "/api/child/xray/config/files"+query, body)
 	if err != nil {
-		remoteWriteError(w, http.StatusBadGateway, err.Error())
+		remoteWriteForwardError(w, err)
 		return
 	}
 
@@ -1673,7 +1814,7 @@ func (h *RemoteManageHandler) HandleNginxConfigFiles(w http.ResponseWriter, r *h
 
 	result, err := h.forwardToRemoteServer(r.Context(), id, r.Method, "/api/child/nginx/config/files"+query, body)
 	if err != nil {
-		remoteWriteError(w, http.StatusBadGateway, err.Error())
+		remoteWriteForwardError(w, err)
 		return
 	}
 
@@ -1704,7 +1845,7 @@ func (h *RemoteManageHandler) HandleNginxServersList(w http.ResponseWriter, r *h
 
 	result, err := h.forwardToRemoteServer(r.Context(), id, r.Method, "/api/child/nginx/servers-list", nil)
 	if err != nil {
-		remoteWriteError(w, http.StatusBadGateway, err.Error())
+		remoteWriteForwardError(w, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -1922,13 +2063,31 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
+	// POST 是一条多步远程写链：证书落盘、inbound 变更、Reality 路由以及
+	// WSS nginx 聚合都必须在同一 server mutation lease 内完成。GET 保持原来的无写租约路径。
+	operationCtx := r.Context()
+	if r.Method == http.MethodPost {
+		leasedCtx, release, leaseErr := h.repo.AcquireRemoteServerMutationLease(operationCtx, id)
+		if leaseErr != nil {
+			remoteWriteForwardError(w, leaseErr)
+			return
+		}
+		defer release()
+		operationCtx = leasedCtx
+	}
+
 	// 删除 reality 入站前，先保存其 serverNames 以便后续恢复路由
 	var preDeleteRealityDomains []string
+	var removedInboundWasWSS bool
 	if r.Method == http.MethodPost && inboundReq != nil {
 		action, _ := inboundReq["action"].(string)
 		if strings.ToLower(action) == "remove" {
 			if tag, _ := inboundReq["tag"].(string); tag != "" {
-				preDeleteRealityDomains = h.getRealityServerNames(r.Context(), id, tag)
+				preDeleteRealityDomains, removedInboundWasWSS, err = h.getInboundRemovalSyncState(operationCtx, id, tag)
+				if err != nil {
+					remoteWriteError(w, http.StatusBadGateway, fmt.Sprintf("删除前读取入站后置同步信息失败: %v", err))
+					return
+				}
 			}
 		}
 	}
@@ -1937,7 +2096,7 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 	// 避免「agent 上没有该证书 → xray 加载失败 → 502」。失败明确报错(已透传,不被 CF 吞)。
 	if r.Method == http.MethodPost && inboundReq != nil {
 		if action, _ := inboundReq["action"].(string); action == "" || strings.ToLower(action) == "add" {
-			if newBody, certErr := h.resolveInboundCert(r.Context(), id, inboundReq); certErr != nil {
+			if newBody, certErr := h.resolveInboundCert(operationCtx, id, inboundReq); certErr != nil {
 				remoteWriteError(w, http.StatusBadGateway, "证书处理失败: "+certErr.Error())
 				return
 			} else if newBody != nil {
@@ -1956,7 +2115,7 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 			lock := wssServerLock(id)
 			lock.Lock()
 			defer lock.Unlock()
-			newBody, perr := h.preprocessWSSInbound(r.Context(), id, body, inboundReq)
+			newBody, perr := h.preprocessWSSInbound(operationCtx, id, body, inboundReq)
 			if perr != nil {
 				remoteWriteError(w, http.StatusBadGateway, perr.Error())
 				return
@@ -1984,7 +2143,7 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 		if action, _ := inboundReq["action"].(string); action == "" || strings.ToLower(action) == "add" {
 			if inbound, ok := inboundReq["inbound"].(map[string]interface{}); ok {
 				if proto, _ := inbound["protocol"].(string); strings.ToLower(proto) == "anytls" || strings.ToLower(proto) == "snell" {
-					if server, err := h.repo.GetRemoteServer(r.Context(), id); err == nil && server != nil && server.XrayMode == "external" {
+					if server, err := h.repo.GetRemoteServer(operationCtx, id); err == nil && server != nil && server.XrayMode == "external" {
 						remoteWriteError(w, http.StatusBadRequest, strings.ToLower(proto)+" 协议需要内嵌 xray,请先将该服务器切换为内嵌模式")
 						return
 					}
@@ -2013,9 +2172,9 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	result, err := h.forwardToRemoteServer(r.Context(), id, r.Method, "/api/child/inbounds", body)
+	result, err := h.forwardToRemoteServer(operationCtx, id, r.Method, "/api/child/inbounds", body)
 	if err != nil {
-		remoteWriteError(w, http.StatusBadGateway, err.Error())
+		remoteWriteForwardError(w, err)
 		return
 	}
 
@@ -2033,6 +2192,7 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 		var resp map[string]interface{}
 		if err := json.Unmarshal(result, &resp); err == nil {
 			if success, ok := resp["success"].(bool); ok && success {
+				var postSyncErrors []string
 				if actionLower == "" || actionLower == "add" {
 					// 添加入站：先处理 reality 相关配置（更新 tunnel-in port + 清理域名路由）
 					if inbound, ok := inboundReq["inbound"].(map[string]interface{}); ok {
@@ -2049,14 +2209,16 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 							ipVersion = "" // 非法值降级为默认 v4
 						}
 
-						h.cleanupTunnelRouteForReality(r.Context(), id, inbound)
+						if err := h.cleanupTunnelRouteForReality(operationCtx, id, inbound); err != nil {
+							postSyncErrors = append(postSyncErrors, "Reality 路由同步失败: "+err.Error())
+						}
 
 						// 转换为 map[string]any
 						inboundAny := make(map[string]any)
 						for k, v := range inbound {
 							inboundAny[k] = v
 						}
-						event.GetBus().PublishAsync(event.InboundEvent{
+						event.GetBus().Publish(event.InboundEvent{
 							Type:          event.EventInboundAdded,
 							ServerID:      id,
 							Tag:           tag,
@@ -2070,18 +2232,16 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 							RelayPort:     relayPort,
 						})
 					}
-					// VLESS+WS 入站添加成功 → 异步聚合渲染该 server 全部 WSS location 下发 nginx
+					// VLESS+WS 入站添加成功 → 在同一租约内聚合渲染并等待 Agent ACK。
 					if isVlessWSInboundReq(inboundReq) {
-						go func() {
-							if err := h.SyncWSSNginx(context.Background(), id); err != nil {
-								log.Printf("[WSS-Nginx] sync after add server=%d failed: %v", id, err)
-							}
-						}()
+						if err := h.SyncWSSNginx(operationCtx, id); err != nil {
+							postSyncErrors = append(postSyncErrors, "WSS nginx 同步失败: "+err.Error())
+						}
 					}
 				} else if actionLower == "remove" {
 					// 删除入站：发布事件
 					if tag, ok := inboundReq["tag"].(string); ok && tag != "" {
-						event.GetBus().PublishAsync(event.InboundEvent{
+						event.GetBus().Publish(event.InboundEvent{
 							Type:     event.EventInboundRemoved,
 							ServerID: id,
 							Tag:      tag,
@@ -2089,14 +2249,19 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 					}
 					// 恢复被 reality 接管的域名到 tunnel-in→nginx 路由
 					if len(preDeleteRealityDomains) > 0 {
-						go h.restoreTunnelRouteForReality(context.Background(), id, preDeleteRealityDomains)
-					}
-					// 不知道被删的入站是否 vless+ws,稳妥起见每次 remove 都触发 sync(代价是一次 GET inbounds + 渲染)
-					go func() {
-						if err := h.SyncWSSNginx(context.Background(), id); err != nil {
-							log.Printf("[WSS-Nginx] sync after remove server=%d failed: %v", id, err)
+						if err := h.restoreTunnelRouteForReality(operationCtx, id, preDeleteRealityDomains); err != nil {
+							postSyncErrors = append(postSyncErrors, "Reality 路由恢复失败: "+err.Error())
 						}
-					}()
+					}
+					if removedInboundWasWSS {
+						if err := h.SyncWSSNginx(operationCtx, id); err != nil {
+							postSyncErrors = append(postSyncErrors, "WSS nginx 清理失败: "+err.Error())
+						}
+					}
+				}
+				if len(postSyncErrors) > 0 {
+					remoteWritePartialError(w, "入站主动作已生效，但后置同步未完成: "+strings.Join(postSyncErrors, "; "))
+					return
 				}
 			}
 		}
@@ -2290,7 +2455,7 @@ func (h *RemoteManageHandler) HandleOutbounds(w http.ResponseWriter, r *http.Req
 
 	result, err := h.forwardToRemoteServer(r.Context(), id, r.Method, "/api/child/outbounds", body)
 	if err != nil {
-		remoteWriteError(w, http.StatusBadGateway, err.Error())
+		remoteWriteForwardError(w, err)
 		return
 	}
 
@@ -2433,7 +2598,7 @@ func (h *RemoteManageHandler) HandleRouting(w http.ResponseWriter, r *http.Reque
 
 	result, err := h.forwardToRemoteServer(r.Context(), id, r.Method, "/api/child/routing", body)
 	if err != nil {
-		remoteWriteError(w, http.StatusBadGateway, err.Error())
+		remoteWriteForwardError(w, err)
 		return
 	}
 
@@ -2462,10 +2627,21 @@ func (h *RemoteManageHandler) HandleScan(w http.ResponseWriter, r *http.Request)
 		remoteWriteError(w, http.StatusBadRequest, "invalid server_id")
 		return
 	}
+	leasedCtx, release, err := h.repo.AcquireRemoteServerMutationLease(r.Context(), id)
+	if errors.Is(err, storage.ErrRemoteInstallationActive) {
+		remoteWriteError(w, http.StatusConflict, "server installation is active; retry after it completes")
+		return
+	}
+	if err != nil {
+		remoteWriteError(w, http.StatusInternalServerError, "unable to acquire server mutation lease")
+		return
+	}
+	defer release()
+	r = r.WithContext(leasedCtx)
 
 	result, err := h.forwardToRemoteServer(r.Context(), id, "POST", "/api/child/scan", nil)
 	if err != nil {
-		remoteWriteError(w, http.StatusBadGateway, err.Error())
+		remoteWriteForwardError(w, err)
 		return
 	}
 
@@ -2525,6 +2701,21 @@ func (h *RemoteManageHandler) syncInboundsToNodesInternal(ctx context.Context, s
 // serverHostOverride: 写入 clash proxy 配置的 server 字段;空时回退到 server.IPAddress。
 // forceOverride: true 时,遇到同名节点先删除再新建(手动同步对话框的"强制覆盖"开关)。
 func (h *RemoteManageHandler) syncInboundsToNodes(ctx context.Context, serverID int64, serverHostOverride string, forceOverride bool) SyncInboundsToNodesResponse {
+	var response SyncInboundsToNodesResponse
+	err := withRemoteInstallationSafeMutation(ctx, h.repo, serverID, "Inbound-to-node sync", func(leasedCtx context.Context) error {
+		response = h.syncInboundsToNodesLeased(leasedCtx, serverID, serverHostOverride, forceOverride)
+		return nil
+	})
+	if err != nil {
+		return SyncInboundsToNodesResponse{
+			Success: false,
+			Errors:  []string{err.Error()},
+		}
+	}
+	return response
+}
+
+func (h *RemoteManageHandler) syncInboundsToNodesLeased(ctx context.Context, serverID int64, serverHostOverride string, forceOverride bool) SyncInboundsToNodesResponse {
 	response := SyncInboundsToNodesResponse{
 		Success:    true,
 		SyncedTags: []string{},
@@ -3363,7 +3554,7 @@ func (h *RemoteManageHandler) HandleXraySystemConfig(w http.ResponseWriter, r *h
 
 	result, err := h.forwardToRemoteServer(r.Context(), id, r.Method, "/api/child/xray/system-config", body)
 	if err != nil {
-		remoteWriteError(w, http.StatusBadGateway, err.Error())
+		remoteWriteForwardError(w, err)
 		return
 	}
 
@@ -3982,6 +4173,17 @@ func (h *RemoteManageHandler) HandleResetServerToken(w http.ResponseWriter, r *h
 	}
 
 	ctx := r.Context()
+	leasedCtx, release, err := h.repo.AcquireRemoteServerMutationLease(ctx, id)
+	if errors.Is(err, storage.ErrRemoteInstallationActive) {
+		remoteWriteError(w, http.StatusConflict, "server installation is active; retry after it completes")
+		return
+	}
+	if err != nil {
+		remoteWriteError(w, http.StatusInternalServerError, "unable to acquire server mutation lease")
+		return
+	}
+	defer release()
+	ctx = leasedCtx
 
 	// 获取当前服务器信息以查找旧令牌
 	server, err := h.repo.GetRemoteServer(ctx, id)
@@ -4043,6 +4245,17 @@ func (h *RemoteManageHandler) HandleResetAgentToken(w http.ResponseWriter, r *ht
 	}
 
 	ctx := r.Context()
+	leasedCtx, release, err := h.repo.AcquireRemoteServerMutationLease(ctx, id)
+	if errors.Is(err, storage.ErrRemoteInstallationActive) {
+		remoteWriteError(w, http.StatusConflict, "server installation is active; retry after it completes")
+		return
+	}
+	if err != nil {
+		remoteWriteError(w, http.StatusInternalServerError, "unable to acquire server mutation lease")
+		return
+	}
+	defer release()
+	ctx = leasedCtx
 
 	// 重置代理令牌
 	newToken, expiresAt, err := h.repo.ResetAgentToken(ctx, id)
@@ -4079,6 +4292,17 @@ func (h *RemoteManageHandler) HandleResetAllTokens(w http.ResponseWriter, r *htt
 	}
 
 	ctx := r.Context()
+	leasedCtx, release, err := h.repo.AcquireRemoteServerMutationLease(ctx, id)
+	if errors.Is(err, storage.ErrRemoteInstallationActive) {
+		remoteWriteError(w, http.StatusConflict, "server installation is active; retry after it completes")
+		return
+	}
+	if err != nil {
+		remoteWriteError(w, http.StatusInternalServerError, "unable to acquire server mutation lease")
+		return
+	}
+	defer release()
+	ctx = leasedCtx
 
 	// 获取当前服务器信息以查找旧令牌
 	server, err := h.repo.GetRemoteServer(ctx, id)
@@ -4147,6 +4371,13 @@ func isXrayConfigError(err error) bool {
 }
 
 func (h *RemoteManageHandler) restartXrayWithRecovery(ctx context.Context, serverID int64, logPrefix string) error {
+	leasedCtx, release, err := h.repo.AcquireRemoteServerMutationLease(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	ctx = leasedCtx
+
 	// restartAndVerify 改成 polling — 之前固定 sleep N 秒固然简单但显著拖慢套餐绑定/批量操作:
 	// 主控对每条 server restart 都等满 sleep 时长,套餐里多 routed 节点跨多台 server 时
 	// total wait ≈ 最慢 server 的 sleep 时长。xray 实际重启通常 < 500ms,polling 能把
@@ -4308,27 +4539,46 @@ func (h *RemoteManageHandler) HandleAddWebsite(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	ctx := r.Context()
+	domain := strings.ToLower(strings.TrimSpace(req.Domain))
+	if domain == "" {
+		remoteWriteError(w, http.StatusBadRequest, "domain is required")
+		return
+	}
+
+	ctx, release, err := h.repo.AcquireRemoteServerMutationLease(r.Context(), req.ServerID)
+	if err != nil {
+		remoteWriteForwardError(w, err)
+		return
+	}
+	defer release()
+
 	server, err := h.repo.GetRemoteServer(ctx, req.ServerID)
 	if err != nil {
 		remoteWriteError(w, http.StatusNotFound, "server not found")
 		return
 	}
 
-	domain := strings.ToLower(strings.TrimSpace(req.Domain))
 	rootDomain := extractRootDomain(domain)
 
-	certName := "_." + rootDomain
-	if h.certHandler != nil {
-		if cert, certErr := h.repo.GetCertificateByDomain(ctx, rootDomain, req.ServerID); certErr == nil && cert != nil {
-			certName = certDeployFilename(cert.Domain)
-		}
+	if h.certHandler == nil {
+		remoteWriteError(w, http.StatusConflict, "证书功能未初始化，无法添加 HTTPS 网站")
+		return
 	}
+	cert, certErr := h.findCertificateForRemoteDomain(ctx, rootDomain, req.ServerID)
+	if certErr != nil {
+		remoteWriteError(w, http.StatusConflict, fmt.Sprintf("未找到可部署的 %s 证书: %v", rootDomain, certErr))
+		return
+	}
+	certName := certDeployFilename(cert.Domain)
 	// 1. 生成 nginx domain config(统一渲染:伪装站 location / + ws location)。
 	// ws 入站走主域名 fallback,故仅当添加的正是 server 主域名时才聚合 ws location;额外网站域名不带 ws。
 	var wssForDomain []wssInboundInfo
 	if strings.EqualFold(domain, strings.ToLower(strings.TrimSpace(server.Domain))) {
-		wssForDomain = h.fetchWSSInbounds(ctx, req.ServerID)
+		wssForDomain, err = h.fetchWSSInboundsStrict(ctx, req.ServerID)
+		if err != nil {
+			remoteWriteError(w, http.StatusBadGateway, fmt.Sprintf("读取 WSS 入站失败: %v", err))
+			return
+		}
 	}
 	domainConf, err := renderStealSelfDomainConf(server.StealMode, req.SiteType, req.SiteValue, domain, certName, wssForDomain)
 	if err != nil {
@@ -4336,68 +4586,94 @@ func (h *RemoteManageHandler) HandleAddWebsite(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// 2. 部署 nginx domain config（不覆盖 nginx.conf）
-	sslPayload, _ := json.Marshal(map[string]any{
+	// 2. 先同步部署证书并确认 Agent 完成落盘；随后 setup-ssl 负责重载 nginx。
+	// 证书和 nginx 配置都是覆盖写入，因此该流程可幂等重试。
+	certPayload := WSCertDeployPayload{
+		Domain:   rootDomain,
+		CertPEM:  cert.CertPEM,
+		KeyPEM:   cert.KeyPEM,
+		CertPath: fmt.Sprintf("/usr/local/nginx/cert/%s.pem", certName),
+		KeyPath:  fmt.Sprintf("/usr/local/nginx/cert/%s.key", certName),
+		Reload:   "none",
+	}
+	if err := h.certHandler.deployToRemoteServerSync(ctx, server, certPayload); err != nil {
+		remoteWritePartialError(w, fmt.Sprintf("证书部署未获得 Agent ACK: %v", err))
+		return
+	}
+
+	// 3. 部署 nginx domain config（不覆盖 nginx.conf）。覆盖写入使重试幂等。
+	sslPayload, marshalErr := json.Marshal(map[string]any{
 		"domain":        domain,
 		"domain_config": domainConf,
 	})
+	if marshalErr != nil {
+		remoteWritePartialError(w, fmt.Sprintf("序列化 nginx 配置失败: %v", marshalErr))
+		return
+	}
 	if _, err := h.forwardToRemoteServer(ctx, req.ServerID, http.MethodPost, "/api/child/nginx/setup-ssl", sslPayload); err != nil {
-		remoteWriteError(w, http.StatusBadGateway, fmt.Sprintf("部署 nginx 配置失败: %v", err))
+		remoteWritePartialError(w, fmt.Sprintf("证书已部署，但 nginx 配置失败: %v", err))
 		return
 	}
 
-	// 3. 读取当前 xray 配置
+	// 4. 读取当前 xray 配置
 	xrayResp, err := h.forwardToRemoteServer(ctx, req.ServerID, http.MethodGet, "/api/child/xray/config", nil)
 	if err != nil {
-		remoteWriteError(w, http.StatusBadGateway, fmt.Sprintf("读取 xray 配置失败: %v", err))
+		remoteWritePartialError(w, fmt.Sprintf("证书和 nginx 已部署，但读取 xray 配置失败: %v", err))
 		return
 	}
 	var xrayConfigResp struct {
-		Config string `json:"config"`
+		Success *bool  `json:"success"`
+		Config  string `json:"config"`
+		Error   string `json:"error"`
+		Message string `json:"message"`
 	}
-	json.Unmarshal(xrayResp, &xrayConfigResp)
-
-	var xrayConfig map[string]any
-	if err := json.Unmarshal([]byte(xrayConfigResp.Config), &xrayConfig); err != nil {
-		remoteWriteError(w, http.StatusInternalServerError, fmt.Sprintf("解析 xray 配置失败: %v", err))
+	if err := json.Unmarshal(xrayResp, &xrayConfigResp); err != nil {
+		remoteWritePartialError(w, fmt.Sprintf("解析 xray 配置响应失败: %v", err))
+		return
+	}
+	if xrayConfigResp.Success != nil && !*xrayConfigResp.Success {
+		message := strings.TrimSpace(xrayConfigResp.Error)
+		if message == "" {
+			message = strings.TrimSpace(xrayConfigResp.Message)
+		}
+		remoteWritePartialError(w, "Agent 拒绝读取 xray 配置: "+message)
 		return
 	}
 
-	// 4. 修改 xray 配置
+	var xrayConfig map[string]any
+	if err := json.Unmarshal([]byte(xrayConfigResp.Config), &xrayConfig); err != nil {
+		remoteWritePartialError(w, fmt.Sprintf("解析 xray 配置失败: %v", err))
+		return
+	}
+
+	// 5. 修改 xray 配置；添加域名的 helper 会去重，因此重试不会产生重复路由。
 	if server.StealMode == "fallback" {
 		h.addWebsiteFallbackConfig(xrayConfig, domain)
 	} else {
 		h.addWebsiteTunnelConfig(xrayConfig, domain)
 	}
 
-	updatedConfig, _ := json.MarshalIndent(xrayConfig, "", "    ")
-	configPayload, _ := json.Marshal(map[string]string{
+	updatedConfig, marshalErr := json.MarshalIndent(xrayConfig, "", "    ")
+	if marshalErr != nil {
+		remoteWritePartialError(w, fmt.Sprintf("序列化 xray 配置失败: %v", marshalErr))
+		return
+	}
+	configPayload, marshalErr := json.Marshal(map[string]string{
 		"config": string(updatedConfig),
 	})
+	if marshalErr != nil {
+		remoteWritePartialError(w, fmt.Sprintf("序列化 xray 请求失败: %v", marshalErr))
+		return
+	}
 	if _, err := h.forwardToRemoteServer(ctx, req.ServerID, http.MethodPost, "/api/child/xray/config", configPayload); err != nil {
-		remoteWriteError(w, http.StatusBadGateway, fmt.Sprintf("写入 xray 配置失败: %v", err))
+		remoteWritePartialError(w, fmt.Sprintf("nginx 已部署，但写入 xray 配置失败: %v", err))
 		return
 	}
 
-	// 5. 部署证书
-	if h.certHandler != nil {
-		cert, certErr := h.repo.GetCertificateByDomain(ctx, rootDomain, req.ServerID)
-		if certErr == nil && cert != nil && cert.CertPEM != "" && cert.KeyPEM != "" {
-			payload := WSCertDeployPayload{
-				Domain:   rootDomain,
-				CertPEM:  cert.CertPEM,
-				KeyPEM:   cert.KeyPEM,
-				CertPath: fmt.Sprintf("/usr/local/nginx/cert/%s.pem", certDeployFilename(cert.Domain)),
-				KeyPath:  fmt.Sprintf("/usr/local/nginx/cert/%s.key", certDeployFilename(cert.Domain)),
-				Reload:   "nginx",
-			}
-			h.certHandler.deployToRemoteServer(server, payload)
-		}
-	}
-
-	// 6. 重启 xray
+	// 6. 重启 xray，必须同步确认恢复流程最终成功。
 	if err := h.restartXrayWithRecovery(ctx, req.ServerID, "AddWebsite"); err != nil {
-		log.Printf("[AddWebsite] %v", err)
+		remoteWritePartialError(w, fmt.Sprintf("配置已写入，但 xray 重启/健康检查失败: %v", err))
+		return
 	}
 
 	remoteWriteJSON(w, http.StatusOK, map[string]any{
@@ -4505,22 +4781,22 @@ func (h *RemoteManageHandler) removeDomainsFromTunnelNginxRoute(config map[strin
 	return false
 }
 
-func (h *RemoteManageHandler) cleanupTunnelRouteForReality(ctx context.Context, serverID int64, inbound map[string]interface{}) {
+func (h *RemoteManageHandler) cleanupTunnelRouteForReality(ctx context.Context, serverID int64, inbound map[string]interface{}) error {
 	streamSettings, _ := inbound["streamSettings"].(map[string]interface{})
 	if streamSettings == nil {
-		return
+		return nil
 	}
 	security, _ := streamSettings["security"].(string)
 	if security != "reality" {
-		return
+		return nil
 	}
 	realitySettings, _ := streamSettings["realitySettings"].(map[string]interface{})
 	if realitySettings == nil {
-		return
+		return nil
 	}
 	serverNames, _ := realitySettings["serverNames"].([]interface{})
 	if len(serverNames) == 0 {
-		return
+		return nil
 	}
 
 	var domains []string
@@ -4530,7 +4806,7 @@ func (h *RemoteManageHandler) cleanupTunnelRouteForReality(ctx context.Context, 
 		}
 	}
 	if len(domains) == 0 {
-		return
+		return nil
 	}
 
 	inboundPort := 0
@@ -4541,17 +4817,17 @@ func (h *RemoteManageHandler) cleanupTunnelRouteForReality(ctx context.Context, 
 
 	xrayResp, err := h.forwardToRemoteServer(ctx, serverID, http.MethodGet, "/api/child/xray/config", nil)
 	if err != nil {
-		return
+		return fmt.Errorf("读取 xray 配置: %w", err)
 	}
 	var configResp struct {
 		Config string `json:"config"`
 	}
 	if err := json.Unmarshal(xrayResp, &configResp); err != nil {
-		return
+		return fmt.Errorf("解析 xray 响应: %w", err)
 	}
 	var xrayConfig map[string]any
 	if err := json.Unmarshal([]byte(configResp.Config), &xrayConfig); err != nil {
-		return
+		return fmt.Errorf("解析 xray 配置: %w", err)
 	}
 
 	configChanged := false
@@ -4570,19 +4846,25 @@ func (h *RemoteManageHandler) cleanupTunnelRouteForReality(ctx context.Context, 
 	}
 
 	if !configChanged {
-		return
+		return nil
 	}
 
-	updatedConfig, _ := json.MarshalIndent(xrayConfig, "", "    ")
-	configPayload, _ := json.Marshal(map[string]string{"config": string(updatedConfig)})
+	updatedConfig, err := json.MarshalIndent(xrayConfig, "", "    ")
+	if err != nil {
+		return fmt.Errorf("序列化 xray 配置: %w", err)
+	}
+	configPayload, err := json.Marshal(map[string]string{"config": string(updatedConfig)})
+	if err != nil {
+		return fmt.Errorf("序列化 xray 请求: %w", err)
+	}
 	if _, err := h.forwardToRemoteServer(ctx, serverID, http.MethodPost, "/api/child/xray/config", configPayload); err != nil {
-		log.Printf("[HandleInbounds] Failed to update xray config for reality cleanup: %v", err)
-		return
+		return fmt.Errorf("写入 Reality 路由配置: %w", err)
 	}
 	if err := h.restartXrayWithRecovery(ctx, serverID, "RealityRouteUpdate"); err != nil {
-		log.Printf("[HandleInbounds] %v", err)
+		return err
 	}
 	log.Printf("[HandleInbounds] Reality cleanup done on server %d: domains=%v", serverID, domains)
+	return nil
 }
 
 // isFirstRealityInbound 检查当前配置中是否已有其他 reality 入站（排除 currentTag）
@@ -4631,33 +4913,51 @@ func (h *RemoteManageHandler) updateTunnelInPortInConfig(xrayConfig map[string]a
 	return false
 }
 
-// getRealityServerNames 获取指定 inbound 的 reality serverNames（删除前调用）。
-func (h *RemoteManageHandler) getRealityServerNames(ctx context.Context, serverID int64, tag string) []string {
+// getInboundRemovalSyncState 在删除前一次读取目标 inbound，同时保存 Reality 路由恢复
+// 所需的 serverNames 以及 WSS nginx 清理标志。该读取失败时必须在主删除前终止，
+// 否则删除成功后已无法可靠重建后置状态。
+func (h *RemoteManageHandler) getInboundRemovalSyncState(ctx context.Context, serverID int64, tag string) ([]string, bool, error) {
 	resp, err := h.forwardToRemoteServer(ctx, serverID, http.MethodGet, "/api/child/inbounds", nil)
 	if err != nil {
-		return nil
+		return nil, false, err
 	}
 	var inboundsResp struct {
+		Success  *bool                    `json:"success"`
 		Inbounds []map[string]interface{} `json:"inbounds"`
+		Error    string                   `json:"error"`
+		Message  string                   `json:"message"`
 	}
-	if json.Unmarshal(resp, &inboundsResp) != nil {
-		return nil
+	if err := json.Unmarshal(resp, &inboundsResp); err != nil {
+		return nil, false, err
+	}
+	if inboundsResp.Success != nil && !*inboundsResp.Success {
+		message := strings.TrimSpace(inboundsResp.Error)
+		if message == "" {
+			message = strings.TrimSpace(inboundsResp.Message)
+		}
+		if message == "" {
+			message = "Agent rejected inbounds query"
+		}
+		return nil, false, errors.New(message)
 	}
 	for _, inb := range inboundsResp.Inbounds {
 		inbTag, _ := inb["tag"].(string)
 		if inbTag != tag {
 			continue
 		}
+		protocol, _ := inb["protocol"].(string)
 		ss, _ := inb["streamSettings"].(map[string]interface{})
 		if ss == nil {
-			return nil
+			return nil, false, nil
 		}
+		network, _ := ss["network"].(string)
+		wasWSS := strings.EqualFold(protocol, "vless") && strings.EqualFold(network, "ws")
 		if sec, _ := ss["security"].(string); sec != "reality" {
-			return nil
+			return nil, wasWSS, nil
 		}
 		rs, _ := ss["realitySettings"].(map[string]interface{})
 		if rs == nil {
-			return nil
+			return nil, wasWSS, nil
 		}
 		sns, _ := rs["serverNames"].([]interface{})
 		var domains []string
@@ -4666,42 +4966,48 @@ func (h *RemoteManageHandler) getRealityServerNames(ctx context.Context, serverI
 				domains = append(domains, s)
 			}
 		}
-		return domains
+		return domains, wasWSS, nil
 	}
-	return nil
+	return nil, false, nil
 }
 
 // restoreTunnelRouteForReality 删除 reality 入站后，将其 serverNames 恢复到 tunnel-in→nginx 路由。
-func (h *RemoteManageHandler) restoreTunnelRouteForReality(ctx context.Context, serverID int64, domains []string) {
+func (h *RemoteManageHandler) restoreTunnelRouteForReality(ctx context.Context, serverID int64, domains []string) error {
 	xrayResp, err := h.forwardToRemoteServer(ctx, serverID, http.MethodGet, "/api/child/xray/config", nil)
 	if err != nil {
-		return
+		return fmt.Errorf("读取 xray 配置: %w", err)
 	}
 	var configResp struct {
 		Config string `json:"config"`
 	}
-	if json.Unmarshal(xrayResp, &configResp) != nil {
-		return
+	if err := json.Unmarshal(xrayResp, &configResp); err != nil {
+		return fmt.Errorf("解析 xray 响应: %w", err)
 	}
 	var xrayConfig map[string]any
-	if json.Unmarshal([]byte(configResp.Config), &xrayConfig) != nil {
-		return
+	if err := json.Unmarshal([]byte(configResp.Config), &xrayConfig); err != nil {
+		return fmt.Errorf("解析 xray 配置: %w", err)
 	}
 
 	for _, domain := range domains {
 		h.addWebsiteTunnelConfig(xrayConfig, domain)
 	}
 
-	updatedConfig, _ := json.MarshalIndent(xrayConfig, "", "    ")
-	configPayload, _ := json.Marshal(map[string]string{"config": string(updatedConfig)})
+	updatedConfig, err := json.MarshalIndent(xrayConfig, "", "    ")
+	if err != nil {
+		return fmt.Errorf("序列化 xray 配置: %w", err)
+	}
+	configPayload, err := json.Marshal(map[string]string{"config": string(updatedConfig)})
+	if err != nil {
+		return fmt.Errorf("序列化 xray 请求: %w", err)
+	}
 	if _, err := h.forwardToRemoteServer(ctx, serverID, http.MethodPost, "/api/child/xray/config", configPayload); err != nil {
-		log.Printf("[HandleInbounds] Failed to restore domains %v to tunnel route: %v", domains, err)
-		return
+		return fmt.Errorf("恢复域名 %v 到 tunnel 路由: %w", domains, err)
 	}
 	if err := h.restartXrayWithRecovery(ctx, serverID, "RealityRouteRestore"); err != nil {
-		log.Printf("[HandleInbounds] %v", err)
+		return err
 	}
 	log.Printf("[HandleInbounds] Restored reality serverNames %v to tunnel-in→nginx route on server %d", domains, serverID)
+	return nil
 }
 
 func (h *RemoteManageHandler) addWebsiteFallbackConfig(config map[string]any, domain string) {

@@ -427,6 +427,13 @@ func main() {
 	mux.Handle("/api/remote/token/refresh", http.HandlerFunc(xrayServerHandler.RefreshRemoteToken))
 	mux.Handle("/api/remote/install.sh", http.HandlerFunc(xrayServerHandler.GetRemoteInstallScript))
 	mux.Handle("/api/remote/expiry-guard", http.HandlerFunc(xrayServerHandler.GetExpiryGuardAsset))
+	mux.Handle("/api/remote/install-begin", http.HandlerFunc(xrayServerHandler.BeginRemoteInstallation))
+	mux.Handle("/api/remote/install-renew", http.HandlerFunc(xrayServerHandler.RenewRemoteInstallation))
+	mux.Handle("/api/remote/install-quiesce", http.HandlerFunc(xrayServerHandler.QuiesceRemoteInstallation))
+	mux.Handle("/api/remote/install-abort", http.HandlerFunc(xrayServerHandler.AbortRemoteInstallation))
+	mux.Handle("/api/remote/management-ready", http.HandlerFunc(xrayServerHandler.VerifyRemoteManagementPorts))
+	mux.Handle("/api/remote/install-prepare", http.HandlerFunc(xrayServerHandler.PrepareRemoteInstallation))
+	mux.Handle("/api/remote/install-finalize", http.HandlerFunc(xrayServerHandler.FinalizeRemoteInstallation))
 
 	// 流量采集与统计
 	trafficApiHandler := handler.NewTrafficHandler(repo, trafficCollector)

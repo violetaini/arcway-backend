@@ -295,6 +295,16 @@ func (h *ManagedNodesHandler) reconcileSourceLocked(ctx context.Context, source 
 	if h.remoteManage == nil {
 		return errors.New("remote manager is not available")
 	}
+	return h.repo.WithRemoteServerMutationLease(ctx, source.ServerID, func(leasedCtx context.Context) error {
+		return h.reconcileSourceMutationLocked(leasedCtx, source)
+	})
+}
+
+// reconcileSourceMutationLocked keeps the limiter replacement, expiry guard,
+// and client add/remove in one server mutation transaction. Nested remote
+// helpers reuse the lease through ctx, so an installation Begin cannot split
+// the policy update from the credential mutation.
+func (h *ManagedNodesHandler) reconcileSourceMutationLocked(ctx context.Context, source storage.UserInboundAccessSource) error {
 	now := time.Now().UTC()
 	if source.DesiredState == storage.ManagedDesiredActive && source.ExpiresAt != nil && !now.Before(*source.ExpiresAt) {
 		updated, err := h.repo.SetUserInboundAccessSourceState(ctx, source.ID, source.Generation,
@@ -1220,10 +1230,22 @@ func (h *ManagedNodesHandler) HandleAdminManagedNodeLimits(w http.ResponseWriter
 		writeManagedError(w, err)
 		return
 	}
-	if offer, offerErr := h.repo.GetSelfServiceNodeOffer(r.Context(), updated.OfferID); offerErr == nil && h.limiter != nil {
-		h.limiter.PushToServer(r.Context(), offer.ServerID)
+	status := http.StatusOK
+	pendingError := ""
+	if updated.AccessSourceID != nil {
+		source, sourceErr := h.repo.GetUserInboundAccessSource(r.Context(), *updated.AccessSourceID)
+		if sourceErr != nil {
+			status = http.StatusAccepted
+			pendingError = sourceErr.Error()
+		} else if reconcileErr := h.reconcileSource(r.Context(), *source); reconcileErr != nil {
+			status = http.StatusAccepted
+			pendingError = reconcileErr.Error()
+		}
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "selection": updated})
+	writeJSON(w, status, map[string]interface{}{
+		"success": true, "selection": updated, "pending": status == http.StatusAccepted,
+		"pending_error": pendingError,
+	})
 }
 
 func (h *ManagedNodesHandler) HandleAdminManagedNodeRetry(w http.ResponseWriter, r *http.Request) {

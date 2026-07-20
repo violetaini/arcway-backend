@@ -47,10 +47,16 @@ docker compose up -d
 Release installation:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/violetaini/arcway-backend/main/install.sh | sudo bash
+(set -eu; installer="$(mktemp)"; trap 'rm -f "$installer"' EXIT; curl -fsSL https://raw.githubusercontent.com/violetaini/arcway-backend/main/install.sh -o "$installer"; sudo bash "$installer")
 ```
 
 Installation and online updates use the public GitHub Release assets and verify their published SHA-256 digests before replacing binaries.
+
+On a directly addressed public host, Arcway detects the panel's public IPv4/IPv6 addresses automatically. If the panel is behind NAT or its public hostname uses a CDN, set `ARCWAY_PANEL_IPS` to the space-separated egress addresses that remote servers actually see before installation or in the service environment. Remote management ports are restricted to these addresses.
+
+Before running a generated node command, install `curl` and a working `nftables` stack. External Xray mode requires an existing, running Xray service. Port takeover mode likewise requires an existing, running Nginx installation with a valid configuration. The generated installer deliberately does not add or remove operating-system packages.
+
+Set the panel's `master_url` to an HTTPS origin that nodes can reach directly. The post-install readiness callback is bound to the node's observed source address, so a Cloudflare-proxied hostname needs trusted Cloudflare `real_ip` configuration at Nginx; the simpler deployment is a separate DNS-only node-control hostname. Do not expose that origin without TLS.
 
 ## Deployment
 

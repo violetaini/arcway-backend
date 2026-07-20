@@ -538,14 +538,11 @@ func (h *PackageUpdateHandler) syncInboundUsersAfterNodeChange(ctx context.Conte
 				if hasPackageAccess {
 					return
 				}
-				retained, removeErr := removePackageUserFromInbound(ctx, h.remoteManage, *cfg)
+				_, removeErr := removePackageUserInboundConfig(ctx, h.remoteManage, h.repo, *cfg)
 				if removeErr != nil && !isInboundNotFoundErr(removeErr) {
 					log.Printf("[PackageUpdate] Failed to remove user %s from inbound %s on server %d: %v",
 						user.Username, cfg.InboundTag, cfg.ServerID, removeErr)
 					return
-				}
-				if !retained {
-					_ = h.repo.DeleteUserInboundConfig(ctx, user.Username, server.ID, node.InboundTag)
 				}
 			}(user, nodeID)
 		}
@@ -610,9 +607,11 @@ func NewPackageDeleteHandler(repo *storage.TrafficRepository, remoteManage *Remo
 }
 
 // unbindUserPackage 解除单个用户的套餐绑定:从入站移除凭据、删本地入站配置、推送 limiter、
-// 清空 package_id,并删除该用户残留的套餐订阅(历史 auto-gen)。best-effort,只记日志。
-func unbindUserPackage(ctx context.Context, repo *storage.TrafficRepository, remoteManage *RemoteManageHandler, pusher *LimiterConfigPusher, username string) {
+// 清空 package_id,并删除该用户残留的套餐订阅(历史 auto-gen)。远端失败时保留 package_id
+// 供重试，并把部分失败明确返回给调用方。
+func unbindUserPackage(ctx context.Context, repo *storage.TrafficRepository, remoteManage *RemoteManageHandler, pusher *LimiterConfigPusher, username string) error {
 	var mu sync.Mutex
+	var mutationErrs []error
 	// 只 routed 路径(改 routing rules)需要重启;普通 inbound remove-client 由 agent 热更新。
 	restartNeeded := map[int64]bool{}
 
@@ -621,27 +620,28 @@ func unbindUserPackage(ctx context.Context, repo *storage.TrafficRepository, rem
 
 	configs, err := repo.GetUserInboundConfigs(ctx, username)
 	if err != nil {
-		log.Printf("[PackageUnbind] 获取用户 %s 入站配置失败: %v", username, err)
+		return fmt.Errorf("获取用户 %s 入站配置失败: %w", username, err)
 	}
 	for _, cfg := range configs {
 		wg.Add(1)
 		go func(cfg storage.UserInboundConfig) {
 			defer wg.Done()
-			retained, removeErr := removePackageUserFromInbound(ctx, remoteManage, cfg)
+			_, removeErr := removePackageUserInboundConfig(ctx, remoteManage, repo, cfg)
 			if removeErr != nil && !isInboundNotFoundErr(removeErr) {
 				log.Printf("[PackageUnbind] 从入站 %s(server %d)移除用户 %s 失败: %v", cfg.InboundTag, cfg.ServerID, username, removeErr)
+				mu.Lock()
+				mutationErrs = append(mutationErrs, fmt.Errorf("server %d inbound %s: %w", cfg.ServerID, cfg.InboundTag, removeErr))
+				mu.Unlock()
 				return
-			}
-			if !retained {
-				if err := repo.DeleteUserInboundConfig(ctx, username, cfg.ServerID, cfg.InboundTag); err != nil {
-					log.Printf("[PackageUnbind] 删除用户 %s 入站 %s(server %d)配置失败: %v", username, cfg.InboundTag, cfg.ServerID, err)
-				}
 			}
 		}(cfg)
 	}
 
 	// 子账号路径:从所有 active routed 节点下线(凭据保留,续费可恢复)
-	subaccs, _ := repo.ListUserSubaccounts(ctx, username)
+	subaccs, subaccountErr := repo.ListUserSubaccounts(ctx, username)
+	if subaccountErr != nil {
+		mutationErrs = append(mutationErrs, fmt.Errorf("获取用户 %s 路由子账号失败: %w", username, subaccountErr))
+	}
 	for _, sa := range subaccs {
 		if !sa.IsActive {
 			continue
@@ -658,12 +658,18 @@ func unbindUserPackage(ctx context.Context, repo *storage.TrafficRepository, rem
 			}
 			if err := removeUserFromRoutedNode(ctx, remoteManage, repo, username, routedNodeID); err != nil {
 				log.Printf("[PackageUnbind] routed node %d 下线用户 %s 失败: %v", routedNodeID, username, err)
+				mu.Lock()
+				mutationErrs = append(mutationErrs, fmt.Errorf("routed node %d: %w", routedNodeID, err))
+				mu.Unlock()
 			}
 		}(sa.RoutedNodeID)
 	}
 	wg.Wait()
 
 	restartXrayInParallel(ctx, remoteManage, restartNeeded, "PackageUnbind")
+	if joined := errors.Join(mutationErrs...); joined != nil {
+		return joined
+	}
 	if pusher != nil {
 		go pusher.PushToAllServersForUser(context.Background(), username)
 	}
@@ -679,6 +685,7 @@ func unbindUserPackage(ctx context.Context, repo *storage.TrafficRepository, rem
 			_ = os.Remove(filepath.Join("subscribes", sf.Filename))
 		}
 	}
+	return nil
 }
 
 func (h *PackageDeleteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -726,7 +733,14 @@ func (h *PackageDeleteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	if users, err := h.repo.ListUsersWithPackage(ctx); err == nil {
 		for _, u := range users {
 			if u.PackageID == id {
-				unbindUserPackage(ctx, h.repo, h.remoteManage, h.pusher, u.Username)
+				if unbindErr := unbindUserPackage(ctx, h.repo, h.remoteManage, h.pusher, u.Username); unbindErr != nil {
+					status := http.StatusBadGateway
+					if errors.Is(unbindErr, storage.ErrRemoteInstallationActive) {
+						status = http.StatusConflict
+					}
+					http.Error(w, fmt.Sprintf("Package deletion partially failed while unbinding %s; package was retained for retry: %v", u.Username, unbindErr), status)
+					return
+				}
 				unbound++
 			}
 		}
@@ -785,32 +799,42 @@ func (h *PackageUnassignHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	// 先从入站中移除用户凭据
 	configs, err := h.repo.GetUserInboundConfigs(ctx, req.Username)
 	if err != nil {
-		log.Printf("[PackageUnassign] Failed to get user inbound configs: %v", err)
+		http.Error(w, fmt.Sprintf("Failed to get user inbound configs: %v", err), http.StatusInternalServerError)
+		return
 	}
+	var mutationErrs []error
 	for _, cfg := range configs {
-		retained, removeErr := removePackageUserFromInbound(ctx, h.remoteManage, cfg)
+		_, removeErr := removePackageUserInboundConfig(ctx, h.remoteManage, h.repo, cfg)
 		if removeErr != nil && !isInboundNotFoundErr(removeErr) {
 			log.Printf("[PackageUnassign] Failed to remove user %s from inbound %s on server %d: %v",
 				req.Username, cfg.InboundTag, cfg.ServerID, removeErr)
+			mutationErrs = append(mutationErrs, fmt.Errorf("server %d inbound %s: %w", cfg.ServerID, cfg.InboundTag, removeErr))
 			continue
-		}
-		if !retained {
-			if err := h.repo.DeleteUserInboundConfig(ctx, req.Username, cfg.ServerID, cfg.InboundTag); err != nil {
-				log.Printf("[PackageUnassign] Failed to delete user %s inbound %s on server %d config: %v",
-					req.Username, cfg.InboundTag, cfg.ServerID, err)
-			}
 		}
 	}
 
 	// 路由出站子账号:从 active 状态下线,凭据保留供续费恢复。
-	subaccs, _ := h.repo.ListUserSubaccounts(ctx, req.Username)
+	subaccs, err := h.repo.ListUserSubaccounts(ctx, req.Username)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to get routed subaccounts: %v", err), http.StatusInternalServerError)
+		return
+	}
 	for _, sa := range subaccs {
 		if !sa.IsActive {
 			continue
 		}
 		if err := removeUserFromRoutedNode(ctx, h.remoteManage, h.repo, req.Username, sa.RoutedNodeID); err != nil {
 			log.Printf("[PackageUnassign] routed node %d 下线用户 %s 失败: %v", sa.RoutedNodeID, req.Username, err)
+			mutationErrs = append(mutationErrs, fmt.Errorf("routed node %d: %w", sa.RoutedNodeID, err))
 		}
+	}
+	if joined := errors.Join(mutationErrs...); joined != nil {
+		status := http.StatusBadGateway
+		if errors.Is(joined, storage.ErrRemoteInstallationActive) {
+			status = http.StatusConflict
+		}
+		http.Error(w, fmt.Sprintf("Package removal partially failed; package assignment was retained for retry: %v", joined), status)
+		return
 	}
 
 	if h.pusher != nil {
@@ -1386,16 +1410,30 @@ func addUserToInbound(ctx context.Context, rm *RemoteManageHandler, repo *storag
 }
 
 func addUserToInboundWithExpiry(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, user storage.User, serverID int64, inboundTag string, notAfter *time.Time) error {
-	credential, err := prepareUserInboundCredential(ctx, rm, repo, user, serverID, inboundTag)
+	// SaveUserInboundConfig takes the user provisioning mutex itself. Hold only
+	// the server lease across snapshot, reservation, publish, and restart to
+	// avoid reversing the user->server order used by deletion/routed flows.
+	leasedCtx, release, err := repo.AcquireRemoteServerMutationLease(ctx, serverID)
 	if err != nil {
 		return err
 	}
-	return applyPreparedInboundCredentialForUser(ctx, rm, repo, user.Username, serverID, inboundTag, credential, notAfter)
+	defer release()
+
+	credential, err := prepareUserInboundCredential(leasedCtx, rm, repo, user, serverID, inboundTag)
+	if err != nil {
+		return err
+	}
+	return applyPreparedInboundCredential(leasedCtx, rm, serverID, inboundTag, credential, notAfter)
 }
 
 func applyPreparedInboundCredentialForUser(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, username string, serverID int64, inboundTag string, credential map[string]interface{}, notAfter *time.Time) error {
 	return repo.WithUserProvisioningLease(ctx, username, func() error {
-		return applyPreparedInboundCredential(ctx, rm, serverID, inboundTag, credential, notAfter)
+		leasedCtx, release, err := repo.AcquireRemoteServerMutationLease(ctx, serverID)
+		if err != nil {
+			return err
+		}
+		defer release()
+		return applyPreparedInboundCredential(leasedCtx, rm, serverID, inboundTag, credential, notAfter)
 	})
 }
 
@@ -1571,6 +1609,54 @@ func removePackageUserFromInbound(ctx context.Context, rm *RemoteManageHandler, 
 		return true, nil
 	}
 	return false, removeUserFromInbound(ctx, rm, cfg)
+}
+
+// removePackageUserInboundConfig is the package unbind transaction for one
+// physical server. The remote remove/managed-deadline refresh, its required
+// restart, and the local credential-state deletion all happen under the same
+// user-then-server lease order. A running installation therefore fails before
+// the Agent or user_inbound_configs can be changed.
+func removePackageUserInboundConfig(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, cfg storage.UserInboundConfig) (bool, error) {
+	if rm == nil || repo == nil {
+		return false, errors.New("remote manager is not available")
+	}
+	retained := false
+	err := repo.WithUserProvisioningLease(ctx, cfg.Username, func() error {
+		leasedCtx, release, err := repo.AcquireRemoteServerMutationLease(ctx, cfg.ServerID)
+		if err != nil {
+			return err
+		}
+		defer release()
+
+		hasManagedAccess, notAfter, err := repo.HasEffectiveUserInboundAccess(
+			leasedCtx, cfg.Username, cfg.ServerID, cfg.InboundTag, 0, time.Now().UTC(),
+		)
+		if err != nil {
+			return fmt.Errorf("resolve managed access before package cleanup: %w", err)
+		}
+		if hasManagedAccess {
+			var credential map[string]interface{}
+			if err := json.Unmarshal([]byte(cfg.CredentialJSON), &credential); err != nil || credential == nil {
+				return fmt.Errorf("parse retained package credential: %v", err)
+			}
+			err = applyPreparedInboundCredential(leasedCtx, rm, cfg.ServerID, cfg.InboundTag, credential, notAfter)
+			if err != nil {
+				requeueManagedInboundAccess(leasedCtx, repo, cfg.Username, cfg.ServerID, cfg.InboundTag)
+				return fmt.Errorf("refresh managed credential deadline: %w", err)
+			}
+			retained = true
+			return nil
+		}
+
+		if err := removeUserFromInbound(leasedCtx, rm, cfg); err != nil && !isInboundNotFoundErr(err) {
+			return err
+		}
+		if err := repo.DeleteUserInboundConfig(leasedCtx, cfg.Username, cfg.ServerID, cfg.InboundTag); err != nil {
+			return fmt.Errorf("delete package inbound credential state: %w", err)
+		}
+		return nil
+	})
+	return retained, err
 }
 
 func requeueManagedInboundAccess(ctx context.Context, repo *storage.TrafficRepository, username string, serverID int64, inboundTag string) {

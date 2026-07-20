@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -81,7 +82,6 @@ func (h *TunnelChainHandler) create(w http.ResponseWriter, r *http.Request) {
 	n := len(req.ServerIDs)
 	servers := make([]*storage.RemoteServer, n)
 	hosts := make([]string, n)
-	used := make([]map[int]bool, n)
 	for i, sid := range req.ServerIDs {
 		s, err := h.repo.GetRemoteServer(ctx, sid)
 		if err != nil || s == nil {
@@ -94,7 +94,32 @@ func (h *TunnelChainHandler) create(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("服务器 %s 缺少可达地址(ip/domain)", s.Name))
 			return
 		}
-		used[i] = h.usedPorts(ctx, sid)
+	}
+
+	// Hold every involved server lease before the first Agent request. Sorting
+	// the unique IDs gives every multi-server operation the same lock order and
+	// prevents two reversed chains from deadlocking when an installer is queued.
+	leasedCtx, releaseLeases, err := h.acquireMutationLeases(ctx, req.ServerIDs)
+	if err != nil {
+		if errors.Is(err, storage.ErrRemoteInstallationActive) {
+			writeError(w, http.StatusConflict, err)
+		} else {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("获取服务器变更锁失败: %w", err))
+		}
+		return
+	}
+	defer releaseLeases()
+	ctx = leasedCtx
+
+	usedByServer := make(map[int64]map[int]bool, n)
+	used := make([]map[int]bool, n)
+	for i, sid := range req.ServerIDs {
+		ports, ok := usedByServer[sid]
+		if !ok {
+			ports = h.usedPorts(ctx, sid)
+			usedByServer[sid] = ports
+		}
+		used[i] = ports
 	}
 
 	// 端口分配:入口=指定/随机;中间跳沿用上一跳实际端口;出口跳沿用入口端口;冲突则随机空闲。
@@ -120,13 +145,22 @@ func (h *TunnelChainHandler) create(w http.ResponseWriter, r *http.Request) {
 		tag string
 	}
 	var done []created
-	rollback := func() {
-		for _, c := range done {
+	rollback := func() error {
+		var rollbackErrors []error
+		for i := len(done) - 1; i >= 0; i-- {
+			c := done[i]
 			body, _ := json.Marshal(map[string]any{"action": "remove", "tag": c.tag})
-			rctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-			_, _ = h.rm.ForwardToServer(rctx, c.sid, http.MethodPost, "/api/child/inbounds", body)
+			// Preserve the chained lease values even if the client disconnected.
+			// The rollback stays synchronous and all leases remain held until the
+			// Agent has acknowledged every attempted removal.
+			rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 8*time.Second)
+			_, err := h.rm.ForwardToServer(rctx, c.sid, http.MethodPost, "/api/child/inbounds", body)
 			cancel()
+			if err != nil {
+				rollbackErrors = append(rollbackErrors, fmt.Errorf("服务器 %d 删除 %s: %w", c.sid, c.tag, err))
+			}
 		}
+		return errors.Join(rollbackErrors...)
 	}
 
 	hops := make([]chainHopResult, n)
@@ -151,8 +185,11 @@ func (h *TunnelChainHandler) create(w http.ResponseWriter, r *http.Request) {
 		_, err := h.rm.ForwardToServer(hctx, req.ServerIDs[i], http.MethodPost, "/api/child/inbounds", body)
 		cancel()
 		if err != nil {
-			rollback()
-			writeError(w, http.StatusBadGateway, fmt.Errorf("第 %d 跳(%s)下发失败,已回滚: %v", i+1, servers[i].Name, err))
+			if rollbackErr := rollback(); rollbackErr != nil {
+				writeError(w, http.StatusBadGateway, fmt.Errorf("第 %d 跳(%s)下发失败: %v; 回滚未完整确认: %v", i+1, servers[i].Name, err, rollbackErr))
+			} else {
+				writeError(w, http.StatusBadGateway, fmt.Errorf("第 %d 跳(%s)下发失败,已确认回滚: %v", i+1, servers[i].Name, err))
+			}
 			return
 		}
 		done = append(done, created{sid: req.ServerIDs[i], tag: tag})
@@ -169,6 +206,36 @@ func (h *TunnelChainHandler) create(w http.ResponseWriter, r *http.Request) {
 		"entry_port": ports[0],
 		"hops":       hops,
 	})
+}
+
+func (h *TunnelChainHandler) acquireMutationLeases(ctx context.Context, serverIDs []int64) (context.Context, func(), error) {
+	uniqueIDs := make(map[int64]struct{}, len(serverIDs))
+	for _, serverID := range serverIDs {
+		uniqueIDs[serverID] = struct{}{}
+	}
+	orderedIDs := make([]int64, 0, len(uniqueIDs))
+	for serverID := range uniqueIDs {
+		orderedIDs = append(orderedIDs, serverID)
+	}
+	sort.Slice(orderedIDs, func(i, j int) bool { return orderedIDs[i] < orderedIDs[j] })
+
+	leasedCtx := ctx
+	releases := make([]func(), 0, len(orderedIDs))
+	releaseAll := func() {
+		for i := len(releases) - 1; i >= 0; i-- {
+			releases[i]()
+		}
+	}
+	for _, serverID := range orderedIDs {
+		nextCtx, release, err := h.repo.AcquireRemoteServerMutationLease(leasedCtx, serverID)
+		if err != nil {
+			releaseAll()
+			return nil, func() {}, err
+		}
+		leasedCtx = nextCtx
+		releases = append(releases, release)
+	}
+	return leasedCtx, releaseAll, nil
 }
 
 // usedPorts 拉该服务器 xray config,收集所有 inbound 已用的 port。失败返回空集(退化为随机不冲突判断弱一点,靠下发失败兜底)。
