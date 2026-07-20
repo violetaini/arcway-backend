@@ -913,6 +913,11 @@ func TestVerifyRemoteManagementPorts(t *testing.T) {
 		t.Fatalf("stored management address=%q port=%d", stored.IPAddress, stored.ListenPort)
 	}
 	handler := NewXrayServerHandler(repo, nil, nil)
+	wsHandler := NewRemoteWSHandler(repo, nil)
+	wsHandler.conns.Store(server.Token, &RemoteWSConnection{
+		ServerID: server.ID, Encrypted: true, Capabilities: AgentCapabilities{RPC: true},
+	})
+	handler.SetWSHandler(wsHandler)
 	const installNonce = "ready-installation-nonce"
 	if err := repo.BeginRemoteServerInstallation(context.Background(), server.ID, installNonce, time.Now().Add(time.Minute)); err != nil {
 		t.Fatal(err)
@@ -922,6 +927,11 @@ func TestVerifyRemoteManagementPorts(t *testing.T) {
 	request.Header.Set("Authorization", "Bearer ready-token")
 	request.Header.Set(remoteInstallationNonceHeader, installNonce)
 	response := httptest.NewRecorder()
+	NewXrayServerHandler(repo, nil, nil).VerifyRemoteManagementPorts(response, request)
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("unencrypted status=%d body=%s", response.Code, response.Body.String())
+	}
+	response = httptest.NewRecorder()
 	handler.VerifyRemoteManagementPorts(response, request)
 	if response.Code != http.StatusOK {
 		t.Fatalf("ready status=%d body=%s", response.Code, response.Body.String())
@@ -936,7 +946,9 @@ func TestVerifyRemoteManagementPorts(t *testing.T) {
 		t.Fatal(err)
 	}
 	response = httptest.NewRecorder()
-	NewXrayServerHandler(repo, nil, nil).VerifyRemoteManagementPorts(response, request)
+	blockedHandler := NewXrayServerHandler(repo, nil, nil)
+	blockedHandler.SetWSHandler(wsHandler)
+	blockedHandler.VerifyRemoteManagementPorts(response, request)
 	if response.Code != http.StatusBadGateway {
 		t.Fatalf("blocked status=%d body=%s", response.Code, response.Body.String())
 	}
@@ -1062,27 +1074,64 @@ func TestRemoteInstallationBeginRejectsChangedPanelPolicyContext(t *testing.T) {
 	}
 }
 
-func TestRemoteManagementProbesRejectSemanticFailures(t *testing.T) {
-	client := &http.Client{Timeout: time.Second}
-	for _, status := range []int{http.StatusOK, http.StatusForbidden, http.StatusInternalServerError} {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.WriteHeader(status)
-		}))
-		port := server.Listener.Addr().(*net.TCPAddr).Port
-		err := probeRemoteAgent(context.Background(), client, "127.0.0.1", port)
-		server.Close()
-		if err == nil {
-			t.Fatalf("Agent probe accepted HTTP %d", status)
-		}
+func TestRemoteManagementAgentProbeRequiresTCPReachability(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
 	}
-	authChallenge := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-	}))
-	if err := probeRemoteAgent(context.Background(), client, "127.0.0.1", authChallenge.Listener.Addr().(*net.TCPAddr).Port); err != nil {
-		t.Fatalf("Agent probe rejected authentication challenge: %v", err)
+	address := listener.Addr().(*net.TCPAddr)
+	if err := probeRemoteAgent(context.Background(), address.IP.String(), address.Port); err != nil {
+		t.Fatalf("Agent probe rejected reachable TCP port: %v", err)
 	}
-	authChallenge.Close()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := probeRemoteAgent(context.Background(), address.IP.String(), address.Port); err == nil {
+		t.Fatal("Agent probe accepted a closed TCP port")
+	}
+}
 
+func TestAuthenticatedRemoteAgentConnectedRequiresEncryptedRPC(t *testing.T) {
+	handler := &XrayServerHandler{}
+	websocketServer := &storage.RemoteServer{ID: 7, ConnectionMode: storage.ConnectionModeWebSocket}
+	var nilHandler *XrayServerHandler
+	if nilHandler.authenticatedRemoteAgentConnected(&storage.RemoteServer{ID: 8, ConnectionMode: storage.ConnectionModePush}) {
+		t.Fatal("nil handler accepted a push-mode installation")
+	}
+	if handler.authenticatedRemoteAgentConnected(websocketServer) {
+		t.Fatal("handler accepted an Agent without a WebSocket handler")
+	}
+	if handler.authenticatedRemoteAgentConnected(&storage.RemoteServer{ID: 8, ConnectionMode: "unknown"}) {
+		t.Fatal("handler accepted an unsupported connection mode")
+	}
+	if !handler.authenticatedRemoteAgentConnected(&storage.RemoteServer{ID: 8, ConnectionMode: storage.ConnectionModePush}) {
+		t.Fatal("handler rejected an authenticated push-mode installation callback")
+	}
+	wsHandler := &RemoteWSHandler{}
+	handler.SetWSHandler(wsHandler)
+	for _, connection := range []*RemoteWSConnection{
+		{ServerID: 7, Capabilities: AgentCapabilities{RPC: true}},
+		{ServerID: 7, Encrypted: true},
+	} {
+		wsHandler.conns.Store("agent", connection)
+		if handler.authenticatedRemoteAgentConnected(websocketServer) {
+			t.Fatalf("handler accepted insecure Agent connection: %+v", connection)
+		}
+		wsHandler.conns.Delete("agent")
+	}
+	wsHandler.conns.Store("agent", &RemoteWSConnection{
+		ServerID: 7, Encrypted: true, Capabilities: AgentCapabilities{RPC: true},
+	})
+	if !handler.authenticatedRemoteAgentConnected(websocketServer) {
+		t.Fatal("handler rejected an encrypted RPC-capable Agent connection")
+	}
+	if handler.authenticatedRemoteAgentConnected(&storage.RemoteServer{ID: 9, ConnectionMode: storage.ConnectionModeWebSocket}) {
+		t.Fatal("handler accepted an encrypted connection for a different server")
+	}
+}
+
+func TestRemoteExpiryGuardProbeRejectsSemanticFailures(t *testing.T) {
+	client := &http.Client{Timeout: time.Second}
 	for _, body := range []string{
 		`{"client_expiry":false,"durable":true}`,
 		`{"client_expiry":true,"durable":false}`,
@@ -1100,7 +1149,7 @@ func TestRemoteManagementProbesRejectSemanticFailures(t *testing.T) {
 	}
 }
 
-func TestRemoteManagementProbesDoNotFollowRedirects(t *testing.T) {
+func TestRemoteExpiryGuardProbeDoesNotFollowRedirects(t *testing.T) {
 	var redirectedRequests atomic.Int32
 	redirectTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		redirectedRequests.Add(1)
@@ -1120,12 +1169,6 @@ func TestRemoteManagementProbesDoNotFollowRedirects(t *testing.T) {
 	client, transport := newRemoteManagementProbeClient()
 	t.Cleanup(transport.CloseIdleConnections)
 
-	if err := probeRemoteAgent(context.Background(), client, address.IP.String(), address.Port); err == nil {
-		t.Fatal("Agent probe accepted a redirect")
-	}
-	if got := redirectedRequests.Load(); got != 0 {
-		t.Fatalf("Agent probe followed redirect; target requests=%d", got)
-	}
 	if err := probeRemoteExpiryGuard(context.Background(), client, address.IP.String(), address.Port, "probe-secret"); err == nil {
 		t.Fatal("expiry guard probe accepted a redirect")
 	}

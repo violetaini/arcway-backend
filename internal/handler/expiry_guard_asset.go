@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -126,26 +127,27 @@ func remoteBearerToken(authorization string) (string, bool) {
 	return token, true
 }
 
-func probeRemoteAgent(ctx context.Context, client *http.Client, address string, port int) error {
-	target := "http://" + net.JoinHostPort(address, strconv.Itoa(port)) + "/api/child/system/info"
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+func probeRemoteAgent(ctx context.Context, address string, port int) error {
+	dialer := &net.Dialer{Timeout: 1500 * time.Millisecond}
+	connection, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(address, strconv.Itoa(port)))
 	if err != nil {
 		return err
 	}
-	request.Header.Set("User-Agent", version.AgentUserAgent)
-	response, err := client.Do(request)
-	if err != nil {
-		return err
+	return connection.Close()
+}
+
+func (h *XrayServerHandler) authenticatedRemoteAgentConnected(server *storage.RemoteServer) bool {
+	if h == nil || server == nil {
+		return false
 	}
-	defer response.Body.Close()
-	// Deliberately send no long-lived node token over the public plaintext
-	// management socket. A correctly configured Agent proves its identity by
-	// returning the known authentication challenge status; data-plane health is
-	// checked locally by the installer, and guard readiness is HMAC protected.
-	if response.StatusCode != http.StatusUnauthorized {
-		return fmt.Errorf("Agent authentication challenge returned HTTP %d", response.StatusCode)
+	if server.ConnectionMode == storage.ConnectionModePush {
+		return true
 	}
-	return nil
+	if server.ConnectionMode != storage.ConnectionModeWebSocket || h.wsHandler == nil {
+		return false
+	}
+	connection, connected := h.wsHandler.GetConnectionByServerID(server.ID)
+	return connected && connection.Encrypted && connection.Capabilities.RPC
 }
 
 func probeRemoteExpiryGuard(ctx context.Context, client *http.Client, address string, port int, secret string) error {
@@ -493,20 +495,30 @@ func (h *XrayServerHandler) VerifyRemoteManagementPorts(w http.ResponseWriter, r
 
 	client, transport := newRemoteManagementProbeClient()
 	defer transport.CloseIdleConnections()
-	if err := probeRemoteAgent(r.Context(), client, address, agentPort); err == nil {
-		if err := probeRemoteExpiryGuard(r.Context(), client, address, agentPort+managedExpiryGuardPortOffset, guardSecret); err == nil {
-			if err := h.repo.MarkRemoteServerInstallationReady(r.Context(), server.ID, nonce); err != nil {
-				w.WriteHeader(http.StatusConflict)
-				_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "installation transaction is no longer valid"})
-				return
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "address": address, "agent_port": agentPort, "guard_port": agentPort + managedExpiryGuardPortOffset})
-			return
-		}
+	// Agent v0.3.7 intentionally closes unauthenticated HTTP connections instead
+	// of returning a challenge. Prove fallback-port reachability with TCP, while
+	// the installer validates Agent/Xray locally and the adjacent guard provides
+	// an authenticated HMAC capability proof without exposing the Agent token.
+	var probeErr error
+	if !h.authenticatedRemoteAgentConnected(server) {
+		probeErr = errors.New("authenticated encrypted Agent WebSocket is unavailable")
+	} else if err := probeRemoteAgent(r.Context(), address, agentPort); err != nil {
+		probeErr = fmt.Errorf("Agent TCP probe: %w", err)
+	} else if err := probeRemoteExpiryGuard(r.Context(), client, address, agentPort+managedExpiryGuardPortOffset, guardSecret); err != nil {
+		probeErr = fmt.Errorf("expiry guard capability probe: %w", err)
 	}
-
-	w.WriteHeader(http.StatusBadGateway)
-	_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "panel cannot reach the node management ports"})
+	if probeErr != nil {
+		log.Printf("[Remote Install] Management readiness failed for server %d at %s:%d: %v", server.ID, address, agentPort, probeErr)
+		w.WriteHeader(http.StatusBadGateway)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "panel cannot reach the node management ports"})
+		return
+	}
+	if err := h.repo.MarkRemoteServerInstallationReady(r.Context(), server.ID, nonce); err != nil {
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "installation transaction is no longer valid"})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "address": address, "agent_port": agentPort, "guard_port": agentPort + managedExpiryGuardPortOffset})
 }
 
 func expiryGuardAssetDirectories() []string {
