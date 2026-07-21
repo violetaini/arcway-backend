@@ -1719,6 +1719,17 @@ func (h *nodesHandler) deleteRemoteInbound(ctx context.Context, serverName, inbo
 		return
 	}
 
+	// Serialize the pre-delete snapshot, delete and any dependent Reality/WSS
+	// repair with managed inbound creation on the same server. The snapshot is
+	// required because the Agent cannot classify the inbound after it is gone.
+	lock := wssServerLock(server.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	realityDomains, removedInboundWasWSS, stateErr := h.remoteManage.getInboundRemovalSyncState(ctx, server.ID, inboundTag)
+	if stateErr != nil {
+		log.Printf("[Nodes] Failed to snapshot remote inbound %s on server %s before deletion: %v", inboundTag, serverName, stateErr)
+	}
+
 	body, _ := json.Marshal(map[string]string{
 		"action": "remove",
 		"tag":    inboundTag,
@@ -1730,15 +1741,21 @@ func (h *nodesHandler) deleteRemoteInbound(ctx context.Context, serverName, inbo
 	}
 	log.Printf("[Nodes] Deleted remote inbound %s on server %s", inboundTag, serverName)
 
-	// 删的可能是 vless+ws,跟 HandleInbounds remove 路径保持一致 — 异步聚合重渲 nginx,
-	// 清掉对应 location;若 server 上已无任何 WSS 入站,SyncWSSNginx 内部会下发只含 default 404
-	// 的兜底 server 块,把残留 location 全冲掉。
-	serverID := server.ID
-	go func() {
-		if err := h.remoteManage.SyncWSSNginx(context.Background(), serverID); err != nil {
-			log.Printf("[Nodes] SyncWSSNginx after delete inbound %s on server=%d failed: %v", inboundTag, serverID, err)
+	if stateErr != nil {
+		// Do not guess after deletion. An unconditional WSS rewrite here can
+		// disturb unrelated nginx sites when the removed inbound was plain WS.
+		return
+	}
+	if len(realityDomains) > 0 {
+		if err := h.remoteManage.restoreTunnelRouteForReality(ctx, server.ID, realityDomains); err != nil {
+			log.Printf("[Nodes] Restore Reality route after delete inbound %s on server=%d failed: %v", inboundTag, server.ID, err)
 		}
-	}()
+	}
+	if removedInboundWasWSS {
+		if err := h.remoteManage.SyncWSSNginx(ctx, server.ID); err != nil {
+			log.Printf("[Nodes] SyncWSSNginx after delete inbound %s on server=%d failed: %v", inboundTag, server.ID, err)
+		}
+	}
 }
 
 func (h *nodesHandler) handleBatchRename(w http.ResponseWriter, r *http.Request) {

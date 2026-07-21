@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/ecdh"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,10 +16,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"time"
-
-	"encoding/base64"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -1997,6 +1997,89 @@ func validateInboundTLS(inboundReq map[string]interface{}) string {
 	return ""
 }
 
+// validateInboundRealityTarget keeps the server-side REALITY contract strict.
+// target is a camouflage TLS peer, not the address clients use to reach this
+// node. The current managed presets intentionally require a DNS name and keep
+// target aligned with one accepted SNI.
+func validateInboundRealityTarget(inboundReq map[string]interface{}, serverDomain string) string {
+	inbound, _ := inboundReq["inbound"].(map[string]interface{})
+	streamSettings, _ := inbound["streamSettings"].(map[string]interface{})
+	security, _ := streamSettings["security"].(string)
+	if !strings.EqualFold(strings.TrimSpace(security), "reality") {
+		return ""
+	}
+	realitySettings, _ := streamSettings["realitySettings"].(map[string]interface{})
+	target, _ := realitySettings["target"].(string)
+	if strings.TrimSpace(target) == "" {
+		// Xray still accepts the historical alias, but newly managed configs use target.
+		target, _ = realitySettings["dest"].(string)
+	}
+	if strings.Contains(target, "://") || strings.ContainsAny(target, "/?#") {
+		return "Reality 伪装目标必须是域名或域名:端口，不能包含协议、路径或参数"
+	}
+	targetDomain, targetErr := parseManagedRealityTarget(target)
+	if targetErr != nil {
+		return "Reality 必须配置有效的伪装目标域名，不能使用 IP 地址"
+	}
+	serverNames, _ := realitySettings["serverNames"].([]interface{})
+	if len(serverNames) == 0 {
+		return "Reality serverNames 至少需要一个目标证书覆盖的 SNI"
+	}
+	targetAccepted := false
+	for _, value := range serverNames {
+		serverName, _ := value.(string)
+		serverName = strings.ToLower(strings.TrimSpace(serverName))
+		if validManagedDNSName(serverName) && serverName == targetDomain {
+			targetAccepted = true
+			break
+		}
+	}
+	if !targetAccepted {
+		return "Reality 伪装目标域名必须同时出现在 serverNames 中"
+	}
+	if ownDomain := normalizeDomainCandidate(serverDomain); ownDomain != "" && ownDomain == targetDomain {
+		return "Reality 伪装目标不能使用当前节点自己的域名，否则接管端口后可能形成回环"
+	}
+	return ""
+}
+
+func parseManagedRealityTarget(target string) (string, error) {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return "", fmt.Errorf("empty target")
+	}
+	host, portText, err := net.SplitHostPort(target)
+	if err != nil {
+		return "", err
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return "", fmt.Errorf("invalid port")
+	}
+	host = strings.ToLower(strings.TrimSpace(host))
+	if net.ParseIP(host) != nil || !validManagedDNSName(host) {
+		return "", fmt.Errorf("invalid DNS name")
+	}
+	return host, nil
+}
+
+func validManagedDNSName(domain string) bool {
+	if len(domain) < 3 || len(domain) > 253 || !strings.Contains(domain, ".") || strings.HasSuffix(domain, ".") {
+		return false
+	}
+	for _, label := range strings.Split(domain, ".") {
+		if len(label) < 1 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, char := range label {
+			if (char < 'a' || char > 'z') && (char < '0' || char > '9') && char != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // resolveInboundCert 处理「添加 tls 入站时选了主控托管证书」(前端通过带外字段 cert_id 指定):
 // 同步把证书下发到该 agent 的 xray 证书目录,再把 tlsSettings.certificates 改写成 agent 上的真实路径,
 // 并在 serverName 为空时补成证书域名。返回改写后的 body(未触发则返回 nil);失败返回错误,由调用方透传给前端。
@@ -2025,25 +2108,49 @@ func (h *RemoteManageHandler) resolveInboundCert(ctx context.Context, serverID i
 	if err != nil || cert == nil {
 		return nil, fmt.Errorf("所选证书不存在(id=%d)", certID)
 	}
+	if cert.Status != storage.CertStatusValid {
+		return nil, fmt.Errorf("所选证书状态不是 valid")
+	}
+	if cert.RemoteServerID != 0 && cert.RemoteServerID != serverID {
+		return nil, fmt.Errorf("所选证书属于另一台服务器，不能跨节点下发")
+	}
+	now := time.Now()
+	if cert.ExpiryDate != nil && !cert.ExpiryDate.After(now) {
+		return nil, fmt.Errorf("所选证书已过期")
+	}
 	server, err := h.repo.GetRemoteServer(ctx, serverID)
 	if err != nil {
 		return nil, err
+	}
+	tlsSettings, _ := ss["tlsSettings"].(map[string]interface{})
+	if tlsSettings == nil {
+		tlsSettings = map[string]interface{}{}
+		ss["tlsSettings"] = tlsSettings
+	}
+	serverName, _ := tlsSettings["serverName"].(string)
+	serverName = strings.ToLower(strings.TrimSpace(serverName))
+	if serverName == "" {
+		candidates := append([]string{server.Domain, cert.Domain}, certificateDNSNames(cert.CertPEM)...)
+		for _, candidate := range candidates {
+			candidate = strings.ToLower(strings.TrimSpace(candidate))
+			if strings.HasPrefix(candidate, "*.") || !certificateCoversHostname(cert.CertPEM, cert.KeyPEM, candidate, now) {
+				continue
+			}
+			serverName = candidate
+			break
+		}
+	}
+	if serverName == "" || !certificateCoversHostname(cert.CertPEM, cert.KeyPEM, serverName, now) {
+		return nil, fmt.Errorf("所选证书不覆盖 TLS SNI %q，或证书与私钥不匹配", serverName)
 	}
 	certPath, keyPath, derr := h.certHandler.DeployCertToServerSync(ctx, server, cert)
 	if derr != nil {
 		return nil, fmt.Errorf("下发证书到服务器失败: %v", derr)
 	}
-	tls, _ := ss["tlsSettings"].(map[string]interface{})
-	if tls == nil {
-		tls = map[string]interface{}{}
-		ss["tlsSettings"] = tls
-	}
-	tls["certificates"] = []interface{}{
+	tlsSettings["certificates"] = []interface{}{
 		map[string]interface{}{"certificateFile": certPath, "keyFile": keyPath},
 	}
-	if sn, _ := tls["serverName"].(string); sn == "" {
-		tls["serverName"] = cert.Domain
-	}
+	tlsSettings["serverName"] = serverName
 	delete(inbound, "cert_id") // 剥离带外字段,xray 不认识它
 	return json.Marshal(inboundReq)
 }
@@ -2137,11 +2244,15 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	// VLESS + WSS 入站添加:强制 listen=127.0.0.1、自动分配本地端口、自动随机 path、security=none
+	// VLESS/VMess/Trojan + WSS 入站添加:强制 listen=127.0.0.1、自动分配本地端口、自动随机 path、security=none
 	// (TLS 由 nginx 在 443 处理,xray 只接 ws upgrade)。后续 forward 成功再调 syncWSSNginx 聚合渲染。
 	// per-server 锁:防止并发添加抢到同一端口。
 	if r.Method == http.MethodPost && inboundReq != nil {
-		if action, _ := inboundReq["action"].(string); (action == "" || strings.ToLower(action) == "add") && isVlessWSInboundReq(inboundReq) {
+		if action, _ := inboundReq["action"].(string); (action == "" || strings.ToLower(action) == "add") && isWSSInboundReq(inboundReq) {
+			if _, prerequisiteErr := h.resolveWSSCertificateContext(operationCtx, id); prerequisiteErr != nil {
+				remoteWriteError(w, http.StatusConflict, "WSS 前置检查失败: "+prerequisiteErr.Error())
+				return
+			}
 			lock := wssServerLock(id)
 			lock.Lock()
 			defer lock.Unlock()
@@ -2160,6 +2271,14 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 	// 这里在 forward 前明确拒绝并给出用户能看懂的提示。
 	if r.Method == http.MethodPost && inboundReq != nil {
 		if action, _ := inboundReq["action"].(string); action == "" || strings.ToLower(action) == "add" {
+			serverDomain := ""
+			if server, serverErr := h.repo.GetRemoteServer(operationCtx, id); serverErr == nil && server != nil {
+				serverDomain = server.Domain
+			}
+			if msg := validateInboundRealityTarget(inboundReq, serverDomain); msg != "" {
+				remoteWriteError(w, http.StatusBadRequest, msg)
+				return
+			}
 			if msg := validateInboundTLS(inboundReq); msg != "" {
 				remoteWriteError(w, http.StatusBadRequest, msg)
 				return
@@ -2224,6 +2343,7 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 			if success, ok := resp["success"].(bool); ok && success {
 				var postSyncErrors []string
 				if actionLower == "" || actionLower == "add" {
+					var pendingWSSEvent *event.InboundEvent
 					// 添加入站：先处理 reality 相关配置（更新 tunnel-in port + 清理域名路由）
 					if inbound, ok := inboundReq["inbound"].(map[string]interface{}); ok {
 						tag, _ := inbound["tag"].(string)
@@ -2248,7 +2368,7 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 						for k, v := range inbound {
 							inboundAny[k] = v
 						}
-						event.GetBus().Publish(event.InboundEvent{
+						inboundEvent := event.InboundEvent{
 							Type:          event.EventInboundAdded,
 							ServerID:      id,
 							Tag:           tag,
@@ -2260,12 +2380,26 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 							IPVersion:     ipVersion,
 							RelayServer:   relayServer,
 							RelayPort:     relayPort,
-						})
+						}
+						if isWSSInboundReq(inboundReq) {
+							pendingWSSEvent = &inboundEvent
+						} else {
+							event.GetBus().Publish(inboundEvent)
+						}
 					}
-					// VLESS+WS 入站添加成功 → 在同一租约内聚合渲染并等待 Agent ACK。
-					if isVlessWSInboundReq(inboundReq) {
+					// 受管 WS 入站添加成功 → 在同一租约内聚合渲染并等待 Agent ACK。
+					if isWSSInboundReq(inboundReq) {
 						if err := h.SyncWSSNginx(operationCtx, id); err != nil {
-							postSyncErrors = append(postSyncErrors, "WSS nginx 同步失败: "+err.Error())
+							inbound, _ := inboundReq["inbound"].(map[string]interface{})
+							tag, _ := inbound["tag"].(string)
+							rollbackErr := h.rollbackWSSInboundAdd(operationCtx, id, tag)
+							if rollbackErr == nil {
+								remoteWriteError(w, http.StatusBadGateway, "WSS nginx 同步失败，刚创建的入站已自动回滚: "+err.Error())
+								return
+							}
+							postSyncErrors = append(postSyncErrors, "WSS nginx 同步失败: "+err.Error()+"；自动回滚失败: "+rollbackErr.Error())
+						} else if pendingWSSEvent != nil {
+							event.GetBus().Publish(*pendingWSSEvent)
 						}
 					}
 				} else if actionLower == "remove" {
@@ -2300,6 +2434,40 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write(result)
+}
+
+func (h *RemoteManageHandler) rollbackWSSInboundAdd(ctx context.Context, serverID int64, tag string) error {
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		return errors.New("入站 Tag 为空")
+	}
+	body, err := json.Marshal(map[string]interface{}{"action": "remove", "tag": tag})
+	if err != nil {
+		return err
+	}
+	result, err := h.forwardToRemoteServer(ctx, serverID, http.MethodPost, "/api/child/inbounds", body)
+	if err != nil {
+		return err
+	}
+	var response struct {
+		Success *bool  `json:"success"`
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(result, &response); err != nil {
+		return fmt.Errorf("解析 Agent 回滚响应失败: %w", err)
+	}
+	if response.Success != nil && *response.Success {
+		return nil
+	}
+	message := strings.TrimSpace(response.Error)
+	if message == "" {
+		message = strings.TrimSpace(response.Message)
+	}
+	if message == "" {
+		message = "Agent 未确认入站删除"
+	}
+	return errors.New(message)
 }
 
 // HandleCreateManagedNode creates a remote inbound and only reports success when
@@ -3986,7 +4154,9 @@ func (h *RemoteManageHandler) inboundToClashProxy(inbound map[string]interface{}
 			proxy["encryption"] = enc
 		}
 		// 添加流设置
-		h.addStreamSettings(proxy, streamSettings)
+		if err := h.addStreamSettings(proxy, streamSettings); err != nil {
+			return nil, err
+		}
 
 	case "vmess":
 		proxy["type"] = "vmess"
@@ -3998,8 +4168,13 @@ func (h *RemoteManageHandler) inboundToClashProxy(inbound map[string]interface{}
 			proxy["alterId"] = int(aid)
 		}
 		proxy["cipher"] = "auto"
+		if cipher, ok := client["security"].(string); ok && strings.TrimSpace(cipher) != "" {
+			proxy["cipher"] = strings.ToLower(strings.TrimSpace(cipher))
+		}
 		// 添加流设置
-		h.addStreamSettings(proxy, streamSettings)
+		if err := h.addStreamSettings(proxy, streamSettings); err != nil {
+			return nil, err
+		}
 
 	case "trojan":
 		proxy["type"] = "trojan"
@@ -4011,7 +4186,9 @@ func (h *RemoteManageHandler) inboundToClashProxy(inbound map[string]interface{}
 			proxy["flow"] = flow
 		}
 		// 添加流设置
-		h.addStreamSettings(proxy, streamSettings)
+		if err := h.addStreamSettings(proxy, streamSettings); err != nil {
+			return nil, err
+		}
 		// mihomo trojan 使用 sni 而非 servername
 		if sn, ok := proxy["servername"]; ok {
 			proxy["sni"] = sn
@@ -4072,7 +4249,9 @@ func (h *RemoteManageHandler) inboundToClashProxy(inbound map[string]interface{}
 		if password, ok := client["password"].(string); ok {
 			proxy["password"] = password
 		}
-		h.addStreamSettings(proxy, streamSettings)
+		if err := h.addStreamSettings(proxy, streamSettings); err != nil {
+			return nil, err
+		}
 		if sn, ok := proxy["servername"]; ok {
 			proxy["sni"] = sn
 			delete(proxy, "servername")
@@ -4135,9 +4314,9 @@ func canonicalManagedProtocol(protocol string) string {
 }
 
 // 将流设置添加到 Clash 代理配置
-func (h *RemoteManageHandler) addStreamSettings(proxy map[string]interface{}, streamSettings map[string]interface{}) {
+func (h *RemoteManageHandler) addStreamSettings(proxy map[string]interface{}, streamSettings map[string]interface{}) error {
 	if streamSettings == nil {
-		return
+		return nil
 	}
 
 	network, _ := streamSettings["network"].(string)
@@ -4187,44 +4366,52 @@ func (h *RemoteManageHandler) addStreamSettings(proxy map[string]interface{}, st
 	if security == "reality" {
 		proxy["tls"] = true
 		proxy["skip-cert-verify"] = true
-		if realitySettings, ok := streamSettings["realitySettings"].(map[string]interface{}); ok {
-			realityOpts := map[string]interface{}{}
-			if publicKey, ok := realitySettings["publicKey"].(string); ok {
-				realityOpts["public-key"] = toURLSafeBase64(publicKey)
+		realitySettings, ok := streamSettings["realitySettings"].(map[string]interface{})
+		if !ok {
+			return fmt.Errorf("Reality 入站缺少 realitySettings")
+		}
+		realityOpts := map[string]interface{}{}
+		publicKey, err := managedRealityPublicKey(realitySettings)
+		if err != nil {
+			return err
+		}
+		realityOpts["public-key"] = publicKey
+		// ShortIds 是 Xray 配置中的一个数组
+		if shortIds, ok := realitySettings["shortIds"].([]interface{}); ok && len(shortIds) > 0 {
+			if sid, ok := shortIds[0].(string); ok {
+				realityOpts["short-id"] = sid
 			}
-			// ShortIds 是 Xray 配置中的一个数组
-			if shortIds, ok := realitySettings["shortIds"].([]interface{}); ok && len(shortIds) > 0 {
-				if sid, ok := shortIds[0].(string); ok {
-					realityOpts["short-id"] = sid
-				}
+		}
+		// 后备：单个 ShortId 字段
+		if _, exists := realityOpts["short-id"]; !exists {
+			if shortId, ok := realitySettings["shortId"].(string); ok {
+				realityOpts["short-id"] = shortId
 			}
-			// 后备：单个 ShortId 字段
-			if _, exists := realityOpts["short-id"]; !exists {
-				if shortId, ok := realitySettings["shortId"].(string); ok {
-					realityOpts["short-id"] = shortId
-				}
+		}
+		if spiderX, ok := realitySettings["spiderX"].(string); ok {
+			realityOpts["spider-x"] = spiderX
+		}
+		if len(realityOpts) > 0 {
+			proxy["reality-opts"] = realityOpts
+		}
+		// serverNames 是 Xray 配置中的一个数组
+		if serverNames, ok := realitySettings["serverNames"].([]interface{}); ok && len(serverNames) > 0 {
+			if sn, ok := serverNames[0].(string); ok && sn != "" {
+				proxy["servername"] = strings.ToLower(strings.TrimSpace(sn))
 			}
-			if spiderX, ok := realitySettings["spiderX"].(string); ok {
-				realityOpts["spider-x"] = spiderX
+		}
+		// 后备：单个 serverName 字段
+		if _, exists := proxy["servername"]; !exists {
+			if sni, ok := realitySettings["serverName"].(string); ok && sni != "" {
+				proxy["servername"] = strings.ToLower(strings.TrimSpace(sni))
 			}
-			if len(realityOpts) > 0 {
-				proxy["reality-opts"] = realityOpts
-			}
-			// serverNames 是 Xray 配置中的一个数组
-			if serverNames, ok := realitySettings["serverNames"].([]interface{}); ok && len(serverNames) > 0 {
-				if sn, ok := serverNames[0].(string); ok && sn != "" {
-					proxy["servername"] = sn
-				}
-			}
-			// 后备：单个 serverName 字段
-			if _, exists := proxy["servername"]; !exists {
-				if sni, ok := realitySettings["serverName"].(string); ok && sni != "" {
-					proxy["servername"] = sni
-				}
-			}
-			if fp, ok := realitySettings["fingerprint"].(string); ok && fp != "" {
-				proxy["client-fingerprint"] = fp
-			}
+		}
+		sni, _ := proxy["servername"].(string)
+		if net.ParseIP(sni) != nil || !validManagedDNSName(sni) {
+			return fmt.Errorf("Reality 入站缺少有效的 serverNames / SNI 域名")
+		}
+		if fp, ok := realitySettings["fingerprint"].(string); ok && fp != "" {
+			proxy["client-fingerprint"] = fp
 		}
 		// 如果未设置，则为 REALITY 默认客户端指纹
 		if _, exists := proxy["client-fingerprint"]; !exists {
@@ -4239,8 +4426,23 @@ func (h *RemoteManageHandler) addStreamSettings(proxy map[string]interface{}, st
 			if path, ok := wsSettings["path"].(string); ok {
 				wsOpts["path"] = path
 			}
+			var wsHeaders map[string]interface{}
 			if headers, ok := wsSettings["headers"].(map[string]interface{}); ok {
-				wsOpts["headers"] = headers
+				wsHeaders = make(map[string]interface{}, len(headers)+1)
+				for key, value := range headers {
+					wsHeaders[key] = value
+				}
+			}
+			// Xray's current WebSocket schema uses wsSettings.host. Mihomo still
+			// represents the HTTP Host header under ws-opts.headers.Host.
+			if host, ok := wsSettings["host"].(string); ok && strings.TrimSpace(host) != "" {
+				if wsHeaders == nil {
+					wsHeaders = map[string]interface{}{}
+				}
+				wsHeaders["Host"] = strings.TrimSpace(host)
+			}
+			if len(wsHeaders) > 0 {
+				wsOpts["headers"] = wsHeaders
 			}
 			if len(wsOpts) > 0 {
 				proxy["ws-opts"] = wsOpts
@@ -4292,6 +4494,39 @@ func (h *RemoteManageHandler) addStreamSettings(proxy map[string]interface{}, st
 			}
 		}
 	}
+	return nil
+}
+
+func decodeManagedRealityKey(value string) ([]byte, error) {
+	value = strings.TrimSpace(value)
+	encodings := []*base64.Encoding{base64.RawURLEncoding, base64.URLEncoding, base64.RawStdEncoding, base64.StdEncoding}
+	for _, encoding := range encodings {
+		decoded, err := encoding.DecodeString(value)
+		if err == nil && len(decoded) == 32 {
+			return decoded, nil
+		}
+	}
+	return nil, fmt.Errorf("Reality X25519 密钥必须是 32 字节 Base64")
+}
+
+func managedRealityPublicKey(settings map[string]interface{}) (string, error) {
+	if publicKey, _ := settings["publicKey"].(string); strings.TrimSpace(publicKey) != "" {
+		decoded, err := decodeManagedRealityKey(publicKey)
+		if err != nil {
+			return "", fmt.Errorf("Reality publicKey 无效: %w", err)
+		}
+		return base64.RawURLEncoding.EncodeToString(decoded), nil
+	}
+	privateKey, _ := settings["privateKey"].(string)
+	decoded, err := decodeManagedRealityKey(privateKey)
+	if err != nil {
+		return "", fmt.Errorf("Reality 入站缺少可用于派生公钥的有效 privateKey: %w", err)
+	}
+	key, err := ecdh.X25519().NewPrivateKey(decoded)
+	if err != nil {
+		return "", fmt.Errorf("Reality privateKey 无法派生公钥: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(key.PublicKey().Bytes()), nil
 }
 
 func (h *RemoteManageHandler) getTunnelInSettingsPort(ctx context.Context, serverID int64) int {
@@ -4378,8 +4613,8 @@ func (h *RemoteManageHandler) InboundToClashProxyByServerID(serverID int64, inbo
 	return string(clashJSON), nil
 }
 
-// applyWSSClientRewrite 若 inbound 是 VLESS WSS 入站(network=ws + security=none + listen 127.0.0.1),
-// 把 inboundMap 原地改写为"客户端视角"(security=tls, tlsSettings.serverName=domain, wsSettings.headers.Host=domain),
+// applyWSSClientRewrite 若 inbound 是受支持的 WSS 入站(network=ws + security=none + listen 127.0.0.1),
+// 把 inboundMap 原地改写为"客户端视角"(security=tls, tlsSettings.serverName=domain, wsSettings.host=domain),
 // 并返回客户端连接用的端口(443) + serverHost(域名)。
 //
 // 否则不修改 inboundMap,返回 (0, "")。调用方据此判断是否覆盖默认 tunnelPort/serverHost。
@@ -4389,19 +4624,10 @@ func applyWSSClientRewrite(inboundMap map[string]interface{}, server *storage.Re
 	if server == nil || server.Domain == "" {
 		return 0, ""
 	}
-	if proto, _ := inboundMap["protocol"].(string); !strings.EqualFold(proto, "vless") {
+	if !isNginxManagedWSSInbound(inboundMap) {
 		return 0, ""
 	}
 	ss, _ := inboundMap["streamSettings"].(map[string]interface{})
-	if ss == nil {
-		return 0, ""
-	}
-	network, _ := ss["network"].(string)
-	security, _ := ss["security"].(string)
-	listen, _ := inboundMap["listen"].(string)
-	if network != "ws" || !(security == "" || security == "none") || !(listen == "127.0.0.1" || listen == "localhost") {
-		return 0, ""
-	}
 
 	// 不污染外面持有的 streamSettings,做浅拷贝
 	ssCopy := make(map[string]interface{}, len(ss)+1)
@@ -4416,14 +4642,7 @@ func applyWSSClientRewrite(inboundMap map[string]interface{}, server *storage.Re
 	for k, v := range ws {
 		wsCopy[k] = v
 	}
-	headers, _ := wsCopy["headers"].(map[string]interface{})
-	if headers == nil {
-		headers = map[string]interface{}{}
-	}
-	if _, ok := headers["Host"]; !ok {
-		headers["Host"] = server.Domain
-	}
-	wsCopy["headers"] = headers
+	wsCopy["host"] = server.Domain
 	ssCopy["wsSettings"] = wsCopy
 	inboundMap["streamSettings"] = ssCopy
 	return 443, server.Domain
@@ -4840,7 +5059,7 @@ func (h *RemoteManageHandler) HandleAddWebsite(w http.ResponseWriter, r *http.Re
 		remoteWriteError(w, http.StatusConflict, "证书功能未初始化，无法添加 HTTPS 网站")
 		return
 	}
-	cert, certErr := h.findCertificateForRemoteDomain(ctx, rootDomain, req.ServerID)
+	cert, certErr := h.findCertificateForRemoteDomain(ctx, domain, req.ServerID)
 	if certErr != nil {
 		remoteWriteError(w, http.StatusConflict, fmt.Sprintf("未找到可部署的 %s 证书: %v", rootDomain, certErr))
 		return
@@ -5221,13 +5440,11 @@ func (h *RemoteManageHandler) getInboundRemovalSyncState(ctx context.Context, se
 		if inbTag != tag {
 			continue
 		}
-		protocol, _ := inb["protocol"].(string)
+		wasWSS := isNginxManagedWSSInbound(inb)
 		ss, _ := inb["streamSettings"].(map[string]interface{})
 		if ss == nil {
-			return nil, false, nil
+			return nil, wasWSS, nil
 		}
-		network, _ := ss["network"].(string)
-		wasWSS := strings.EqualFold(protocol, "vless") && strings.EqualFold(network, "ws")
 		if sec, _ := ss["security"].(string); sec != "reality" {
 			return nil, wasWSS, nil
 		}

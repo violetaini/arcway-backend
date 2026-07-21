@@ -14,13 +14,14 @@ import (
 	"sync"
 	texttemplate "text/template"
 
+	"miaomiaowux/internal/storage"
 	"miaomiaowux/templates"
 )
 
-// VLESS WSS 入站 nginx 联动:
+// WSS 入站 nginx 联动:
 //   - 入站创建时:自动分配本地端口 + 随机 path,强制 listen 127.0.0.1 + security=none
 //     (TLS 由 nginx 在 443 端口处理,xray 只负责 127.0.0.1:<port> 的 ws upgrade)
-//   - 入站创建/删除后:聚合渲染该 server 全部 vless+ws 入站到一份 nginx domain.conf,
+//   - 入站创建/删除后:聚合渲染该 server 全部 VLESS/VMess/Trojan+WS 入站到一份 nginx domain.conf,
 //     调 agent /api/child/nginx/setup-ssl 下发 + reload
 //
 // 与 reality 流程互斥(都覆盖 servers/{domain}.conf),设计上同一 server.domain 不应同时用两种。
@@ -51,25 +52,61 @@ func randomWSPath() string {
 	return "/ws/" + string(b)
 }
 
-// isVlessWSInboundReq 从 HandleInbounds 收到的 inboundReq 里判断是否 vless+ws 入站添加请求。
-// 入参形如 {action: "add", inbound: {protocol, port, listen, streamSettings: {network, security, wsSettings: {path}}, ...}}。
-func isVlessWSInboundReq(inboundReq map[string]interface{}) bool {
-	inbound, _ := inboundReq["inbound"].(map[string]interface{})
+func isWSSProtocol(protocol string) bool {
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case "vless", "vmess", "trojan":
+		return true
+	default:
+		return false
+	}
+}
+
+// isNginxManagedWSSInbound distinguishes the internal WebSocket backend used by
+// Arcway's nginx TLS terminator from a regular, directly exposed WS inbound.
+// A public WS inbound may intentionally have no domain or TLS certificate, so
+// network=ws alone must never opt it into the nginx/domain/443 workflow.
+func isNginxManagedWSSInbound(inbound map[string]interface{}) bool {
 	if inbound == nil {
 		return false
 	}
-	if protocol, _ := inbound["protocol"].(string); strings.ToLower(protocol) != "vless" {
+	if protocol, _ := inbound["protocol"].(string); !isWSSProtocol(protocol) {
 		return false
 	}
+
+	listen, _ := inbound["listen"].(string)
+	switch strings.ToLower(strings.TrimSpace(listen)) {
+	case "127.0.0.1", "localhost":
+	default:
+		return false
+	}
+
 	ss, _ := inbound["streamSettings"].(map[string]interface{})
 	if ss == nil {
 		return false
 	}
 	network, _ := ss["network"].(string)
-	return network == "ws"
+	security, _ := ss["security"].(string)
+	return strings.EqualFold(strings.TrimSpace(network), "ws") &&
+		strings.EqualFold(strings.TrimSpace(security), "none")
 }
 
-// preprocessWSSInbound 在 forward 之前对 vless+ws 入站强制注入安全默认值。
+// isWSSInboundReq 从 HandleInbounds 收到的 inboundReq 里判断是否需要 nginx TLS 终止的 WS 入站。
+func isWSSInboundReq(inboundReq map[string]interface{}) bool {
+	inbound, _ := inboundReq["inbound"].(map[string]interface{})
+	return isNginxManagedWSSInbound(inbound)
+}
+
+// isVlessWSInboundReq 保留给旧调用方和测试，语义仍严格限定为 VLESS+WS。
+func isVlessWSInboundReq(inboundReq map[string]interface{}) bool {
+	if !isWSSInboundReq(inboundReq) {
+		return false
+	}
+	inbound, _ := inboundReq["inbound"].(map[string]interface{})
+	protocol, _ := inbound["protocol"].(string)
+	return strings.EqualFold(strings.TrimSpace(protocol), "vless")
+}
+
+// preprocessWSSInbound 在 forward 之前对受管 WS 入站强制注入安全默认值。
 // 返回新的 body(已 marshal 好,可直接 forward)。
 //
 // 调用方持有 server-level 锁,内部扫端口安全。
@@ -166,42 +203,59 @@ type wssInboundInfo struct {
 	Port   string
 }
 
-// SyncWSSNginx 查该 server 所有 vless+ws 入站,聚合渲染 nginx domain.conf 并下发 agent。
+type wssCertificateContext struct {
+	server      *storage.RemoteServer
+	domain      string
+	rootDomain  string
+	certificate *storage.Certificate
+	certName    string
+}
+
+func (h *RemoteManageHandler) resolveWSSCertificateContext(ctx context.Context, serverID int64) (*wssCertificateContext, error) {
+	server, err := h.repo.GetRemoteServer(ctx, serverID)
+	if err != nil {
+		return nil, fmt.Errorf("server not found: %v", err)
+	}
+	domain := strings.ToLower(strings.TrimSpace(server.Domain))
+	if domain == "" {
+		return nil, fmt.Errorf("server %d 未配置域名，无法同步 WSS nginx", serverID)
+	}
+	if h.certHandler == nil {
+		return nil, fmt.Errorf("证书功能未初始化，无法同步 WSS nginx")
+	}
+	rootDomain := extractRootDomain(domain)
+	certificate, err := h.findCertificateForRemoteDomain(ctx, domain, serverID)
+	if err != nil {
+		return nil, fmt.Errorf("server %d domain=%s 根域=%s 无可部署证书，无法同步 WSS nginx: %v", serverID, domain, rootDomain, err)
+	}
+	return &wssCertificateContext{
+		server: server, domain: domain, rootDomain: rootDomain,
+		certificate: certificate, certName: certDeployFilename(certificate.Domain),
+	}, nil
+}
+
+// SyncWSSNginx 查该 server 所有受支持的 WS 入站,聚合渲染 nginx domain.conf 并下发 agent。
 // 关键约束:
-//   - server.domain 必须有(无域名直接跳过,日志即可)
-//   - 根域必须有可用证书(无证书直接跳过 — 调用前前端已预检,只兜底)
+//   - server.domain 必须有
+//   - 根域必须有状态有效、PEM 完整且未过期的可部署证书
+//   - 必须先收到 Agent 证书落盘 ACK，才能下发引用该证书的 nginx 配置
 //   - 不下发主 nginx.conf(留空),只覆盖 servers/{domain}.conf
 //   - infos 为空(用户删完所有 WSS 入站)时也走渲染流程下发空 location 的 server 块,
 //     借模板的 default `location / { return 404; }` 兜底,把旧 location 全部覆盖,避免死 backend 残留。
 //
 // 大写导出:nodes.go 的 deleteRemoteInbound 也要调,删节点路径不走 HandleInbounds remove。
 func (h *RemoteManageHandler) SyncWSSNginx(ctx context.Context, serverID int64) error {
-	server, err := h.repo.GetRemoteServer(ctx, serverID)
+	certificateContext, err := h.resolveWSSCertificateContext(ctx, serverID)
 	if err != nil {
-		return fmt.Errorf("server not found: %v", err)
+		return err
 	}
-	domain := strings.ToLower(strings.TrimSpace(server.Domain))
-	if domain == "" {
-		return fmt.Errorf("server %d 未配置域名，无法同步 WSS nginx", serverID)
-	}
-	rootDomain := extractRootDomain(domain)
+	server := certificateContext.server
+	domain := certificateContext.domain
+	rootDomain := certificateContext.rootDomain
+	cert := certificateContext.certificate
+	certName := certificateContext.certName
 
-	// 证书查找优先级 (跟 reality 流程一致,见 remote_reality_domains.go HandleSetupSSL):
-	//   1. per-server 精确匹配 (server_id=X, domain=rootDomain)
-	//   2. 回退到全局通配证书 (server_id=0, domain="*."+rootDomain) — auto_deploy 会被推到 agent
-	//   3. 都找不到 → 跳过
-	var certDomain string
-	if c, err := h.repo.GetCertificateByDomain(ctx, rootDomain, serverID); err == nil && c != nil {
-		certDomain = c.Domain
-	} else if c2, err2 := h.repo.GetCertificateByDomain(ctx, "*."+rootDomain, 0); err2 == nil && c2 != nil {
-		certDomain = c2.Domain
-	}
-	if certDomain == "" {
-		return fmt.Errorf("server %d domain=%s 根域=%s 无可用证书，无法同步 WSS nginx", serverID, domain, rootDomain)
-	}
-	certName := certDeployFilename(certDomain)
-
-	// 拉全部 inbounds,过滤 vless+ws
+	// 拉全部 inbounds,过滤 VLESS/VMess/Trojan+WS。
 	result, err := h.forwardToRemoteServer(ctx, serverID, http.MethodGet, "/api/child/inbounds", nil)
 	if err != nil {
 		return fmt.Errorf("拉取 inbounds 失败: %v", err)
@@ -215,80 +269,91 @@ func (h *RemoteManageHandler) SyncWSSNginx(ctx context.Context, serverID int64) 
 
 	infos := extractWSSInbounds(resp.Inbounds)
 
+	var domainConf string
+	stealSelf := server.StealMode == "tunnel" || server.StealMode == "fallback"
+
 	// 偷自己 server(steal_mode=tunnel/fallback):ws location 合并进伪装站 conf(listen 127.0.0.1:8001,
 	// 流量走 tunnel 域名分流 / reality fallback 到 nginx),不用 wss_domain.conf.tpl(listen 443 会和
 	// xray 的 443 抢端口 + 冲掉伪装站)。renderStealSelfDomainConf 把伪装站 location / 和 ws location 一并渲染,
 	// 无 ws 入站时就是纯伪装站 conf(不再空 404 兜底冲掉伪装站)。
-	if server.StealMode == "tunnel" || server.StealMode == "fallback" {
+	if stealSelf {
 		conf, rerr := renderStealSelfDomainConf(server.StealMode, server.SiteType, server.SiteValue, domain, certName, infos)
 		if rerr != nil {
 			return rerr
 		}
-		payload, _ := json.Marshal(map[string]interface{}{
-			"domain":        domain,
-			"nginx_config":  "",
-			"domain_config": conf,
-		})
-		if _, err := h.forwardToRemoteServer(ctx, serverID, http.MethodPost, "/api/child/nginx/setup-ssl", payload); err != nil {
-			return fmt.Errorf("下发偷自己 nginx 配置失败: %v", err)
+		domainConf = conf
+	} else {
+		// 纯 WSS server(非偷自己, listen 443 独占):
+		// 空 infos 也继续走模板渲染:渲染后是「只有 ssl 配置 + 默认 404 location」的 server 块,
+		// 覆盖 servers/{domain}.conf 后,旧的 WSS location 全部被冲掉,不再残留死 backend。
+		// 当前架构假设 WSS 与 reality 在同 domain 互斥(同 conf 文件覆盖),没有共存场景下的副作用。
+		if len(infos) == 0 {
+			log.Printf("[WSS-Nginx] server %d domain=%s 已无受管 WS 入站,下发空 location 兜底(覆盖残留)", serverID, domain)
 		}
-		log.Printf("[WSS-Nginx] server %d domain=%s 偷自己模式:伪装站 + %d 条 ws location(listen 8001)已下发", serverID, domain, len(infos))
-		return nil
+
+		tplBytes, err := templates.ReadFile("wss_domain.conf.tpl")
+		if err != nil {
+			return fmt.Errorf("读取 wss 模板失败: %v", err)
+		}
+		tpl, err := texttemplate.New("wss").Parse(string(tplBytes))
+		if err != nil {
+			return fmt.Errorf("解析 wss 模板失败: %v", err)
+		}
+		data := struct {
+			Domain   string
+			CertName string
+			Inbounds []wssInboundInfo
+		}{Domain: domain, CertName: certName, Inbounds: infos}
+		var buf bytes.Buffer
+		if err := tpl.Execute(&buf, data); err != nil {
+			return fmt.Errorf("渲染 wss 模板失败: %v", err)
+		}
+		domainConf = buf.String()
 	}
 
-	// 纯 WSS server(非偷自己, listen 443 独占):
-	// 空 infos 也继续走模板渲染:渲染后是「只有 ssl 配置 + 默认 404 location」的 server 块,
-	// 覆盖 servers/{domain}.conf 后,旧的 WSS location 全部被冲掉,不再残留死 backend。
-	// 当前架构假设 WSS 与 reality 在同 domain 互斥(同 conf 文件覆盖),没有共存场景下的副作用。
-	if len(infos) == 0 {
-		log.Printf("[WSS-Nginx] server %d domain=%s 已无 vless+ws 入站,下发空 location 兜底(覆盖残留)", serverID, domain)
-	}
-
-	tplBytes, err := templates.ReadFile("wss_domain.conf.tpl")
-	if err != nil {
-		return fmt.Errorf("读取 wss 模板失败: %v", err)
-	}
-	tpl, err := texttemplate.New("wss").Parse(string(tplBytes))
-	if err != nil {
-		return fmt.Errorf("解析 wss 模板失败: %v", err)
-	}
-	data := struct {
-		Domain   string
-		CertName string
-		Inbounds []wssInboundInfo
-	}{Domain: domain, CertName: certName, Inbounds: infos}
-	var buf bytes.Buffer
-	if err := tpl.Execute(&buf, data); err != nil {
-		return fmt.Errorf("渲染 wss 模板失败: %v", err)
-	}
-
-	payload, _ := json.Marshal(map[string]interface{}{
+	payload, err := json.Marshal(map[string]interface{}{
 		"domain":        domain,
 		"nginx_config":  "", // 留空 → agent 跳过主 nginx.conf 写入(reality 已下过的不动)
-		"domain_config": buf.String(),
+		"domain_config": domainConf,
 	})
+	if err != nil {
+		return fmt.Errorf("序列化 WSS nginx 配置失败: %v", err)
+	}
+
+	certPayload := WSCertDeployPayload{
+		Domain:   rootDomain,
+		CertPEM:  cert.CertPEM,
+		KeyPEM:   cert.KeyPEM,
+		CertPath: fmt.Sprintf("/usr/local/nginx/cert/%s.pem", certName),
+		KeyPath:  fmt.Sprintf("/usr/local/nginx/cert/%s.key", certName),
+		Reload:   "none",
+	}
+	if err := h.certHandler.deployToRemoteServerSync(ctx, server, certPayload); err != nil {
+		return fmt.Errorf("WSS 证书部署未获得 Agent ACK: %v", err)
+	}
+
 	if _, err := h.forwardToRemoteServer(ctx, serverID, http.MethodPost, "/api/child/nginx/setup-ssl", payload); err != nil {
+		if stealSelf {
+			return fmt.Errorf("下发偷自己 nginx 配置失败: %v", err)
+		}
 		return fmt.Errorf("下发 nginx 配置失败: %v", err)
+	}
+	if stealSelf {
+		log.Printf("[WSS-Nginx] server %d domain=%s 偷自己模式:伪装站 + %d 条 ws location(listen 8001)已下发", serverID, domain, len(infos))
+		return nil
 	}
 	log.Printf("[WSS-Nginx] server %d domain=%s 已下发 %d 条 WSS location", serverID, domain, len(infos))
 	return nil
 }
 
-// extractWSSInbounds 从 agent inbounds 列表过滤出 vless+ws 入站的 {path, port}。
+// extractWSSInbounds 从 agent inbounds 列表过滤出 VLESS/VMess/Trojan+WS 入站的 {path, port}。
 func extractWSSInbounds(inbounds []map[string]interface{}) []wssInboundInfo {
 	var infos []wssInboundInfo
 	for _, ib := range inbounds {
-		protocol, _ := ib["protocol"].(string)
-		if strings.ToLower(protocol) != "vless" {
+		if !isNginxManagedWSSInbound(ib) {
 			continue
 		}
 		ss, _ := ib["streamSettings"].(map[string]interface{})
-		if ss == nil {
-			continue
-		}
-		if network, _ := ss["network"].(string); network != "ws" {
-			continue
-		}
 		ws, _ := ss["wsSettings"].(map[string]interface{})
 		if ws == nil {
 			continue
@@ -311,7 +376,7 @@ func extractWSSInbounds(inbounds []map[string]interface{}) []wssInboundInfo {
 	return infos
 }
 
-// fetchWSSInboundsStrict 拉 server 当前所有 vless+ws 入站。多步写操作必须使用
+// fetchWSSInboundsStrict 拉 server 当前所有受管 WS 入站。多步写操作必须使用
 // strict 版本：读取失败时若当作“没有 WSS”，会用空 location 覆盖掉现网配置。
 func (h *RemoteManageHandler) fetchWSSInboundsStrict(ctx context.Context, serverID int64) ([]wssInboundInfo, error) {
 	result, err := h.forwardToRemoteServer(ctx, serverID, http.MethodGet, "/api/child/inbounds", nil)

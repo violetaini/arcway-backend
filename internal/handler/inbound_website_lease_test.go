@@ -3,7 +3,14 @@ package handler
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -25,17 +32,49 @@ func attachRemoteCertificateHandler(t *testing.T, repo *storage.TrafficRepositor
 
 func createRemoteDomainCertificate(t *testing.T, repo *storage.TrafficRepository, serverID int64, domain string) {
 	t.Helper()
+	certPEM, keyPEM, expiry := createTestCertificatePEM(t, domain)
 	cert := &storage.Certificate{
 		Domain:         domain,
 		Email:          "admin@example.test",
 		Status:         storage.CertStatusValid,
 		RemoteServerID: serverID,
-		CertPEM:        "test-certificate-pem",
-		KeyPEM:         "test-private-key-pem",
+		CertPEM:        certPEM,
+		KeyPEM:         keyPEM,
+		ExpiryDate:     &expiry,
 	}
 	if err := repo.CreateCertificate(context.Background(), cert); err != nil {
 		t.Fatalf("CreateCertificate: %v", err)
 	}
+}
+
+func createTestCertificatePEM(t *testing.T, dnsNames ...string) (string, string, time.Time) {
+	t.Helper()
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate test certificate key: %v", err)
+	}
+	now := time.Now()
+	expiry := now.Add(24 * time.Hour)
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(now.UnixNano()),
+		Subject:      pkix.Name{CommonName: dnsNames[0]},
+		DNSNames:     dnsNames,
+		NotBefore:    now.Add(-time.Hour),
+		NotAfter:     expiry,
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		t.Fatalf("create test certificate: %v", err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(privateKey)
+	if err != nil {
+		t.Fatalf("marshal test certificate key: %v", err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	return string(certPEM), string(keyPEM), expiry
 }
 
 func decodeResponseMap(t *testing.T, response *httptest.ResponseRecorder) map[string]any {
@@ -140,6 +179,8 @@ func TestHandleInboundsHoldsLeaseThroughWSSPostSync(t *testing.T) {
 			storedInbound = request.Inbound
 			inboundMu.Unlock()
 			_, _ = w.Write([]byte(`{"success":true}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/child/cert/deploy":
+			_, _ = w.Write([]byte(`{"success":true}`))
 		case r.Method == http.MethodPost && r.URL.Path == "/api/child/nginx/setup-ssl":
 			close(nginxStarted)
 			<-allowNginx
@@ -153,10 +194,11 @@ func TestHandleInboundsHoldsLeaseThroughWSSPostSync(t *testing.T) {
 	defer agent.Close()
 
 	repo, server := newRemoteInstallationHandlerRepo(t, testServerPort(t, agent.URL))
-	createRemoteDomainCertificate(t, repo, server.ID, "example.test")
+	createRemoteDomainCertificate(t, repo, server.ID, "edge.example.test")
 	handler := NewRemoteManageHandler(repo, nil)
+	attachRemoteCertificateHandler(t, repo, handler)
 
-	body := bytes.NewBufferString(`{"action":"add","inbound":{"tag":"wss-test","protocol":"vless","settings":{"clients":[]},"streamSettings":{"network":"ws","security":"none","wsSettings":{}}}}`)
+	body := bytes.NewBufferString(`{"action":"add","inbound":{"tag":"wss-test","protocol":"vless","listen":"127.0.0.1","settings":{"clients":[]},"streamSettings":{"network":"ws","security":"none","wsSettings":{}}}}`)
 	request := httptest.NewRequest(http.MethodPost, "/api/remote/inbounds?server_id="+leaseTestID(server.ID), body)
 	request = request.WithContext(auth.ContextWithUsername(request.Context(), "lease-test-user"))
 	response := httptest.NewRecorder()
@@ -201,7 +243,7 @@ func TestHandleInboundsHoldsLeaseThroughWSSPostSync(t *testing.T) {
 	}
 }
 
-func TestHandleInboundsReportsWSSPostSyncFailureAsPartial(t *testing.T) {
+func TestHandleInboundsRollsBackWSSWhenPostSyncFails(t *testing.T) {
 	var added atomic.Bool
 	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -216,7 +258,13 @@ func TestHandleInboundsReportsWSSPostSyncFailureAsPartial(t *testing.T) {
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "inbounds": inbounds})
 		case r.Method == http.MethodPost && r.URL.Path == "/api/child/inbounds":
-			added.Store(true)
+			var request struct {
+				Action string `json:"action"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&request)
+			added.Store(request.Action != "remove")
+			_, _ = w.Write([]byte(`{"success":true}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/child/cert/deploy":
 			_, _ = w.Write([]byte(`{"success":true}`))
 		case r.Method == http.MethodPost && r.URL.Path == "/api/child/nginx/setup-ssl":
 			http.Error(w, "nginx reload rejected", http.StatusInternalServerError)
@@ -229,21 +277,25 @@ func TestHandleInboundsReportsWSSPostSyncFailureAsPartial(t *testing.T) {
 	defer agent.Close()
 
 	repo, server := newRemoteInstallationHandlerRepo(t, testServerPort(t, agent.URL))
-	createRemoteDomainCertificate(t, repo, server.ID, "example.test")
+	createRemoteDomainCertificate(t, repo, server.ID, "edge.example.test")
 	handler := NewRemoteManageHandler(repo, nil)
-	body := bytes.NewBufferString(`{"action":"add","inbound":{"tag":"wss-partial","protocol":"vless","settings":{"clients":[]},"streamSettings":{"network":"ws","security":"none","wsSettings":{}}}}`)
+	attachRemoteCertificateHandler(t, repo, handler)
+	body := bytes.NewBufferString(`{"action":"add","inbound":{"tag":"wss-partial","protocol":"vless","listen":"127.0.0.1","settings":{"clients":[]},"streamSettings":{"network":"ws","security":"none","wsSettings":{}}}}`)
 	request := httptest.NewRequest(http.MethodPost, "/api/remote/inbounds?server_id="+leaseTestID(server.ID), body)
 	request = request.WithContext(auth.ContextWithUsername(request.Context(), "lease-test-user"))
 	response := httptest.NewRecorder()
 
 	handler.HandleInbounds(response, request)
 
-	if response.Code != http.StatusConflict {
-		t.Fatalf("status=%d body=%s, want 409", response.Code, response.Body.String())
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s, want CDN-safe 400", response.Code, response.Body.String())
 	}
 	payload := decodeResponseMap(t, response)
-	if payload["success"] != false || payload["partial"] != true {
-		t.Fatalf("unexpected partial response: %#v", payload)
+	if payload["success"] != false || payload["partial"] == true {
+		t.Fatalf("unexpected rollback response: %#v", payload)
+	}
+	if added.Load() {
+		t.Fatal("WSS inbound remained after nginx post-sync failed")
 	}
 }
 
@@ -264,7 +316,7 @@ func TestHandleAddWebsiteRequiresCertificateAndRestartACKs(t *testing.T) {
 		defer agent.Close()
 
 		repo, server := newRemoteInstallationHandlerRepo(t, testServerPort(t, agent.URL))
-		createRemoteDomainCertificate(t, repo, server.ID, "example.test")
+		createRemoteDomainCertificate(t, repo, server.ID, "*.example.test")
 		handler := NewRemoteManageHandler(repo, nil)
 		attachRemoteCertificateHandler(t, repo, handler)
 		body, _ := json.Marshal(map[string]any{
@@ -309,7 +361,7 @@ func TestHandleAddWebsiteRequiresCertificateAndRestartACKs(t *testing.T) {
 		defer agent.Close()
 
 		repo, server := newRemoteInstallationHandlerRepo(t, testServerPort(t, agent.URL))
-		createRemoteDomainCertificate(t, repo, server.ID, "example.test")
+		createRemoteDomainCertificate(t, repo, server.ID, "*.example.test")
 		handler := NewRemoteManageHandler(repo, nil)
 		attachRemoteCertificateHandler(t, repo, handler)
 		body, _ := json.Marshal(map[string]any{
@@ -350,7 +402,7 @@ func TestHandleSetupSSLDoesNotReportCertificateFailureAsDeployed(t *testing.T) {
 	defer agent.Close()
 
 	repo, server := newRemoteInstallationHandlerRepo(t, testServerPort(t, agent.URL))
-	createRemoteDomainCertificate(t, repo, server.ID, "example.test")
+	createRemoteDomainCertificate(t, repo, server.ID, "edge.example.test")
 	handler := NewRemoteManageHandler(repo, nil)
 	attachRemoteCertificateHandler(t, repo, handler)
 	request := httptest.NewRequest(http.MethodPost, "/api/remote/setup-ssl?server_id="+leaseTestID(server.ID), nil)

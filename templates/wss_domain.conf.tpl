@@ -5,8 +5,8 @@
         http2                      on;
         server_name                {{.Domain}};
 
-        ssl_certificate            cert/{{.CertName}}.pem;
-        ssl_certificate_key        cert/{{.CertName}}.key;
+        ssl_certificate            /usr/local/nginx/cert/{{.CertName}}.pem;
+        ssl_certificate_key        /usr/local/nginx/cert/{{.CertName}}.key;
 
         ssl_protocols              TLSv1.2 TLSv1.3;
         ssl_ciphers                ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;

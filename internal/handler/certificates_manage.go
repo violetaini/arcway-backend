@@ -85,27 +85,28 @@ type CertificateRequest struct {
 
 // CertificateResponse 表示 API 响应中的证书。
 type CertificateResponse struct {
-	ID               int64   `json:"id"`
-	Domain           string  `json:"domain"`
-	Email            string  `json:"email"`
-	Provider         string  `json:"provider"`
-	CertPath         string  `json:"cert_path"`
-	KeyPath          string  `json:"key_path"`
-	Status           string  `json:"status"`
-	ExpiryDate       *string `json:"expiry_date"`
-	IssueDate        *string `json:"issue_date"`
-	AutoRenew        bool    `json:"auto_renew"`
-	ChallengeMode    string  `json:"challenge_mode"`
-	RemoteServerID   int64   `json:"remote_server_id"`
-	RemoteServerName string  `json:"remote_server_name,omitempty"`
-	Message          string  `json:"message,omitempty"`
-	DNSProviderID    int64   `json:"dns_provider_id"`
-	DeployTarget     string  `json:"deploy_target"`
-	DeployCertPath   string  `json:"deploy_cert_path,omitempty"`
-	DeployKeyPath    string  `json:"deploy_key_path,omitempty"`
-	AutoDeploy       bool    `json:"auto_deploy"`
-	CreatedAt        string  `json:"created_at"`
-	UpdatedAt        string  `json:"updated_at"`
+	ID               int64    `json:"id"`
+	Domain           string   `json:"domain"`
+	Email            string   `json:"email"`
+	Provider         string   `json:"provider"`
+	CertPath         string   `json:"cert_path"`
+	KeyPath          string   `json:"key_path"`
+	Status           string   `json:"status"`
+	DNSNames         []string `json:"dns_names,omitempty"`
+	ExpiryDate       *string  `json:"expiry_date"`
+	IssueDate        *string  `json:"issue_date"`
+	AutoRenew        bool     `json:"auto_renew"`
+	ChallengeMode    string   `json:"challenge_mode"`
+	RemoteServerID   int64    `json:"remote_server_id"`
+	RemoteServerName string   `json:"remote_server_name,omitempty"`
+	Message          string   `json:"message,omitempty"`
+	DNSProviderID    int64    `json:"dns_provider_id"`
+	DeployTarget     string   `json:"deploy_target"`
+	DeployCertPath   string   `json:"deploy_cert_path,omitempty"`
+	DeployKeyPath    string   `json:"deploy_key_path,omitempty"`
+	AutoDeploy       bool     `json:"auto_deploy"`
+	CreatedAt        string   `json:"created_at"`
+	UpdatedAt        string   `json:"updated_at"`
 }
 
 // ListCertificatesResponse 表示列出证书的响应。
@@ -131,6 +132,7 @@ func certificateToResponse(cert *storage.Certificate) CertificateResponse {
 		CertPath:       cert.CertPath,
 		KeyPath:        cert.KeyPath,
 		Status:         cert.Status,
+		DNSNames:       certificateDNSNames(cert.CertPEM),
 		AutoRenew:      cert.AutoRenew,
 		ChallengeMode:  cert.ChallengeMode,
 		RemoteServerID: cert.RemoteServerID,

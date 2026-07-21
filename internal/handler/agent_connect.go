@@ -1201,12 +1201,30 @@ if [ "$AUTO_STEAL_SELF" = "1" ]; then
         exit 1
     }
     NGINX_CONF_PATH=$(printf '%s\n' "$NGINX_BUILD_INFO" | sed -n 's/.*--conf-path=\([^[:space:]]*\).*/\1/p' | tail -n 1)
+    NGINX_PREFIX=$(printf '%s\n' "$NGINX_BUILD_INFO" | sed -n 's/.*--prefix=\([^[:space:]]*\).*/\1/p' | tail -n 1)
     NGINX_CONF_PATH=${NGINX_CONF_PATH#\"}
     NGINX_CONF_PATH=${NGINX_CONF_PATH%\"}
     NGINX_CONF_PATH=${NGINX_CONF_PATH#\'}
     NGINX_CONF_PATH=${NGINX_CONF_PATH%\'}
+    NGINX_PREFIX=${NGINX_PREFIX#\"}
+    NGINX_PREFIX=${NGINX_PREFIX%\"}
+    NGINX_PREFIX=${NGINX_PREFIX#\'}
+    NGINX_PREFIX=${NGINX_PREFIX%\'}
     if [ -z "$NGINX_CONF_PATH" ]; then
-        echo "ERROR: Nginx does not report an authoritative --conf-path" >&2
+        if [ -z "$NGINX_PREFIX" ]; then
+            echo "ERROR: Nginx reports neither --conf-path nor --prefix" >&2
+            exit 1
+        fi
+        NGINX_CONF_PATH="${NGINX_PREFIX%/}/conf/nginx.conf"
+    elif [ "${NGINX_CONF_PATH#/}" = "$NGINX_CONF_PATH" ]; then
+        if [ -z "$NGINX_PREFIX" ]; then
+            echo "ERROR: relative Nginx --conf-path has no --prefix" >&2
+            exit 1
+        fi
+        NGINX_CONF_PATH="${NGINX_PREFIX%/}/${NGINX_CONF_PATH}"
+    fi
+    if [ ! -r "$NGINX_CONF_PATH" ]; then
+        echo "ERROR: resolved Nginx configuration is unreadable: $NGINX_CONF_PATH" >&2
         exit 1
     fi
     record_xray_config "$NGINX_CONF_PATH" || exit 1
@@ -1290,6 +1308,7 @@ TRACKED_PATHS=(
     /opt/xray
     /etc/arcway-port-firewall.env
     /usr/local/sbin/arcway-agent-firewall
+    /usr/local/sbin/arcway-nginx-bridge
     /etc/systemd/system/mmw-agent.service
     /etc/systemd/system/arcway-expiry-guard.service
     /etc/init.d/mmw-agent
@@ -1316,6 +1335,14 @@ track_path() {
 }
 for XRAY_DISCOVERED_PATH in "${XRAY_DISCOVERED_PATHS[@]}"; do
     track_path "$XRAY_DISCOVERED_PATH"
+done
+for NGINX_BRIDGE_PATH in \
+    /usr/local/nginx/servers \
+    /usr/local/nginx/stream_servers \
+    /usr/local/nginx/cert \
+    /www/server/panel/vhost/nginx/zz_arcway_loader.conf \
+    /www/server/panel/vhost/nginx/tcp/zz_arcway_loader.conf; do
+    track_path "$NGINX_BRIDGE_PATH"
 done
 track_symlink_target() {
     local link_path="$1" resolved=""
@@ -2309,6 +2336,182 @@ if command -v ufw >/dev/null 2>&1; then
     fi
 fi
 
+cat > /usr/local/sbin/arcway-nginx-bridge << 'EOF'
+#!/bin/sh
+set -eu
+umask 077
+
+BT_PREFIX=/www/server/nginx
+BT_BIN="$BT_PREFIX/sbin/nginx"
+BT_CONF="$BT_PREFIX/conf/nginx.conf"
+BT_HTTP_DIR=/www/server/panel/vhost/nginx
+BT_STREAM_DIR="$BT_HTTP_DIR/tcp"
+HTTP_LOADER="$BT_HTTP_DIR/zz_arcway_loader.conf"
+STREAM_LOADER="$BT_STREAM_DIR/zz_arcway_loader.conf"
+MANAGED_ROOT=/usr/local/nginx
+HTTP_INCLUDE='/www/server/panel/vhost/nginx/*.conf'
+STREAM_INCLUDE='/www/server/panel/vhost/nginx/tcp/*.conf'
+
+# A host without the BaoTa layout is not an error. A partial BaoTa layout is:
+# silently guessing there would recreate the Agent's false-success path bug.
+if [ ! -e "$BT_CONF" ] && [ ! -x "$BT_BIN" ] && [ ! -d "$BT_HTTP_DIR" ]; then
+    exit 0
+fi
+for REQUIRED_PATH in "$BT_BIN" "$BT_CONF" "$BT_HTTP_DIR" "$BT_STREAM_DIR"; do
+    if [ ! -e "$REQUIRED_PATH" ]; then
+        echo "ERROR: partial BaoTa Nginx layout; missing $REQUIRED_PATH" >&2
+        exit 1
+    fi
+done
+if [ ! -x "$BT_BIN" ] || [ ! -r "$BT_CONF" ] || [ ! -d "$BT_HTTP_DIR" ] || [ ! -d "$BT_STREAM_DIR" ]; then
+    echo "ERROR: BaoTa Nginx layout has unusable permissions or file types" >&2
+    exit 1
+fi
+
+include_is_present() {
+    awk -v wanted="$1" '
+        {
+            line=$0
+            sub(/#.*/, "", line)
+            gsub(/[[:space:]]/, "", line)
+            if (line == "include" wanted ";") found=1
+        }
+        END { exit(found ? 0 : 1) }
+    ' "$BT_CONF"
+}
+if ! include_is_present "$HTTP_INCLUDE" || ! include_is_present "$STREAM_INCLUDE"; then
+    echo "ERROR: BaoTa nginx.conf does not include both supported HTTP and stream vhost globs" >&2
+    exit 1
+fi
+
+for MANAGED_DIR in "$MANAGED_ROOT/servers" "$MANAGED_ROOT/stream_servers" "$MANAGED_ROOT/cert"; do
+    if [ -L "$MANAGED_DIR" ] || { [ -e "$MANAGED_DIR" ] && [ ! -d "$MANAGED_DIR" ]; }; then
+        echo "ERROR: Arcway Nginx managed path is not a real directory: $MANAGED_DIR" >&2
+        exit 1
+    fi
+    if [ ! -d "$MANAGED_DIR" ]; then
+        mkdir -m 0755 -p "$MANAGED_DIR"
+    fi
+done
+
+LOCK_FILE=/run/arcway-nginx-bridge.lock
+exec 7>"$LOCK_FILE"
+chmod 0600 "$LOCK_FILE"
+if ! flock -w 30 7; then
+    echo "ERROR: timed out waiting for the Arcway Nginx bridge lock" >&2
+    exit 1
+fi
+
+STATE_DIR=$(mktemp -d /run/arcway-nginx-bridge.XXXXXX)
+TEMP_LOADER=""
+cleanup_bridge() {
+    [ -z "$TEMP_LOADER" ] || rm -f "$TEMP_LOADER"
+    rm -rf "$STATE_DIR"
+}
+trap cleanup_bridge EXIT
+trap 'exit 130' HUP INT TERM
+
+backup_loader() {
+    target="$1"
+    name="$2"
+    if [ -L "$target" ] || { [ -e "$target" ] && [ ! -f "$target" ]; }; then
+        echo "ERROR: reserved Arcway loader path is not a regular file: $target" >&2
+        return 1
+    fi
+    if [ -f "$target" ]; then
+        cp -a "$target" "$STATE_DIR/$name" || return 1
+        : > "$STATE_DIR/$name.present" || return 1
+    fi
+}
+backup_loader "$HTTP_LOADER" http || exit 1
+backup_loader "$STREAM_LOADER" stream || exit 1
+
+CHANGED=0
+write_loader() {
+    target="$1"
+    include_path="$2"
+    loader_context="$3"
+    temp=$(mktemp "$(dirname "$target")/.arcway-loader.XXXXXX") || return 1
+    TEMP_LOADER="$temp"
+    {
+        echo '# Managed by Arcway. BaoTa loads this file inside the matching Nginx context.'
+        if [ "$loader_context" = "http" ]; then
+            echo 'map $http_upgrade $arcway_connection_upgrade {'
+            echo '    default upgrade;'
+            echo "    '' close;"
+            echo '}'
+        fi
+        printf 'include %s;\n' "$include_path"
+    } > "$temp" || { rm -f "$temp"; return 1; }
+    chmod 0600 "$temp" || { rm -f "$temp"; return 1; }
+    chown root:root "$temp" || { rm -f "$temp"; return 1; }
+    if [ -f "$target" ] && cmp -s "$temp" "$target"; then
+        rm -f "$temp" || return 1
+        TEMP_LOADER=""
+        return 0
+    fi
+    mv -f "$temp" "$target" || { rm -f "$temp"; return 1; }
+    TEMP_LOADER=""
+    CHANGED=1
+}
+
+restore_loader() {
+    target="$1"
+    name="$2"
+    rm -f "$target" || return 1
+    if [ -f "$STATE_DIR/$name.present" ]; then
+        cp -a "$STATE_DIR/$name" "$target" || return 1
+    fi
+}
+rollback_bridge() {
+    rollback_ok=1
+    restore_loader "$HTTP_LOADER" http || rollback_ok=0
+    restore_loader "$STREAM_LOADER" stream || rollback_ok=0
+    if [ "$rollback_ok" = "1" ]; then
+        if ! "$BT_BIN" -p "$BT_PREFIX/" -c "$BT_CONF" -t >/dev/null 2>&1; then
+            rollback_ok=0
+        elif [ "$CHANGED" = "1" ] && ! "$BT_BIN" -p "$BT_PREFIX/" -c "$BT_CONF" -s reload >/dev/null 2>&1; then
+            rollback_ok=0
+        fi
+    fi
+    [ "$rollback_ok" = "1" ]
+}
+fail_bridge() {
+    message="$1"
+    echo "ERROR: $message" >&2
+    if [ "$CHANGED" = "1" ] && ! rollback_bridge; then
+        echo "ERROR: failed to restore the previous BaoTa Nginx bridge" >&2
+    fi
+    exit 1
+}
+
+write_loader "$HTTP_LOADER" "$MANAGED_ROOT/servers/*.conf" http || fail_bridge "cannot write the HTTP loader"
+write_loader "$STREAM_LOADER" "$MANAGED_ROOT/stream_servers/*.conf" stream || fail_bridge "cannot write the stream loader"
+
+if ! TEST_OUTPUT=$("$BT_BIN" -p "$BT_PREFIX/" -c "$BT_CONF" -t 2>&1); then
+    printf '%s\n' "$TEST_OUTPUT" >&2
+    fail_bridge "BaoTa Nginx rejected the Arcway bridge"
+fi
+if ! CONFIG_DUMP=$("$BT_BIN" -p "$BT_PREFIX/" -c "$BT_CONF" -T 2>&1); then
+    printf '%s\n' "$CONFIG_DUMP" >&2
+    fail_bridge "BaoTa Nginx could not dump the effective configuration"
+fi
+if ! printf '%s\n' "$CONFIG_DUMP" | grep -F -- "# configuration file $HTTP_LOADER:" >/dev/null; then
+    fail_bridge "HTTP loader was written but is not loaded by nginx -T"
+fi
+if ! printf '%s\n' "$CONFIG_DUMP" | grep -F -- "# configuration file $STREAM_LOADER:" >/dev/null; then
+    fail_bridge "stream loader was written but is not loaded by nginx -T"
+fi
+if [ "$CHANGED" = "1" ] && ! "$BT_BIN" -p "$BT_PREFIX/" -c "$BT_CONF" -s reload >/dev/null 2>&1; then
+    fail_bridge "BaoTa Nginx reload failed after validating the bridge"
+fi
+EOF
+chmod 0755 /usr/local/sbin/arcway-nginx-bridge
+if ! /usr/local/sbin/arcway-nginx-bridge; then
+    echo "ERROR: failed to install the BaoTa Nginx compatibility bridge" >&2
+    exit 1
+fi
+
 # Step 4: 创建 service 文件 — 按检测到的 init 系统选不同写法
 echo ""
 echo "[4/7] Creating service..."
@@ -2324,6 +2527,7 @@ Wants=network-online.target
 Type=simple
 EnvironmentFile=/etc/arcway-port-firewall.env
 ExecStartPre=/usr/local/sbin/arcway-agent-firewall
+ExecStartPre=/usr/local/sbin/arcway-nginx-bridge
 ExecStart=/usr/local/bin/mmw-agent -c /etc/mmw-agent/config.yaml
 Restart=always
 RestartSec=5
@@ -2373,7 +2577,8 @@ start_pre() {
     set -a
     . /etc/arcway-port-firewall.env
     set +a
-    /usr/local/sbin/arcway-agent-firewall
+    /usr/local/sbin/arcway-agent-firewall || return 1
+    /usr/local/sbin/arcway-nginx-bridge || return 1
 }
 depend() { need net; }
 EOF
@@ -2402,6 +2607,10 @@ else
     # 无 init 系统(典型 LXC 容器):写一个 supervisor 脚本,失败自动重启,放后台跑;同时塞进 rc.local 以便重启
     cat > /usr/local/bin/mmw-agent-supervisor.sh << 'EOF'
 #!/bin/sh
+if ! /usr/local/sbin/arcway-nginx-bridge; then
+    echo "[supervisor] Arcway Nginx bridge validation failed" >&2
+    exit 1
+fi
 while true; do
     # 日志由 agent 自身写文件并轮转(/var/log/mmw-agent/mmw-agent.log);这里输出走 stdout(由 rc.local 的 nohup 接管)
     /usr/local/bin/mmw-agent -c /etc/mmw-agent/config.yaml
@@ -2434,9 +2643,10 @@ EOF
     # installation where the firewall line had been appended after supervisors.
     RC_LOCAL_NEW="$DOWNLOAD_DIR/rc.local"
     awk '
-        /arcway-agent-firewall|mmw-agent-supervisor[.]sh|arcway-expiry-guard-supervisor[.]sh/ { next }
+        /arcway-agent-firewall|arcway-nginx-bridge|mmw-agent-supervisor[.]sh|arcway-expiry-guard-supervisor[.]sh/ { next }
         /^exit 0[[:space:]]*$/ && !inserted {
             print "set -a; . /etc/arcway-port-firewall.env; set +a; /usr/local/sbin/arcway-agent-firewall || exit 1"
+            print "/usr/local/sbin/arcway-nginx-bridge || exit 1"
             print "nohup /usr/local/bin/mmw-agent-supervisor.sh >/dev/null 2>&1 &"
             print "nohup /usr/local/bin/arcway-expiry-guard-supervisor.sh >/dev/null 2>&1 &"
             inserted=1
@@ -2445,6 +2655,7 @@ EOF
         END {
             if (!inserted) {
                 print "set -a; . /etc/arcway-port-firewall.env; set +a; /usr/local/sbin/arcway-agent-firewall || exit 1"
+                print "/usr/local/sbin/arcway-nginx-bridge || exit 1"
                 print "nohup /usr/local/bin/mmw-agent-supervisor.sh >/dev/null 2>&1 &"
                 print "nohup /usr/local/bin/arcway-expiry-guard-supervisor.sh >/dev/null 2>&1 &"
             }

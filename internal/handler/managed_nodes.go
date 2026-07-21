@@ -248,13 +248,32 @@ func (h *ManagedNodesHandler) findServerForNode(ctx context.Context, node storag
 	return nil, storage.ErrManagedServerMismatch
 }
 
+func validateSelfServiceNodeProtocol(node storage.Node) error {
+	protocol := canonicalManagedProtocol(node.Protocol)
+	if protocol != "shadowsocks" {
+		return nil
+	}
+	var config map[string]interface{}
+	if err := json.Unmarshal([]byte(node.ClashConfig), &config); err != nil {
+		return fmt.Errorf("%w: Shadowsocks 节点配置无效，不能发布到用户自助目录", storage.ErrManagedInvalidArgument)
+	}
+	cipher, _ := config["cipher"].(string)
+	if cipher == "" {
+		cipher, _ = config["method"].(string)
+	}
+	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(cipher)), "2022-") {
+		return fmt.Errorf("%w: 经典 Shadowsocks 使用共享密码，不能发布到用户自助目录；请改用 Shadowsocks 2022", storage.ErrManagedInvalidArgument)
+	}
+	return nil
+}
+
 func (h *ManagedNodesHandler) selectionOfferAvailable(ctx context.Context, selection storage.UserNodeSelection) bool {
 	offer, err := h.repo.GetSelfServiceNodeOffer(ctx, selection.OfferID)
 	if err != nil || !offer.Enabled {
 		return false
 	}
 	node, err := h.repo.GetNodeByID(ctx, offer.NodeID)
-	return err == nil && node.Enabled
+	return err == nil && node.Enabled && validateSelfServiceNodeProtocol(node) == nil
 }
 
 func (h *ManagedNodesHandler) requireManagedAgentCapabilities(ctx context.Context, serverID int64) error {
@@ -735,6 +754,10 @@ func (h *ManagedNodesHandler) HandleOffers(w http.ResponseWriter, r *http.Reques
 			writeManagedError(w, storage.ErrManagedInvalidArgument)
 			return
 		}
+		if err := validateSelfServiceNodeProtocol(node); err != nil {
+			writeManagedError(w, err)
+			return
+		}
 		server, err := h.findServerForNode(r.Context(), node)
 		if err != nil {
 			writeManagedError(w, err)
@@ -786,6 +809,15 @@ func (h *ManagedNodesHandler) HandleOffer(w http.ResponseWriter, r *http.Request
 			existing, getErr := h.repo.GetSelfServiceNodeOffer(r.Context(), id)
 			if getErr != nil {
 				writeManagedError(w, getErr)
+				return
+			}
+			node, nodeErr := h.repo.GetNodeByID(r.Context(), existing.NodeID)
+			if nodeErr != nil {
+				writeManagedError(w, nodeErr)
+				return
+			}
+			if protocolErr := validateSelfServiceNodeProtocol(node); protocolErr != nil {
+				writeManagedError(w, protocolErr)
 				return
 			}
 			if capabilityErr := h.requireManagedAgentCapabilities(r.Context(), existing.ServerID); capabilityErr != nil {
@@ -1312,6 +1344,12 @@ func (h *ManagedNodesHandler) catalogResponses(ctx context.Context, username str
 				response.ServerName = server.Name
 			}
 		}
+		if node, nodeErr := h.repo.GetNodeByID(ctx, entry.Offer.NodeID); nodeErr == nil {
+			if protocolErr := validateSelfServiceNodeProtocol(node); protocolErr != nil {
+				response.CanCreate = false
+				response.DisabledReason = protocolErr.Error()
+			}
+		}
 		responses = append(responses, response)
 	}
 	return responses, nil
@@ -1366,6 +1404,20 @@ func (h *ManagedNodesHandler) HandleUserManagedNodes(w http.ResponseWriter, r *h
 		}
 		if err := decodeManagedJSON(r, &request); err != nil {
 			writeManagedError(w, err)
+			return
+		}
+		offer, offerErr := h.repo.GetSelfServiceNodeOffer(r.Context(), request.OfferID)
+		if offerErr != nil {
+			writeManagedError(w, offerErr)
+			return
+		}
+		node, nodeErr := h.repo.GetNodeByID(r.Context(), offer.NodeID)
+		if nodeErr != nil {
+			writeManagedError(w, nodeErr)
+			return
+		}
+		if protocolErr := validateSelfServiceNodeProtocol(node); protocolErr != nil {
+			writeManagedError(w, protocolErr)
 			return
 		}
 		result, err := h.repo.ActivateUserNodeSelection(r.Context(), username, request.OfferID, username, time.Now().UTC())

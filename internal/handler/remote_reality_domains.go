@@ -315,7 +315,7 @@ func (h *RemoteManageHandler) HandleSetupSSL(w http.ResponseWriter, r *http.Requ
 		})
 		return
 	}
-	cert, certErr := h.findCertificateForRemoteDomain(ctx, rootDomain, id)
+	cert, certErr := h.findCertificateForRemoteDomain(ctx, domain, id)
 	if certErr != nil {
 		message := fmt.Sprintf("未找到可部署的 %s 证书: %v", rootDomain, certErr)
 		remoteWriteJSON(w, http.StatusConflict, map[string]any{
@@ -391,27 +391,45 @@ func (h *RemoteManageHandler) HandleSetupSSL(w http.ResponseWriter, r *http.Requ
 	})
 }
 
-// findCertificateForRemoteDomain 优先使用 server 专属证书，其次使用可以分发到
-// 任意节点的全局证书。只返回已有完整 PEM 的证书，避免把 pending 记录当成可用证书。
-func (h *RemoteManageHandler) findCertificateForRemoteDomain(ctx context.Context, rootDomain string, serverID int64) (*storage.Certificate, error) {
-	candidates := []struct {
-		domain   string
-		serverID int64
-	}{
-		{domain: rootDomain, serverID: serverID},
-		{domain: "*." + rootDomain, serverID: serverID},
-		{domain: "*." + rootDomain, serverID: 0},
-		{domain: rootDomain, serverID: 0},
+// findCertificateForRemoteDomain verifies the actual certificate SANs against
+// the complete server hostname. The database domain is only an index/label and
+// must not be treated as proof that a certificate covers a child hostname.
+func (h *RemoteManageHandler) findCertificateForRemoteDomain(ctx context.Context, hostname string, serverID int64) (*storage.Certificate, error) {
+	hostname = strings.ToLower(strings.TrimSpace(hostname))
+	certificates, err := h.repo.ListCertificates(ctx)
+	if err != nil {
+		return nil, err
 	}
-	for _, candidate := range candidates {
-		cert, err := h.repo.GetCertificateByDomain(ctx, candidate.domain, candidate.serverID)
-		if err != nil || cert == nil {
-			continue
+	owners := []int64{serverID}
+	if serverID != 0 {
+		owners = append(owners, 0)
+	}
+	now := time.Now()
+	for _, owner := range owners {
+		// Prefer an exact record, then a syntactically matching wildcard record,
+		// then any multi-SAN certificate that x509 confirms covers the hostname.
+		for matchKind := 0; matchKind < 3; matchKind++ {
+			for index := range certificates {
+				cert := &certificates[index]
+				if cert.RemoteServerID != owner || cert.Status != storage.CertStatusValid {
+					continue
+				}
+				if cert.ExpiryDate != nil && !cert.ExpiryDate.After(now) {
+					continue
+				}
+				recordDomain := strings.ToLower(strings.TrimSpace(cert.Domain))
+				recordKind := 2
+				if recordDomain == hostname {
+					recordKind = 0
+				} else if strings.HasPrefix(recordDomain, "*.") && certificateNameCoversHostname(recordDomain, hostname) {
+					recordKind = 1
+				}
+				if recordKind != matchKind || !certificateCoversHostname(cert.CertPEM, cert.KeyPEM, hostname, now) {
+					continue
+				}
+				return cert, nil
+			}
 		}
-		if strings.TrimSpace(cert.CertPEM) == "" || strings.TrimSpace(cert.KeyPEM) == "" {
-			continue
-		}
-		return cert, nil
 	}
 	return nil, storage.ErrCertificateNotFound
 }
@@ -504,6 +522,11 @@ func extractDomainsFromInbound(inbound map[string]interface{}, seen map[string]s
 	}
 
 	if realitySettings, _ := streamSettings["realitySettings"].(map[string]interface{}); realitySettings != nil {
+		if target, ok := realitySettings["target"].(string); ok {
+			addDomainCandidate(target, seen, out)
+		}
+		// Xray used dest as the legacy alias for target. Keep reading it so
+		// existing inbounds remain discoverable after the field migration.
 		if dest, ok := realitySettings["dest"].(string); ok {
 			addDomainCandidate(dest, seen, out)
 		}
