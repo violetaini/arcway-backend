@@ -758,14 +758,14 @@ func (h *SystemSettingsHandler) SetSubscriptionOutputFormat(w http.ResponseWrite
 	json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "订阅序列化格式已更新"})
 }
 
-// DefaultThemeKey 是「默认主题」系统设置的 KV 键。值:"flat"(扁平)/ "pixel"(妙妙屋像素风,默认)。
+// DefaultThemeKey 是「默认主题」系统设置的 KV 键。值:"flat"(现代扁平,默认)/ "pixel" / "anime"。
 // 无 mmw-theme-style cookie 的用户首屏用它决定初始主题(由 web.SetDefaultTheme 注入 index.html)。
 const DefaultThemeKey = "default_theme"
 
 func (h *SystemSettingsHandler) GetDefaultTheme(w http.ResponseWriter, r *http.Request) {
 	value, _ := h.repo.GetSystemSetting(r.Context(), DefaultThemeKey)
 	if value != "flat" && value != "pixel" && value != "anime" {
-		value = "pixel"
+		value = "flat"
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"success": true, "default_theme": value})

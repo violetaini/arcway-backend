@@ -14,12 +14,17 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"time"
 
+	"miaomiaowux/internal/auth"
 	"miaomiaowux/internal/storage"
 )
 
@@ -27,37 +32,46 @@ const (
 	migrateWorkDir      = "/tmp/mmwx-migrate"
 	defaultFetchTimeout = 5 * time.Minute // mmw 备份可能几十 MB,跨网络下载留足时间
 	maxBackupSizeBytes  = 500 << 20       // 500 MB,防止恶意 URL 让主控 OOM
-	migrateWorkPerm     = 0o755
-	migrateTempFilePerm = 0o644
+	maxExtractedBytes   = 1 << 30         // 1 GiB, ZIP 解压后所有有效条目的总上限
+	maxExtractedEntry   = 768 << 20       // 768 MiB, 单个 DB/订阅文件上限
+	maxArchiveEntries   = 10_000          // 防止海量空条目消耗 CPU/内存
+	migrateWorkPerm     = 0o700
+	migrateTempFilePerm = 0o600
+	migrationSessionTTL = 24 * time.Hour
 )
+
+var migrationIDPattern = regexp.MustCompile(`^[a-f0-9]{16,64}$`)
 
 // MigrateHandler 处理 /api/admin/migrate/* 系列接口。
 type MigrateHandler struct {
-	repo *storage.TrafficRepository
-	rm   *RemoteManageHandler
+	repo          *storage.TrafficRepository
+	rm            *RemoteManageHandler
+	subscribesDir string
 }
 
 func NewMigrateHandler(repo *storage.TrafficRepository, rm *RemoteManageHandler) *MigrateHandler {
-	return &MigrateHandler{repo: repo, rm: rm}
+	return &MigrateHandler{repo: repo, rm: rm, subscribesDir: mmwxSubscribesDir}
 }
 
 // ------- POST /api/admin/migrate/fetch-mmw-backup -------
 
 type fetchMmwBackupReq struct {
-	URL      string `json:"url"`
-	Username string `json:"username"`
-	Password string `json:"password"`
-	TOTP     string `json:"totp"`
+	URL                   string `json:"url"`
+	Username              string `json:"username"`
+	Password              string `json:"password"`
+	TOTP                  string `json:"totp"`
+	AllowInsecureLoopback bool   `json:"allow_insecure_loopback"`
 }
 
 type fetchMmwBackupResp struct {
 	Success        bool   `json:"success"`
-	BackupPath     string `json:"backup_path"`     // 完整 zip 暂存路径
-	DBPath         string `json:"db_path"`         // 解压出来的 mmw.db 路径
-	SubscribesDir  string `json:"subscribes_dir"`  // 解压出来的 subscribes/ 目录(可能为空字符串)
-	SubscribeCount int    `json:"subscribe_count"` // subscribes 目录内文件数
-	SizeBytes      int64  `json:"size_bytes"`      // zip 大小
-	DBSizeBytes    int64  `json:"db_size_bytes"`   // 解压后 db 大小
+	MigrationID    string `json:"migration_id"`
+	BackupPath     string `json:"backup_path,omitempty"`    // 旧前端兼容字段;新响应不再暴露服务端路径
+	DBPath         string `json:"db_path,omitempty"`        // 旧前端兼容字段
+	SubscribesDir  string `json:"subscribes_dir,omitempty"` // 旧前端兼容字段
+	SubscribeCount int    `json:"subscribe_count"`
+	SizeBytes      int64  `json:"size_bytes"`
+	DBSizeBytes    int64  `json:"db_size_bytes"`
 }
 
 func (h *MigrateHandler) FetchMmwBackup(w http.ResponseWriter, r *http.Request) {
@@ -70,21 +84,29 @@ func (h *MigrateHandler) FetchMmwBackup(w http.ResponseWriter, r *http.Request) 
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	req.URL = strings.TrimRight(strings.TrimSpace(req.URL), "/")
 	req.Username = strings.TrimSpace(req.Username)
 	if req.URL == "" || req.Username == "" || req.Password == "" {
 		writeJSONError(w, http.StatusBadRequest, "url, username, password 必填")
 		return
 	}
-	if !strings.HasPrefix(req.URL, "http://") && !strings.HasPrefix(req.URL, "https://") {
-		writeJSONError(w, http.StatusBadRequest, "url 必须以 http(s):// 开头")
+	sourceURL, err := validateMmwSourceURL(req.URL, req.AllowInsecureLoopback)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	req.URL = strings.TrimRight(sourceURL.String(), "/")
 
 	ctx, cancel := context.WithTimeout(r.Context(), defaultFetchTimeout)
 	defer cancel()
+	// Cleanup runs before authentication too: a failed prepare must not prevent
+	// stale sessions from being reclaimed on the next attempt.
+	if err := ensureMigrateWorkDir(); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("创建工作目录失败: %v", err))
+		return
+	}
+	cleanupExpiredMigrationSessions(time.Now())
 	// 不在 client 上设 Timeout — 完全靠 ctx 控制,避免和 ctx 重复
-	client := &http.Client{}
+	client := newMmwHTTPClient(sourceURL)
 
 	// 1. 登录 mmw 拿 token
 	token, err := mmwLogin(ctx, client, req.URL, req.Username, req.Password, req.TOTP)
@@ -94,15 +116,17 @@ func (h *MigrateHandler) FetchMmwBackup(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// 2. 准备暂存目录 + 随机文件名(防并发覆盖)
-	if err := os.MkdirAll(migrateWorkDir, migrateWorkPerm); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("创建工作目录失败: %v", err))
-		return
-	}
-	id, err := randomHex(8)
+	id, err := randomHex(16)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("生成随机 id 失败: %v", err))
 		return
 	}
+	keepSession := false
+	defer func() {
+		if !keepSession {
+			_ = removeMigrationSession(id)
+		}
+	}()
 	zipPath := filepath.Join(migrateWorkDir, id+".zip")
 
 	// 3. 调 mmw 备份下载接口
@@ -120,7 +144,7 @@ func (h *MigrateHandler) FetchMmwBackup(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	zf, err := os.OpenFile(zipPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, migrateTempFilePerm)
+	zf, err := os.OpenFile(zipPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, migrateTempFilePerm)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("打开本地暂存文件失败: %v", err))
 		return
@@ -145,7 +169,7 @@ func (h *MigrateHandler) FetchMmwBackup(w http.ResponseWriter, r *http.Request) 
 	subsDir := filepath.Join(migrateWorkDir, id+"-subs")
 	dbSize, subCount, err := extractMmwBackup(zipPath, dbPath, subsDir)
 	if err != nil {
-		os.Remove(zipPath)
+		_ = removeMigrationSession(id)
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("解压备份失败: %v", err))
 		return
 	}
@@ -154,13 +178,12 @@ func (h *MigrateHandler) FetchMmwBackup(w http.ResponseWriter, r *http.Request) 
 
 	respondJSON(w, http.StatusOK, fetchMmwBackupResp{
 		Success:        true,
-		BackupPath:     zipPath,
-		DBPath:         dbPath,
-		SubscribesDir:  subsDir,
+		MigrationID:    id,
 		SubscribeCount: subCount,
 		SizeBytes:      n,
 		DBSizeBytes:    dbSize,
 	})
+	keepSession = true
 }
 
 // ------- POST /api/admin/migrate/upload-mmw-backup -------
@@ -186,17 +209,24 @@ func (h *MigrateHandler) UploadMmwBackup(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if err := os.MkdirAll(migrateWorkDir, migrateWorkPerm); err != nil {
+	if err := ensureMigrateWorkDir(); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("创建工作目录失败: %v", err))
 		return
 	}
-	id, err := randomHex(8)
+	cleanupExpiredMigrationSessions(time.Now())
+	id, err := randomHex(16)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("生成随机 id 失败: %v", err))
 		return
 	}
+	keepSession := false
+	defer func() {
+		if !keepSession {
+			_ = removeMigrationSession(id)
+		}
+	}()
 	zipPath := filepath.Join(migrateWorkDir, id+".zip")
-	out, err := os.OpenFile(zipPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, migrateTempFilePerm)
+	out, err := os.OpenFile(zipPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, migrateTempFilePerm)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("写本地暂存失败: %v", err))
 		return
@@ -213,7 +243,7 @@ func (h *MigrateHandler) UploadMmwBackup(w http.ResponseWriter, r *http.Request)
 	subsDir := filepath.Join(migrateWorkDir, id+"-subs")
 	dbSize, subCount, err := extractMmwBackup(zipPath, dbPath, subsDir)
 	if err != nil {
-		os.Remove(zipPath)
+		_ = removeMigrationSession(id)
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("解压备份失败: %v", err))
 		return
 	}
@@ -222,13 +252,12 @@ func (h *MigrateHandler) UploadMmwBackup(w http.ResponseWriter, r *http.Request)
 
 	respondJSON(w, http.StatusOK, uploadMmwBackupResp{
 		Success:        true,
-		BackupPath:     zipPath,
-		DBPath:         dbPath,
-		SubscribesDir:  subsDir,
+		MigrationID:    id,
 		SubscribeCount: subCount,
 		SizeBytes:      n,
 		DBSizeBytes:    dbSize,
 	})
+	keepSession = true
 }
 
 // mmwLogin 调 $baseURL/api/login,若需 2FA 再调 /api/login/2fa,最终返回 access token。
@@ -303,14 +332,21 @@ func extractMmwBackup(zipPath, outDBPath, outSubsDir string) (int64, int, error)
 		return 0, 0, err
 	}
 	defer zr.Close()
+	if len(zr.File) > maxArchiveEntries {
+		return 0, 0, fmt.Errorf("zip 条目数超过限制 (%d)", maxArchiveEntries)
+	}
 
 	if err := os.MkdirAll(outSubsDir, migrateWorkPerm); err != nil {
 		return 0, 0, fmt.Errorf("创建 subscribes 目录失败: %w", err)
+	}
+	if err := os.Chmod(outSubsDir, migrateWorkPerm); err != nil {
+		return 0, 0, fmt.Errorf("设置 subscribes 目录权限失败: %w", err)
 	}
 
 	var dbSize int64
 	var dbFound bool
 	subCount := 0
+	var extractedTotal int64
 
 	for _, f := range zr.File {
 		if f.FileInfo().IsDir() {
@@ -324,11 +360,15 @@ func extractMmwBackup(zipPath, outDBPath, outSubsDir string) (int64, int, error)
 
 		// data/*.db → outDBPath(取第一个)
 		if !dbFound && strings.HasPrefix(strings.ToLower(clean), "data/") && strings.HasSuffix(strings.ToLower(clean), ".db") {
-			n, err := copyZipEntry(f, outDBPath)
+			if f.UncompressedSize64 > maxExtractedEntry || f.UncompressedSize64 > uint64(maxExtractedBytes)-uint64(extractedTotal) {
+				return 0, 0, errors.New("zip 解压数据超过 DB 大小或总大小限制")
+			}
+			n, err := copyZipEntry(f, outDBPath, maxExtractedEntry, maxExtractedBytes-extractedTotal)
 			if err != nil {
 				return 0, 0, fmt.Errorf("copy db: %w", err)
 			}
 			dbSize = n
+			extractedTotal += n
 			dbFound = true
 			continue
 		}
@@ -340,9 +380,14 @@ func extractMmwBackup(zipPath, outDBPath, outSubsDir string) (int64, int, error)
 				continue
 			}
 			target := filepath.Join(outSubsDir, base)
-			if _, err := copyZipEntry(f, target); err != nil {
+			if f.UncompressedSize64 > maxExtractedEntry || f.UncompressedSize64 > uint64(maxExtractedBytes)-uint64(extractedTotal) {
+				return 0, 0, errors.New("zip 解压订阅数据超过大小限制")
+			}
+			n, err := copyZipEntry(f, target, maxExtractedEntry, maxExtractedBytes-extractedTotal)
+			if err != nil {
 				return 0, 0, fmt.Errorf("copy subscribe %s: %w", clean, err)
 			}
+			extractedTotal += n
 			subCount++
 		}
 	}
@@ -353,18 +398,34 @@ func extractMmwBackup(zipPath, outDBPath, outSubsDir string) (int64, int, error)
 	return dbSize, subCount, nil
 }
 
-func copyZipEntry(f *zip.File, outPath string) (int64, error) {
+func copyZipEntry(f *zip.File, outPath string, entryLimit, totalRemaining int64) (int64, error) {
 	rc, err := f.Open()
 	if err != nil {
 		return 0, err
 	}
 	defer rc.Close()
-	out, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, migrateTempFilePerm)
+	if entryLimit <= 0 || totalRemaining <= 0 {
+		return 0, errors.New("zip 解压总大小超过限制")
+	}
+	out, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, migrateTempFilePerm)
 	if err != nil {
 		return 0, err
 	}
 	defer out.Close()
-	return io.Copy(out, rc)
+	limit := entryLimit
+	if totalRemaining < limit {
+		limit = totalRemaining
+	}
+	n, err := io.Copy(out, io.LimitReader(rc, limit+1))
+	if err != nil {
+		_ = os.Remove(outPath)
+		return n, err
+	}
+	if n > limit {
+		_ = os.Remove(outPath)
+		return n, errors.New("zip 解压单条目超过大小限制")
+	}
+	return n, nil
 }
 
 func randomHex(n int) (string, error) {
@@ -375,9 +436,272 @@ func randomHex(n int) (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+type migrationSessionPaths struct {
+	Zip  string
+	DB   string
+	Subs string
+}
+
+func migrationSession(id string) (migrationSessionPaths, error) {
+	id = strings.TrimSpace(id)
+	if !migrationIDPattern.MatchString(id) {
+		return migrationSessionPaths{}, errors.New("migration_id 无效")
+	}
+	return migrationSessionPaths{
+		Zip:  filepath.Join(migrateWorkDir, id+".zip"),
+		DB:   filepath.Join(migrateWorkDir, id+".db"),
+		Subs: filepath.Join(migrateWorkDir, id+"-subs"),
+	}, nil
+}
+
+func ensureMigrateWorkDir() error {
+	if err := os.MkdirAll(migrateWorkDir, migrateWorkPerm); err != nil {
+		return err
+	}
+	info, err := os.Lstat(migrateWorkDir)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("migration work directory must be a real directory")
+	}
+	// MkdirAll does not tighten an existing directory. Migration artifacts contain
+	// databases and are therefore never allowed to inherit a world-readable mode.
+	return os.Chmod(migrateWorkDir, migrateWorkPerm)
+}
+
+func removeMigrationSession(id string) error {
+	paths, err := migrationSession(id)
+	if err != nil {
+		return err
+	}
+	var errs []string
+	for _, path := range []string{paths.Zip, paths.DB} {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, err.Error())
+		}
+	}
+	if err := os.RemoveAll(paths.Subs); err != nil && !errors.Is(err, os.ErrNotExist) {
+		errs = append(errs, err.Error())
+	}
+	if len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+func cleanupExpiredMigrationSessions(now time.Time) {
+	entries, err := os.ReadDir(migrateWorkDir)
+	if err != nil {
+		return
+	}
+	cutoff := now.Add(-migrationSessionTTL)
+	ids := map[string]struct{}{}
+	for _, entry := range entries {
+		name := entry.Name()
+		id := ""
+		switch {
+		case strings.HasSuffix(name, ".zip"):
+			id = strings.TrimSuffix(name, ".zip")
+		case strings.HasSuffix(name, ".db"):
+			id = strings.TrimSuffix(name, ".db")
+		case strings.HasSuffix(name, "-subs"):
+			id = strings.TrimSuffix(name, "-subs")
+		}
+		if migrationIDPattern.MatchString(id) {
+			ids[id] = struct{}{}
+		}
+	}
+	for id := range ids {
+		paths, err := migrationSession(id)
+		if err != nil {
+			continue
+		}
+		latest := time.Time{}
+		for _, path := range []string{paths.Zip, paths.DB, paths.Subs} {
+			info, statErr := os.Stat(path)
+			if statErr != nil {
+				continue
+			}
+			if info.ModTime().After(latest) {
+				latest = info.ModTime()
+			}
+		}
+		if !latest.IsZero() && latest.Before(cutoff) {
+			if err := removeMigrationSession(id); err != nil {
+				log.Printf("[Migrate] cleanup expired session %s failed: %v", id, err)
+			}
+		}
+	}
+}
+
+func validateMigrationArtifact(path, id, suffix string, wantDir bool) (string, error) {
+	paths, err := migrationSession(id)
+	if err != nil {
+		return "", err
+	}
+	expected := paths.DB
+	if suffix == ".zip" {
+		expected = paths.Zip
+	} else if suffix == "-subs" {
+		expected = paths.Subs
+	}
+	clean, err := filepath.Abs(filepath.Clean(strings.TrimSpace(path)))
+	if err != nil || clean != expected {
+		return "", errors.New("migration artifact path 不在当前会话工作目录中")
+	}
+	info, err := os.Lstat(expected)
+	if err != nil {
+		return "", err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || (wantDir != info.IsDir()) || (!wantDir && !info.Mode().IsRegular()) {
+		return "", errors.New("migration artifact 类型无效")
+	}
+	return expected, nil
+}
+
+func resolveLegacyMigrationPaths(dbPath, subsDir string) (string, string, error) {
+	dbPath = strings.TrimSpace(dbPath)
+	clean, err := filepath.Abs(filepath.Clean(dbPath))
+	if err != nil {
+		return "", "", errors.New("db_path 无效")
+	}
+	rel, err := filepath.Rel(migrateWorkDir, clean)
+	if err != nil || strings.Contains(rel, string(filepath.Separator)) || filepath.Dir(rel) != "." || !strings.HasSuffix(rel, ".db") {
+		return "", "", errors.New("db_path 只能指向迁移工作目录内的会话数据库")
+	}
+	id := strings.TrimSuffix(filepath.Base(rel), ".db")
+	if !migrationIDPattern.MatchString(id) {
+		return "", "", errors.New("db_path 的会话 ID 无效")
+	}
+	resolvedDB, err := validateMigrationArtifact(clean, id, ".db", false)
+	if err != nil {
+		return "", "", fmt.Errorf("db_path 不可用: %w", err)
+	}
+	if strings.TrimSpace(subsDir) == "" {
+		return resolvedDB, "", nil
+	}
+	resolvedSubs, err := validateMigrationArtifact(subsDir, id, "-subs", true)
+	if err != nil {
+		return "", "", fmt.Errorf("subscribes_dir 不可用: %w", err)
+	}
+	return resolvedDB, resolvedSubs, nil
+}
+
+func resolveMigrationImportPaths(req importMmwReq) (string, string, error) {
+	if id := strings.TrimSpace(req.MigrationID); id != "" {
+		paths, err := migrationSession(id)
+		if err != nil {
+			return "", "", err
+		}
+		dbPath, err := validateMigrationArtifact(paths.DB, id, ".db", false)
+		if err != nil {
+			return "", "", fmt.Errorf("migration_id 不可用: %w", err)
+		}
+		if _, err := os.Lstat(paths.Subs); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return dbPath, "", nil
+			}
+			return "", "", fmt.Errorf("migration subscribes 不可用: %w", err)
+		}
+		if _, err := validateMigrationArtifact(paths.Subs, id, "-subs", true); err != nil {
+			return "", "", fmt.Errorf("migration subscribes 不可用: %w", err)
+		}
+		return dbPath, paths.Subs, nil
+	}
+	if strings.TrimSpace(req.DBPath) == "" {
+		return "", "", errors.New("migration_id 或 db_path 必填")
+	}
+	return resolveLegacyMigrationPaths(req.DBPath, req.SubscribesDir)
+}
+
+// CleanupMmwSession 删除一个迁移会话创建的 zip、db 和 subscribes 目录。
+// 只接受不透明 migration_id，绝不接受任意文件路径。
+func (h *MigrateHandler) CleanupMmwSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete && r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "only DELETE or POST")
+		return
+	}
+	var req struct {
+		MigrationID string `json:"migration_id"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	id := strings.TrimSpace(req.MigrationID)
+	if id == "" {
+		// DELETE /.../cleanup?id=... is intentionally not supported: accepting
+		// only JSON keeps the endpoint explicit and avoids ambiguous path parsing.
+		writeJSONError(w, http.StatusBadRequest, "migration_id 必填")
+		return
+	}
+	if err := removeMigrationSession(id); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			respondJSON(w, http.StatusOK, map[string]any{"success": true, "migration_id": id, "removed": false})
+			return
+		}
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"success": true, "migration_id": id, "removed": true})
+}
+
+func validateMmwSourceURL(raw string, allowInsecureLoopback bool) (*url.URL, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Scheme == "" || u.Host == "" || u.User != nil {
+		return nil, errors.New("url 必须是不含账号密码的 http(s) 地址")
+	}
+	if u.Path != "" && u.Path != "/" || u.RawQuery != "" || u.Fragment != "" {
+		return nil, errors.New("url 只能包含源面板的协议、主机和可选端口")
+	}
+	u.Path = ""
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return u, nil
+	case "http":
+		host := u.Hostname()
+		ip := net.ParseIP(host)
+		loopback := strings.EqualFold(host, "localhost") || (ip != nil && ip.IsLoopback())
+		if loopback && allowInsecureLoopback {
+			return u, nil
+		}
+		return nil, errors.New("远程源地址必须使用 HTTPS；HTTP 仅允许显式开启的 loopback 地址")
+	default:
+		return nil, errors.New("url 必须使用 https://（loopback 可显式使用 http://）")
+	}
+}
+
+func sameURLOrigin(a, b *url.URL) bool {
+	if a == nil || b == nil || !strings.EqualFold(a.Scheme, b.Scheme) || !strings.EqualFold(a.Hostname(), b.Hostname()) {
+		return false
+	}
+	port := func(u *url.URL) string {
+		if p := u.Port(); p != "" {
+			return p
+		}
+		if strings.EqualFold(u.Scheme, "https") {
+			return "443"
+		}
+		return "80"
+	}
+	return port(a) == port(b)
+}
+
+func newMmwHTTPClient(source *url.URL) *http.Client {
+	return &http.Client{
+		CheckRedirect: func(next *http.Request, via []*http.Request) error {
+			if len(via) > 0 && !sameURLOrigin(source, next.URL) {
+				return errors.New("拒绝跳转到非同源地址")
+			}
+			return nil
+		},
+	}
+}
+
 // ------- POST /api/admin/migrate/import-mmw -------
 
 type importMmwReq struct {
+	MigrationID   string `json:"migration_id"`
 	DBPath        string `json:"db_path"`        // mmw.db 路径
 	SubscribesDir string `json:"subscribes_dir"` // 可选:解压后的 subscribes/ 目录,内部文件会被拷到 mmwx subscribes/
 }
@@ -393,10 +717,10 @@ type importMmwResp struct {
 const mmwxSubscribesDir = "subscribes" // mmwx 默认订阅文件目录(相对工作目录)
 
 // ImportMmw 把 mmw 备份完整导入当前 mmwx 实例:
+//   - subscribes_dir(可选):先原子、幂等复制订阅文件，全部成功后才提交数据库
 //   - db_path:mmw.db,核心 9 张表合并到 mmwx db(INSERT OR IGNORE)
-//   - subscribes_dir(可选):订阅 yaml 文件复制到 mmwx 的 subscribes/ 目录
-//   - 把 subscribe_files / templates 的 created_by 字段填成"系统第一个 admin"用户名
-//     (mmw 没有 created_by 概念,默认归属管理员;这样能进入"我的订阅 / 我的模板"列表)
+//   - 把 subscribe_files / templates 的 created_by 字段填成当前认证 admin 用户名
+//     (mmw 没有 created_by 概念，不能按源库时间或 rowid 选择管理员)
 func (h *MigrateHandler) ImportMmw(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "only POST")
@@ -407,48 +731,64 @@ func (h *MigrateHandler) ImportMmw(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	dbPath := strings.TrimSpace(req.DBPath)
-	if dbPath == "" {
-		writeJSONError(w, http.StatusBadRequest, "db_path 必填")
+	admin := strings.TrimSpace(auth.UsernameFromContext(r.Context()))
+	adminUser, err := h.repo.GetUser(r.Context(), admin)
+	if err != nil || admin == "" || adminUser.Role != storage.RoleAdmin || !adminUser.IsActive {
+		writeJSONError(w, http.StatusForbidden, "当前认证管理员无效，已拒绝迁移")
 		return
 	}
-	if _, err := os.Stat(dbPath); err != nil {
-		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("db_path 不可读: %v", err))
+	dbPath, subsDir, err := resolveMigrationImportPaths(req)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	blocking, err := h.repo.MmwImportBlockingCounts(r.Context(), admin)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("迁移预检失败: %v", err))
+		return
+	}
+	if len(blocking) > 0 {
+		keys := make([]string, 0, len(blocking))
+		for key := range blocking {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		parts := make([]string, 0, len(keys))
+		for _, key := range keys {
+			parts = append(parts, fmt.Sprintf("%s=%d", key, blocking[key]))
+		}
+		respondJSON(w, http.StatusConflict, map[string]any{
+			"success":         false,
+			"error":           "迁移只允许导入空白 Arcway 实例；为避免 ID 冲突和关联错位已阻止导入。检测到：" + strings.Join(parts, ", "),
+			"blocking_counts": blocking,
+		})
 		return
 	}
 
-	// 1. 导入 db 数据
-	report, err := h.repo.ImportFromMmw(r.Context(), dbPath)
+	// 1. 先复制订阅文件。每个文件通过同目录临时文件 + hard link 原子落盘，
+	// 失败时数据库仍为空，管理员可直接重试；已成功的文件会被幂等跳过。
+	copied, skipped := 0, []string{}
+	if subsDir != "" {
+		if _, err := os.Stat(subsDir); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("读取 subscribes 失败: %v", err))
+			return
+		}
+		destination := h.subscribesDir
+		if strings.TrimSpace(destination) == "" {
+			destination = mmwxSubscribesDir
+		}
+		copied, skipped, err = copySubscribesDir(subsDir, destination)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("拷贝 subscribes 失败，未导入数据库，可直接重试: %v", err))
+			return
+		}
+	}
+
+	// 2. 文件已完整就位后，再以单事务导入数据库。
+	report, err := h.repo.ImportFromMmw(r.Context(), dbPath, admin)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("导入失败: %v", err))
 		return
-	}
-
-	// 2. 把 subscribe_files / templates 的空 created_by 设为系统 admin
-	admin := h.repo.GetSystemNodeOwner(r.Context()) // 第一个 role='admin' 用户名
-	if err := h.repo.AssignOwnershipForMmwImported(r.Context(), admin); err != nil {
-		report.Warnings = append(report.Warnings, fmt.Sprintf("分配 created_by=%s 失败: %v", admin, err))
-	}
-
-	// 2.5 妙妙屋备份可能带入它自己的 admin → 系统出现多个管理员。
-	//     只保留本实例第一个用户,其余 admin 一律降级为普通用户。
-	if demoted, err := h.repo.DemoteExtraAdmins(r.Context()); err != nil {
-		report.Warnings = append(report.Warnings, fmt.Sprintf("降级多余管理员失败: %v", err))
-	} else if demoted > 0 {
-		log.Printf("[Migrate] demoted %d extra admin(s) to user", demoted)
-	}
-
-	// 3. 拷贝 subscribes/ 目录里的 yaml 文件到 mmwx subscribes/
-	copied, skipped := 0, []string{}
-	if subsDir := strings.TrimSpace(req.SubscribesDir); subsDir != "" {
-		if _, err := os.Stat(subsDir); err == nil {
-			copied, skipped, err = copySubscribesDir(subsDir, mmwxSubscribesDir)
-			if err != nil {
-				report.Warnings = append(report.Warnings, fmt.Sprintf("拷贝 subscribes 失败: %v", err))
-			}
-		} else {
-			report.Warnings = append(report.Warnings, fmt.Sprintf("subscribes_dir 不存在: %s", subsDir))
-		}
 	}
 
 	log.Printf("[Migrate] imported mmw: db=%s users=%d user_tokens=%d nodes=%d sub_files=%d subs_copied=%d",
@@ -466,7 +806,7 @@ func (h *MigrateHandler) ImportMmw(w http.ResponseWriter, r *http.Request) {
 // 同名文件已存在 → 跳过(保留 mmwx 现有的,不覆盖),并把文件名加入 skipped 列表。
 // dst 目录不存在会自动建。
 func copySubscribesDir(src, dst string) (int, []string, error) {
-	if err := os.MkdirAll(dst, 0o755); err != nil {
+	if err := os.MkdirAll(dst, migrateWorkPerm); err != nil {
 		return 0, nil, err
 	}
 	entries, err := os.ReadDir(src)
@@ -476,7 +816,7 @@ func copySubscribesDir(src, dst string) (int, []string, error) {
 	copied := 0
 	var skipped []string
 	for _, e := range entries {
-		if e.IsDir() {
+		if !e.Type().IsRegular() {
 			continue
 		}
 		name := e.Name()
@@ -485,25 +825,71 @@ func copySubscribesDir(src, dst string) (int, []string, error) {
 		}
 		srcPath := filepath.Join(src, name)
 		dstPath := filepath.Join(dst, name)
-		if _, err := os.Stat(dstPath); err == nil {
+		if _, err := os.Lstat(dstPath); err == nil {
 			skipped = append(skipped, name)
 			continue
-		}
-		if err := copyFile(srcPath, dstPath); err != nil {
+		} else if !errors.Is(err, os.ErrNotExist) {
 			return copied, skipped, err
 		}
-		copied++
+		created, err := copyMigrationFile(srcPath, dstPath)
+		if err != nil {
+			return copied, skipped, err
+		}
+		if created {
+			copied++
+		} else {
+			skipped = append(skipped, name)
+		}
 	}
 	return copied, skipped, nil
 }
 
-// copyFile 复用 update.go 中的同名函数(同包内)。
+func copyMigrationFile(src, dst string) (created bool, err error) {
+	source, err := os.Open(src)
+	if err != nil {
+		return false, err
+	}
+	defer source.Close()
+
+	temporary, err := os.CreateTemp(filepath.Dir(dst), ".arcway-migrate-*")
+	if err != nil {
+		return false, err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(migrateTempFilePerm); err != nil {
+		_ = temporary.Close()
+		return false, err
+	}
+	if _, err := io.Copy(temporary, source); err != nil {
+		_ = temporary.Close()
+		return false, err
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return false, err
+	}
+	if err := temporary.Close(); err != nil {
+		return false, err
+	}
+
+	// Link is an atomic no-replace operation on the destination filesystem.
+	// A concurrent retry that wins the race is treated as an idempotent skip.
+	if err := os.Link(temporaryPath, dst); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
 
 // ------- POST /api/admin/migrate/takeover-external-xray -------
 
 type takeoverResultPerServer struct {
 	ServerID    int64  `json:"server_id"`
 	ServerName  string `json:"server_name"`
+	Success     bool   `json:"success"`
 	Detected    bool   `json:"detected"`
 	ConfigPath  string `json:"config_path,omitempty"`
 	ConfDir     string `json:"conf_dir,omitempty"`
@@ -578,12 +964,14 @@ func (h *MigrateHandler) TakeoverExternalXray(w http.ResponseWriter, r *http.Req
 			BackupDir   string `json:"backup_dir"`
 			Restarted   bool   `json:"restarted"`
 			Message     string `json:"message"`
+			Error       string `json:"error"`
 		}
 		if err := json.Unmarshal(raw, &ar); err != nil {
 			row.Error = fmt.Sprintf("parse agent resp: %v", err)
 			resp.Results = append(resp.Results, row)
 			continue
 		}
+		row.Success = ar.Success
 		row.Detected = ar.Detected
 		row.ConfigPath = ar.ConfigPath
 		row.ConfDir = ar.ConfDir
@@ -591,6 +979,13 @@ func (h *MigrateHandler) TakeoverExternalXray(w http.ResponseWriter, r *http.Req
 		row.BackupDir = ar.BackupDir
 		row.Restarted = ar.Restarted
 		row.Message = ar.Message
+		row.Error = ar.Error
+		if !ar.Success && row.Error == "" {
+			row.Error = strings.TrimSpace(ar.Message)
+			if row.Error == "" {
+				row.Error = "agent returned success=false"
+			}
+		}
 		resp.Results = append(resp.Results, row)
 	}
 
@@ -659,9 +1054,14 @@ func (h *MigrateHandler) PatchClientEmails(w http.ResponseWriter, r *http.Reques
 	var req patchClientEmailsReq
 	_ = json.NewDecoder(r.Body).Decode(&req) // body 可空
 
-	admin := h.repo.GetSystemNodeOwner(r.Context())
+	admin := strings.TrimSpace(auth.UsernameFromContext(r.Context()))
 	if admin == "" {
-		admin = "admin"
+		writeJSONError(w, http.StatusForbidden, "无法确定当前管理员")
+		return
+	}
+	if user, err := h.repo.GetUser(r.Context(), admin); err != nil || user.Role != storage.RoleAdmin || !user.IsActive {
+		writeJSONError(w, http.StatusForbidden, "当前认证管理员无效")
+		return
 	}
 
 	servers, err := h.repo.ListRemoteServers(r.Context())

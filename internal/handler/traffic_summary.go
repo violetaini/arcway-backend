@@ -115,7 +115,7 @@ func (h *TrafficSummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 		// 与限额判定口径一致(见 traffic_limit_enforcer:已用×TrafficMultiplier 比限额)。
 		if user.PackageID > 0 {
 			if pkg, perr := h.repo.GetPackage(ctx, user.PackageID); perr == nil {
-				totalLimit += pkg.TrafficLimitBytes
+				totalLimit += resolveTrafficLimitBytes(&user, pkg)
 				if raw, terr := h.repo.GetUserTotalTraffic(ctx, username); terr == nil {
 					totalUsed += raw * pkg.TrafficMultiplier()
 				}

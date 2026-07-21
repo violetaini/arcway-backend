@@ -1623,6 +1623,41 @@ func TestUpdateRemoteServerRejectsListenPortChange(t *testing.T) {
 	}
 }
 
+func TestUpdateRemoteServerValidatesDDNSBeforeMainUpdate(t *testing.T) {
+	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "traffic.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	server := &storage.RemoteServer{
+		Name: "ddns-before", Token: "ddns-token", Status: storage.RemoteServerStatusConnected,
+		PullAddress: "old.example.com", ConnectionMode: storage.ConnectionModeWebSocket,
+	}
+	if err := repo.CreateRemoteServer(context.Background(), server); err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(RemoteServerUpdateRequest{
+		ID: server.ID, Name: "should-not-save", PullAddress: "new.example.com",
+		DDNSEnabled: true, DDNSProviderID: 999999,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPut, "/api/admin/remote-servers/update", strings.NewReader(string(body)))
+	response := httptest.NewRecorder()
+	NewXrayServerHandler(repo, nil, nil).UpdateRemoteServer(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d want=%d body=%s", response.Code, http.StatusBadRequest, response.Body.String())
+	}
+	stored, err := repo.GetRemoteServer(context.Background(), server.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Name != "ddns-before" {
+		t.Fatalf("main server update was applied before DDNS validation: name=%q", stored.Name)
+	}
+}
+
 func TestCreateRemoteServerRejectsInvalidManagementPortPair(t *testing.T) {
 	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "traffic.db"))
 	if err != nil {

@@ -18,27 +18,29 @@ import (
 )
 
 type userEntry struct {
-	Username                 string            `json:"username"`
-	Email                    string            `json:"email"`
-	Nickname                 string            `json:"nickname"`
-	Avatar                   string            `json:"avatar_url"`
-	Role                     string            `json:"role"`
-	IsActive                 bool              `json:"is_active"`
-	Remark                   string            `json:"remark"`
-	PackageID                *int64            `json:"package_id"`
-	PackageName              string            `json:"package_name,omitempty"`
-	TrafficLimitGB           float64           `json:"traffic_limit_gb,omitempty"`
-	TrafficUsed              int64             `json:"traffic_used,omitempty"`
-	TrafficLimit             int64             `json:"traffic_limit,omitempty"`
-	TrafficMultiplier        int64             `json:"traffic_multiplier,omitempty"` // 套餐流量倍率(oneway=1/twoway=2),供首页按用户流量列表换算计费流量
-	IsOverLimit              bool              `json:"is_over_limit"`
-	IsReset                  bool              `json:"is_reset"`
-	ResetDay                 int               `json:"reset_day"`
-	PackageEndDate           *string           `json:"package_end_date,omitempty"`
-	SpeedLimitMbps           float64           `json:"speed_limit_mbps"`
-	DeviceLimit              int               `json:"device_limit"`
-	SpeedLimitOverride       *float64          `json:"speed_limit_override"`
-	DeviceLimitOverride      *int              `json:"device_limit_override"`
+	Username            string   `json:"username"`
+	Email               string   `json:"email"`
+	Nickname            string   `json:"nickname"`
+	Avatar              string   `json:"avatar_url"`
+	Role                string   `json:"role"`
+	IsActive            bool     `json:"is_active"`
+	Remark              string   `json:"remark"`
+	PackageID           *int64   `json:"package_id"`
+	PackageName         string   `json:"package_name,omitempty"`
+	TrafficLimitGB      float64  `json:"traffic_limit_gb,omitempty"`
+	TrafficUsed         int64    `json:"traffic_used,omitempty"`
+	TrafficLimit        int64    `json:"traffic_limit,omitempty"`
+	TrafficMultiplier   int64    `json:"traffic_multiplier,omitempty"` // 套餐流量倍率(oneway=1/twoway=2),供首页按用户流量列表换算计费流量
+	IsOverLimit         bool     `json:"is_over_limit"`
+	IsReset             bool     `json:"is_reset"`
+	ResetDay            int      `json:"reset_day"`
+	PackageEndDate      *string  `json:"package_end_date,omitempty"`
+	SpeedLimitMbps      float64  `json:"speed_limit_mbps"`
+	DeviceLimit         int      `json:"device_limit"`
+	SpeedLimitOverride  *float64 `json:"speed_limit_override"`
+	DeviceLimitOverride *int     `json:"device_limit_override"`
+	// nil=继承套餐,0=显式不限,>0=用户覆盖;TrafficLimit 是已解析后的有效值。
+	TrafficLimitOverrideGB   *float64          `json:"traffic_limit_override_gb"`
 	NodeSpeedLimitOverrides  map[int64]float64 `json:"node_speed_limit_overrides,omitempty"`
 	NodeDeviceLimitOverrides map[int64]int     `json:"node_device_limit_overrides,omitempty"`
 	// 短码:user_short_code 是系统自动生成的;custom_user_short_code 非空时优先生效。
@@ -126,12 +128,19 @@ func NewUserListHandler(repo *storage.TrafficRepository) http.Handler {
 			if user.PackageID > 0 {
 				pid := user.PackageID
 				entry.PackageID = &pid
+				var pkgPtr *storage.Package
 				if pkg, ok := pkgMap[pid]; ok {
+					pkgCopy := pkg
+					pkgPtr = &pkgCopy
 					entry.PackageName = pkg.Name
-					entry.TrafficLimitGB = pkg.TrafficLimitGB
-					entry.TrafficLimit = pkg.TrafficLimitBytes
 					entry.SpeedLimitMbps = pkg.SpeedLimitMbps
 					entry.DeviceLimit = pkg.DeviceLimit
+				}
+				entry.TrafficLimit = resolveTrafficLimitBytes(&user, pkgPtr)
+				entry.TrafficLimitGB = float64(entry.TrafficLimit) / userTrafficLimitBytesPerGB
+				if user.TrafficLimitOverride != nil {
+					gb := float64(*user.TrafficLimitOverride) / userTrafficLimitBytesPerGB
+					entry.TrafficLimitOverrideGB = &gb
 				}
 				used := trafficMap[user.Username]
 				if pkg, ok := pkgMap[pid]; ok {
@@ -139,7 +148,7 @@ func NewUserListHandler(repo *storage.TrafficRepository) http.Handler {
 					used *= pkg.TrafficMultiplier()
 				}
 				entry.TrafficUsed = used
-				if entry.TrafficLimit > 0 && entry.TrafficUsed >= entry.TrafficLimit {
+				if trafficLimitExceeded(entry.TrafficUsed, entry.TrafficLimit) {
 					entry.IsOverLimit = true
 				}
 				entry.IsReset = user.IsReset

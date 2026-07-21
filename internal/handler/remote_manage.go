@@ -41,6 +41,22 @@ type RemoteManageHandler struct {
 	inboundCache      *InboundCache // 从 xray config snapshot 派生,套餐绑/换绑 cred 计算用,setter 注入
 }
 
+const (
+	defaultRemoteOperationTimeout = 30 * time.Second
+	warpRemoteOperationTimeout    = 75 * time.Second
+)
+
+func remoteOperationTimeout(path string) time.Duration {
+	if strings.HasPrefix(path, "/api/child/warp/") {
+		return warpRemoteOperationTimeout
+	}
+	return defaultRemoteOperationTimeout
+}
+
+func remoteTransportContext(parent context.Context, path string) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(parent, remoteOperationTimeout(path))
+}
+
 // SetInboundCache 注入 inbound cache。nil = 不启用 cache(套餐绑回退到逐节点 GET inbounds 老路径)。
 func (h *RemoteManageHandler) SetInboundCache(c *InboundCache) {
 	h.inboundCache = c
@@ -52,7 +68,7 @@ func NewRemoteManageHandler(repo *storage.TrafficRepository, wsHandler *RemoteWS
 		repo:      repo,
 		wsHandler: wsHandler,
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: warpRemoteOperationTimeout,
 		},
 	}
 }
@@ -1381,7 +1397,9 @@ func (h *RemoteManageHandler) forwardToRemoteServerLeased(ctx context.Context, s
 
 	// 联邦(分享)服务器:不直连 agent,改走拥有方主控的 /api/federation/manage
 	if fed, ferr := h.repo.GetFederatedServer(ctx, serverID); ferr == nil {
-		return h.doFederationRequest(ctx, fed, method, path, body)
+		transportCtx, cancel := remoteTransportContext(ctx, path)
+		defer cancel()
+		return h.doFederationRequest(transportCtx, fed, method, path, body)
 	}
 
 	// WS-first:agent 上报 capabilities.rpc=true 且 WS 当前已连接 → 走反向 RPC,
@@ -1390,11 +1408,21 @@ func (h *RemoteManageHandler) forwardToRemoteServerLeased(ctx context.Context, s
 	//   - agent 老二进制不支持 RPC(Capabilities.RPC=false)→ tryWSRPC 直接 return nil,false
 	//   - WS 临时断开 / RPC 调用超时 → tryWSRPC 返回 ErrWSRPCUnavailable
 	//   - 业务级错误(handler 返回非 2xx)直接透传,**不** fallback(语义错就是错)
-	if respBody, ok, err := h.tryWSRPC(ctx, serverID, method, path, body); ok {
+	wsCtx, cancelWS := remoteTransportContext(ctx, path)
+	wsResp, ok, wsErr := h.tryWSRPC(wsCtx, serverID, method, path, body)
+	cancelWS()
+	if ok {
+		respBody, err = wsResp, wsErr
 		return respBody, err
 	}
 
-	server, err := h.repo.GetRemoteServer(ctx, serverID)
+	// A stalled reverse-RPC attempt must not consume the HTTP fallback budget.
+	// Give the fallback its own transport deadline while still honoring caller
+	// cancellation through the shared parent context.
+	fallbackCtx, cancelFallback := remoteTransportContext(ctx, path)
+	defer cancelFallback()
+
+	server, err := h.repo.GetRemoteServer(fallbackCtx, serverID)
 	if err != nil {
 		return nil, fmt.Errorf("server not found: %v", err)
 	}
@@ -1418,18 +1446,18 @@ func (h *RemoteManageHandler) forwardToRemoteServerLeased(ctx context.Context, s
 		var attemptErr error
 
 		if h.crypto == nil || h.crypto.Identity == nil {
-			attemptResp, attemptErr = h.doPlainPullRequest(ctx, method, childURL, server.Token, body)
+			attemptResp, attemptErr = h.doPlainPullRequest(fallbackCtx, method, childURL, server.Token, body)
 		} else {
 			sessionVal, ok := h.pullSessions.Load(serverID)
 			if !ok {
-				attemptResp, attemptErr = h.doPullKeyExchange(ctx, serverID, method, childURL, server.Token, body)
+				attemptResp, attemptErr = h.doPullKeyExchange(fallbackCtx, serverID, method, childURL, server.Token, body)
 			} else {
 				session := sessionVal.(*securechan.Session)
-				attemptResp, attemptErr = h.doEncryptedPullRequest(ctx, method, childURL, server.Token, body, session)
+				attemptResp, attemptErr = h.doEncryptedPullRequest(fallbackCtx, method, childURL, server.Token, body, session)
 				if isSessionInvalidErr(attemptErr) {
 					h.pullSessions.Delete(serverID)
 					log.Printf("[Remote Manage] Pull session invalid for server %d (%v), re-negotiating", serverID, attemptErr)
-					attemptResp, attemptErr = h.doPullKeyExchange(ctx, serverID, method, childURL, server.Token, body)
+					attemptResp, attemptErr = h.doPullKeyExchange(fallbackCtx, serverID, method, childURL, server.Token, body)
 				}
 			}
 		}

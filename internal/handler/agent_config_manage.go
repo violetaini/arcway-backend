@@ -955,6 +955,34 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		return
 	}
 
+	// Validate DDNS before changing any other server fields. A failed provider or
+	// domain check must not leave the main server update half-applied.
+	if req.DDNSEnabled {
+		effectivePull := strings.TrimSpace(req.PullAddress)
+		if effectivePull == "" {
+			effectivePull = strings.TrimSpace(oldServer.PullAddress)
+		}
+		if effectivePull == "" || net.ParseIP(effectivePull) != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(stdhttp.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: "DDNS 开启时,服务器地址必须填域名"})
+			return
+		}
+		if req.DDNSProviderID > 0 {
+			if _, perr := h.repo.GetDNSProvider(ctx, req.DDNSProviderID); perr != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(stdhttp.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: fmt.Sprintf("DDNS 服务商不存在: %v", perr)})
+				return
+			}
+		} else if _, cerr := h.repo.FindCertificateForDomain(ctx, effectivePull); cerr != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(stdhttp.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: fmt.Sprintf("DDNS 自动模式:找不到匹配 %s 的通配符证书,请先签发证书或显式选择 DNS 服务商", effectivePull)})
+			return
+		}
+	}
+
 	// 检测 traffic_source 是否变更 — 用于切换时自动迁移 offset,让 server.traffic_used 显示值连续,
 	// 避免用户从 xray 切到 system 时数字突然变小(只剩主控升级以来累积的几小时 system 流量),
 	// 反向切回也同样平滑。必须在 UpdateRemoteServer **之前**算 oldDisplay,否则 GetServerTrafficUsed
@@ -1053,38 +1081,12 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		}
 	}
 
-	// DDNS 配置变更:校验后 + 单独更新(UpdateRemoteServer 不带 DDNS 字段)
-	// 关闭时跳过校验直接关;开启时校验 PullAddress 是域名 + provider 存在
-	if req.DDNSEnabled {
-		// pull_address:用 update 里的 → 没传时 fallback 到 update 后的 oldServer 值
-		effectivePull := strings.TrimSpace(req.PullAddress)
-		if effectivePull == "" {
-			effectivePull = strings.TrimSpace(oldServer.PullAddress)
-		}
-		if effectivePull == "" || net.ParseIP(effectivePull) != nil {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(stdhttp.StatusBadRequest)
-			json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: "DDNS 开启时,服务器地址必须填域名"})
-			return
-		}
-		if req.DDNSProviderID > 0 {
-			if _, perr := h.repo.GetDNSProvider(ctx, req.DDNSProviderID); perr != nil {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(stdhttp.StatusBadRequest)
-				json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: fmt.Sprintf("DDNS 服务商不存在: %v", perr)})
-				return
-			}
-		} else {
-			if _, cerr := h.repo.FindCertificateForDomain(ctx, effectivePull); cerr != nil {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(stdhttp.StatusBadRequest)
-				json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: fmt.Sprintf("DDNS 自动模式:找不到匹配 %s 的通配符证书,请先签发证书或显式选择 DNS 服务商", effectivePull)})
-				return
-			}
-		}
-	}
 	if err := h.repo.UpdateRemoteServerDDNSConfig(ctx, req.ID, req.DDNSEnabled, req.DDNSProviderID); err != nil {
 		log.Printf("[Remote Server] Failed to update DDNS config for server %d: %v", req.ID, err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(stdhttp.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: fmt.Sprintf("更新 DDNS 配置失败: %s", err.Error())})
+		return
 	}
 
 	// 更新已用流量偏移量。优先级:

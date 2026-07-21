@@ -27,7 +27,7 @@ var (
 
 	themeMu      sync.RWMutex
 	servedIndex  []byte // indexBytes 替换占位符后的实际下发内容
-	currentTheme = "pixel"
+	currentTheme = "flat"
 )
 
 // SetDefaultTheme 更新首屏注入的默认主题(flat / pixel),供无 mmw-theme-style cookie 的用户决定初始主题。
@@ -35,7 +35,7 @@ var (
 func SetDefaultTheme(theme string) {
 	initOnce.Do(initialize)
 	if theme != "flat" && theme != "pixel" && theme != "anime" {
-		theme = "pixel"
+		theme = "flat"
 	}
 	themeMu.Lock()
 	defer themeMu.Unlock()
@@ -57,7 +57,7 @@ func initialize() {
 	if err != nil {
 		panic(err)
 	}
-	// 默认先按 pixel 替换占位符;main.go 启动后会用 DB 里的值再 SetDefaultTheme 一次。
+	// 默认先按 flat 替换占位符;main.go 启动后会用 DB 里的值再 SetDefaultTheme 一次。
 	servedIndex = bytes.ReplaceAll(indexBytes, []byte(themePlaceholder), []byte(currentTheme))
 
 	if info, err := fs.Stat(sub, "index.html"); err == nil {

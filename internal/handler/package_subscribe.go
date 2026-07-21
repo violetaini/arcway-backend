@@ -376,7 +376,8 @@ func (h *PackageSubscribeHandler) serveAllNodes(w http.ResponseWriter, r *http.R
 }
 
 func (h *PackageSubscribeHandler) writeTrafficHeader(ctx context.Context, w http.ResponseWriter, user storage.User, pkg *storage.Package) {
-	if pkg.TrafficLimitBytes <= 0 {
+	limitBytes := resolveTrafficLimitBytes(&user, pkg)
+	if limitBytes <= 0 {
 		return
 	}
 	// 已用流量 = 裸流量(SUM(uplink+downlink)) × 套餐倍率(oneway×1 / twoway×2),
@@ -385,7 +386,7 @@ func (h *PackageSubscribeHandler) writeTrafficHeader(ctx context.Context, w http
 	// 之前这里硬编码 download=0,导致客户端永远显示已用 0。
 	raw, _ := h.repo.GetUserTotalTraffic(ctx, user.Username)
 	used := raw * pkg.TrafficMultiplier()
-	info := fmt.Sprintf("upload=0; download=%d; total=%d", used, pkg.TrafficLimitBytes)
+	info := fmt.Sprintf("upload=0; download=%d; total=%d", used, limitBytes)
 	if user.PackageEndDate != nil {
 		info += fmt.Sprintf("; expire=%d", user.PackageEndDate.Unix())
 	}

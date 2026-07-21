@@ -34,8 +34,10 @@ type MmwImportReport struct {
 //   - 整体在事务里执行,失败回滚
 //   - 已存在(同 PRIMARY KEY / UNIQUE)的行用 IGNORE 跳过 — 不覆盖现有 mmwx 数据
 //
-// 调用方应在调用前确认目标 mmwx 数据库是空的(否则 IGNORE 跳过会让用户困惑)。
-func (r *TrafficRepository) ImportFromMmw(ctx context.Context, mmwDBPath string) (*MmwImportReport, error) {
+// 调用方应在调用前调用 MmwImportBlockingCounts 确认目标库为空白实例。
+// currentAdmin 非空时，导入事务内会保留该账号的管理员身份，将源库管理员降权，
+// 并把导入订阅/模板统一归属给该账号。使用可变参数仅为保持旧的内部调用兼容。
+func (r *TrafficRepository) ImportFromMmw(ctx context.Context, mmwDBPath string, currentAdmin ...string) (*MmwImportReport, error) {
 	if r == nil || r.db == nil {
 		return nil, errors.New("traffic repository not initialized")
 	}
@@ -168,6 +170,18 @@ func (r *TrafficRepository) ImportFromMmw(ctx context.Context, mmwDBPath string)
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	rollback := func() { _ = tx.Rollback() }
+	if len(currentAdmin) > 0 && strings.TrimSpace(currentAdmin[0]) != "" {
+		admin := strings.TrimSpace(currentAdmin[0])
+		blocking, err := mmwImportBlockingCountsTx(ctx, tx, admin)
+		if err != nil {
+			rollback()
+			return nil, fmt.Errorf("migration preflight: %w", err)
+		}
+		if len(blocking) > 0 {
+			rollback()
+			return nil, fmt.Errorf("destination is not blank: %v", blocking)
+		}
+	}
 
 	for _, spec := range specs {
 		// 检查 src 是否真有这些列;少的列对应 INSERT 给默认值(NULL/0/...)。
@@ -212,10 +226,102 @@ func (r *TrafficRepository) ImportFromMmw(ctx context.Context, mmwDBPath string)
 		}
 	}
 
+	if len(currentAdmin) > 0 && strings.TrimSpace(currentAdmin[0]) != "" {
+		admin := strings.TrimSpace(currentAdmin[0])
+		var role string
+		if err := tx.QueryRowContext(ctx, `SELECT role FROM main.users WHERE username = ?`, admin).Scan(&role); err != nil {
+			rollback()
+			return nil, fmt.Errorf("verify current admin: %w", err)
+		}
+		if role != RoleAdmin {
+			rollback()
+			return nil, errors.New("current migration owner is no longer an admin")
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE main.users SET role = ?, updated_at = CURRENT_TIMESTAMP WHERE role = ? AND username <> ?`,
+			RoleUser, RoleAdmin, admin,
+		); err != nil {
+			rollback()
+			return nil, fmt.Errorf("demote imported admins: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE main.subscribe_files SET created_by = ? WHERE created_by IS NULL OR created_by = ''`, admin,
+		); err != nil {
+			rollback()
+			return nil, fmt.Errorf("assign subscribe ownership: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE main.templates SET created_by = ? WHERE created_by IS NULL OR created_by = ''`, admin,
+		); err != nil {
+			rollback()
+			return nil, fmt.Errorf("assign template ownership: %w", err)
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit: %w", err)
 	}
 	return report, nil
+}
+
+// MmwImportBlockingCounts returns only non-zero business rows that make the
+// destination unsafe for the legacy ID-preserving import. The authenticated
+// current admin, its token, and its own user_settings row are installation
+// scaffolding and are allowed on an otherwise blank instance.
+func (r *TrafficRepository) MmwImportBlockingCounts(ctx context.Context, currentAdmin string) (map[string]int64, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("traffic repository not initialized")
+	}
+	currentAdmin = strings.TrimSpace(currentAdmin)
+	if currentAdmin == "" {
+		return nil, errors.New("current admin is required")
+	}
+	return mmwImportBlockingCountsDB(ctx, r.db, currentAdmin)
+}
+
+type mmwImportCountQuerier interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func mmwImportBlockingCountsTx(ctx context.Context, tx *sql.Tx, currentAdmin string) (map[string]int64, error) {
+	return mmwImportBlockingCountsDB(ctx, tx, currentAdmin)
+}
+
+func mmwImportBlockingCountsDB(ctx context.Context, db mmwImportCountQuerier, currentAdmin string) (map[string]int64, error) {
+	var role string
+	if err := db.QueryRowContext(ctx, `SELECT role FROM users WHERE username = ?`, currentAdmin).Scan(&role); err != nil {
+		return nil, fmt.Errorf("verify current admin: %w", err)
+	}
+	if role != RoleAdmin {
+		return nil, errors.New("current migration owner is not an admin")
+	}
+	queries := []struct {
+		name  string
+		query string
+		args  []any
+	}{
+		{name: "users", query: `SELECT COUNT(1) FROM users WHERE username <> ?`, args: []any{currentAdmin}},
+		{name: "user_tokens", query: `SELECT COUNT(1) FROM user_tokens WHERE username <> ?`, args: []any{currentAdmin}},
+		{name: "nodes", query: `SELECT COUNT(1) FROM nodes`},
+		{name: "subscribe_files", query: `SELECT COUNT(1) FROM subscribe_files`},
+		{name: "user_subscriptions", query: `SELECT COUNT(1) FROM user_subscriptions`},
+		{name: "user_settings", query: `SELECT COUNT(1) FROM user_settings WHERE username <> ?`, args: []any{currentAdmin}},
+		{name: "templates", query: `SELECT COUNT(1) FROM templates`},
+		{name: "custom_rules", query: `SELECT COUNT(1) FROM custom_rules`},
+		{name: "override_scripts", query: `SELECT COUNT(1) FROM override_scripts`},
+		{name: "external_subscriptions", query: `SELECT COUNT(1) FROM external_subscriptions`},
+	}
+	blocking := make(map[string]int64)
+	for _, item := range queries {
+		var count int64
+		if err := db.QueryRowContext(ctx, item.query, item.args...).Scan(&count); err != nil {
+			return nil, fmt.Errorf("count %s: %w", item.name, err)
+		}
+		if count > 0 {
+			blocking[item.name] = count
+		}
+	}
+	return blocking, nil
 }
 
 // txTableColumns 在事务上下文中用 PRAGMA table_info 取某张表的列名。

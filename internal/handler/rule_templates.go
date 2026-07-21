@@ -256,6 +256,17 @@ func (h *RuleTemplatesHandler) handleDeleteTemplate(w http.ResponseWriter, r *ht
 		http.Error(w, "Invalid template name", http.StatusBadRequest)
 		return
 	}
+	if h.repo != nil {
+		cfg, err := h.repo.GetSystemConfig(r.Context())
+		if err != nil {
+			http.Error(w, "读取默认模板设置失败", http.StatusInternalServerError)
+			return
+		}
+		if cfg.DefaultTemplateFilename == templateName {
+			http.Error(w, "默认模板不能删除，请先更换默认模板", http.StatusConflict)
+			return
+		}
+	}
 
 	templatesDir := "rule_templates"
 	templatePath := filepath.Join(templatesDir, templateName)
@@ -320,7 +331,18 @@ func (h *RuleTemplatesHandler) handleRenameTemplate(w http.ResponseWriter, r *ht
 		newName = newName + ".yaml"
 	}
 
-	// 归属校验:仅管理员或模板所有者可重命名
+	if h.repo != nil {
+		cfg, err := h.repo.GetSystemConfig(r.Context())
+		if err != nil {
+			http.Error(w, "读取默认模板设置失败", http.StatusInternalServerError)
+			return
+		}
+		if cfg.DefaultTemplateFilename == oldName {
+			http.Error(w, "默认模板不能重命名，请先更换默认模板", http.StatusConflict)
+			return
+		}
+	}
+	// 默认模板保护优先于归属判断，确保所有调用方都得到明确且一致的冲突语义。
 	if !h.canModifyRuleTemplate(r, oldName) {
 		http.Error(w, "无权重命名该模板", http.StatusForbidden)
 		return

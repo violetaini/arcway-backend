@@ -771,7 +771,7 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		if creator != "" {
 			if user, uerr := h.repo.GetUser(r.Context(), creator); uerr == nil && user.Role != storage.RoleAdmin && user.PackageID > 0 {
 				if pkg, perr := h.repo.GetPackage(r.Context(), user.PackageID); perr == nil && pkg != nil {
-					remoteTrafficLimit = pkg.TrafficLimitBytes
+					remoteTrafficLimit = resolveTrafficLimitBytes(&user, pkg)
 					if raw, terr := h.repo.GetUserTotalTraffic(r.Context(), creator); terr == nil {
 						remoteTrafficUsed = raw * pkg.TrafficMultiplier()
 					}

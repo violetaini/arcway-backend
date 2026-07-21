@@ -178,9 +178,9 @@ func (h *RemoteManageHandler) tryWSRPC(ctx context.Context, serverID int64, meth
 	}
 
 	cleanPath, query := splitPathQuery(path)
-	// 30s 总超时与 doPlainPullRequest / doEncryptedPullRequest 的 http.Client 默认 timeout 同款,
-	// 跨长 op(xray restart)够用,跨短 op 也不会拖延 fallback。
-	const wsRPCTimeout = 30 * time.Second
+	// WARP 注册/License 的 agent 端窗口为 60s，主控必须留出完整响应余量；
+	// 其余管理调用继续保持 30s，避免失联节点拖慢交互。
+	wsRPCTimeout := remoteOperationTimeout(cleanPath)
 	status, respBody, err := h.wsHandler.CallAgent(ctx, serverID, method, cleanPath, query, body, wsRPCTimeout)
 	if err != nil {
 		if errors.Is(err, ErrWSRPCUnavailable) {
