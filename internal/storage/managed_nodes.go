@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -499,18 +500,21 @@ func (r *TrafficRepository) CreateSelfServiceNodeOffer(ctx context.Context, node
 	var (
 		nodeEnabled    int
 		nodeType       string
+		nodeProtocol   string
+		clashConfig    string
 		inboundTag     string
 		originalServer string
 		serverName     string
 		xrayMode       string
 	)
 	err := r.db.QueryRowContext(ctx, `
-SELECT n.enabled, COALESCE(n.node_type, 'physical'), COALESCE(n.inbound_tag, ''),
+SELECT n.enabled, COALESCE(n.node_type, 'physical'), LOWER(COALESCE(n.protocol, '')),
+       COALESCE(n.clash_config, ''), COALESCE(n.inbound_tag, ''),
        COALESCE(n.original_server, ''), rs.name, COALESCE(rs.xray_mode, 'external')
 FROM nodes n
 JOIN remote_servers rs ON rs.id = ?
 WHERE n.id = ?`, serverID, nodeID).Scan(
-		&nodeEnabled, &nodeType, &inboundTag, &originalServer, &serverName, &xrayMode,
+		&nodeEnabled, &nodeType, &nodeProtocol, &clashConfig, &inboundTag, &originalServer, &serverName, &xrayMode,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrManagedServerMismatch
@@ -520,6 +524,9 @@ WHERE n.id = ?`, serverID, nodeID).Scan(
 	}
 	if nodeEnabled == 0 || nodeType != "physical" || strings.TrimSpace(inboundTag) == "" || originalServer != serverName || xrayMode != "embedded" {
 		return nil, ErrManagedServerMismatch
+	}
+	if !selfServiceProtocolEligible(nodeProtocol, clashConfig) {
+		return nil, fmt.Errorf("%w: protocol does not support isolated managed credentials", ErrManagedInvalidArgument)
 	}
 
 	now := time.Now().UTC()
@@ -538,6 +545,24 @@ VALUES (?, ?, ?, 1, 0, ?, ?, ?)`, nodeID, serverID, inboundTag, createdBy, now, 
 		return nil, fmt.Errorf("read self-service node offer id: %w", err)
 	}
 	return r.GetSelfServiceNodeOffer(ctx, id)
+}
+
+func selfServiceProtocolEligible(protocolName, clashConfig string) bool {
+	protocolName = strings.ToLower(strings.TrimSpace(protocolName))
+	switch protocolName {
+	case "vless", "vmess", "trojan", "anytls", "snell", "socks", "socks5", "http", "hysteria", "hysteria2", "hy2":
+		return true
+	case "ss", "shadowsocks":
+		var config map[string]interface{}
+		if json.Unmarshal([]byte(clashConfig), &config) != nil {
+			return false
+		}
+		cipher, _ := config["cipher"].(string)
+		cipher = strings.ToLower(strings.TrimSpace(cipher))
+		return cipher == "2022-blake3-aes-128-gcm" || cipher == "2022-blake3-aes-256-gcm"
+	default:
+		return false
+	}
 }
 
 func (r *TrafficRepository) GetSelfServiceNodeOffer(ctx context.Context, id int64) (*SelfServiceNodeOffer, error) {

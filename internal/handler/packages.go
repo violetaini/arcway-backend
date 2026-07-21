@@ -1748,6 +1748,7 @@ func shadowsocksKeyLength(method string) int {
 func generateCredential(protocol string, user storage.User, method, inboundTag string) (map[string]interface{}, string, error) {
 	cred := make(map[string]interface{})
 	email := user.Username + "__" + inboundTag
+	protocol = canonicalManagedProtocol(protocol)
 
 	switch strings.ToLower(protocol) {
 	case "vless", "vmess":
@@ -1810,7 +1811,7 @@ func filterCredentials(items []interface{}, savedCred map[string]interface{}, pr
 }
 
 func matchCredential(a, b map[string]interface{}, protocol string) bool {
-	switch strings.ToLower(protocol) {
+	switch canonicalManagedProtocol(protocol) {
 	case "vless", "vmess":
 		return fmt.Sprint(a["id"]) == fmt.Sprint(b["id"])
 	case "trojan", "anytls":

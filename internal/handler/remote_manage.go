@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -1971,6 +1972,7 @@ func validateInboundTLS(inboundReq map[string]interface{}) string {
 		return ""
 	}
 	protocol, _ := inbound["protocol"].(string)
+	protocol = canonicalManagedProtocol(protocol)
 	tls, _ := ss["tlsSettings"].(map[string]interface{})
 	certs, _ := tls["certificates"].([]interface{})
 	if len(certs) == 0 {
@@ -2298,6 +2300,240 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write(result)
+}
+
+// HandleCreateManagedNode creates a remote inbound and only reports success when
+// the corresponding database node exists. The legacy raw inbound endpoint keeps
+// its low-level semantics; this endpoint is the transactional UI workflow.
+func (h *RemoteManageHandler) HandleCreateManagedNode(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		remoteWriteError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	serverID, err := strconv.ParseInt(strings.TrimSpace(r.URL.Query().Get("server_id")), 10, 64)
+	if err != nil || serverID <= 0 {
+		remoteWriteError(w, http.StatusBadRequest, "invalid server_id")
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		remoteWriteError(w, http.StatusBadRequest, "failed to read body")
+		return
+	}
+	var request map[string]interface{}
+	if err := json.Unmarshal(body, &request); err != nil {
+		remoteWriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	action, _ := request["action"].(string)
+	if action != "" && !strings.EqualFold(strings.TrimSpace(action), "add") {
+		remoteWriteError(w, http.StatusBadRequest, "managed node creation only supports action=add")
+		return
+	}
+	request["action"] = "add"
+	nodeName, _ := request["node_name"].(string)
+	nodeName = strings.TrimSpace(nodeName)
+	if nodeName == "" {
+		remoteWriteError(w, http.StatusBadRequest, "node_name is required")
+		return
+	}
+	request["node_name"] = nodeName
+	inbound, _ := request["inbound"].(map[string]interface{})
+	tag, _ := inbound["tag"].(string)
+	protocol, _ := inbound["protocol"].(string)
+	tag = strings.TrimSpace(tag)
+	if inbound == nil || tag == "" || strings.TrimSpace(protocol) == "" {
+		remoteWriteError(w, http.StatusBadRequest, "inbound.tag and inbound.protocol are required")
+		return
+	}
+	inbound["tag"] = tag
+	body, err = json.Marshal(request)
+	if err != nil {
+		remoteWriteError(w, http.StatusBadRequest, "failed to normalize request")
+		return
+	}
+	server, err := h.repo.GetRemoteServer(r.Context(), serverID)
+	if err != nil || server == nil {
+		remoteWriteError(w, http.StatusNotFound, "server not found")
+		return
+	}
+	if !server.XrayRunning || (server.Status != "online" && server.Status != "connected") {
+		remoteWriteError(w, http.StatusConflict, "目标服务器或 Xray 当前不在线")
+		return
+	}
+	if _, found, lookupErr := h.findManagedNode(r.Context(), server.Name, tag); lookupErr != nil {
+		remoteWriteError(w, http.StatusInternalServerError, "failed to validate inbound tag")
+		return
+	} else if found {
+		remoteWriteError(w, http.StatusConflict, "该服务器已存在相同入站 Tag 的节点")
+		return
+	}
+
+	forwardRequest := r.Clone(r.Context())
+	forwardRequest.Body = io.NopCloser(bytes.NewReader(body))
+	forwardRequest.ContentLength = int64(len(body))
+	recorder := &managedNodeResponseRecorder{header: make(http.Header)}
+	h.HandleInbounds(recorder, forwardRequest)
+	if recorder.status >= http.StatusBadRequest {
+		if !managedNodeResponseIsPartial(recorder) {
+			copyHTTPResponse(w, recorder)
+			return
+		}
+		rollbackErr := h.rollbackManagedNode(r, serverID, server.Name, tag)
+		message := managedNodeResponseMessage(recorder, "入站后置同步失败")
+		if rollbackErr != nil {
+			remoteWriteError(w, http.StatusBadGateway, message+"；自动回滚也失败: "+rollbackErr.Error())
+			return
+		}
+		remoteWriteError(w, http.StatusBadGateway, message+"；已回滚远程入站和节点记录")
+		return
+	}
+	if success, message := managedNodeResponseSuccess(recorder); !success {
+		remoteWriteError(w, http.StatusBadGateway, message)
+		return
+	}
+
+	node, found, lookupErr := h.findManagedNode(r.Context(), server.Name, tag)
+	if lookupErr == nil && !found {
+		syncResult := h.syncInboundsToNodes(r.Context(), serverID, "", false)
+		node, found, err = h.findManagedNode(r.Context(), server.Name, tag)
+		lookupErr = err
+		if lookupErr == nil && !found && len(syncResult.Errors) > 0 {
+			lookupErr = fmt.Errorf("%s", strings.Join(syncResult.Errors, "; "))
+		}
+	}
+	if lookupErr == nil && !found {
+		lookupErr = errors.New("入站已创建，但节点同步未生成记录")
+	}
+	if lookupErr != nil {
+		if rollbackErr := h.rollbackManagedNode(r, serverID, server.Name, tag); rollbackErr != nil {
+			remoteWriteError(w, http.StatusBadGateway, "节点同步失败，自动回滚也失败: "+lookupErr.Error()+"；"+rollbackErr.Error())
+			return
+		}
+		remoteWriteError(w, http.StatusBadGateway, "节点同步失败，已回滚远程入站和节点记录: "+lookupErr.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "受管节点已创建",
+		"node_id": node.ID,
+		"node":    node,
+	})
+}
+
+func managedNodeResponseIsPartial(recorder *managedNodeResponseRecorder) bool {
+	var response struct {
+		Partial bool `json:"partial"`
+	}
+	return json.Unmarshal(recorder.body.Bytes(), &response) == nil && response.Partial
+}
+
+func managedNodeResponseMessage(recorder *managedNodeResponseRecorder, fallback string) string {
+	var response struct {
+		Message string `json:"message"`
+		Error   string `json:"error"`
+	}
+	if json.Unmarshal(recorder.body.Bytes(), &response) == nil {
+		if message := strings.TrimSpace(response.Message); message != "" {
+			return message
+		}
+		if message := strings.TrimSpace(response.Error); message != "" {
+			return message
+		}
+	}
+	return fallback
+}
+
+func managedNodeResponseSuccess(recorder *managedNodeResponseRecorder) (bool, string) {
+	var response struct {
+		Success *bool  `json:"success"`
+		Message string `json:"message"`
+		Error   string `json:"error"`
+	}
+	if json.Unmarshal(recorder.body.Bytes(), &response) != nil || response.Success == nil {
+		return false, "Agent 返回了无法确认的创建结果"
+	}
+	if *response.Success {
+		return true, ""
+	}
+	message := strings.TrimSpace(response.Message)
+	if message == "" {
+		message = strings.TrimSpace(response.Error)
+	}
+	if message == "" {
+		message = "Agent 拒绝创建入站"
+	}
+	return false, message
+}
+
+func (h *RemoteManageHandler) rollbackManagedNode(r *http.Request, serverID int64, serverName, tag string) error {
+	rollbackBody, _ := json.Marshal(map[string]interface{}{"action": "remove", "tag": tag})
+	rollbackRequest := r.Clone(context.Background())
+	rollbackRequest.Body = io.NopCloser(bytes.NewReader(rollbackBody))
+	rollbackRequest.ContentLength = int64(len(rollbackBody))
+	rollbackRequest.URL = cloneURLWithQuery(r, serverID)
+	rollbackRecorder := &managedNodeResponseRecorder{header: make(http.Header)}
+	h.HandleInbounds(rollbackRecorder, rollbackRequest)
+	if rollbackRecorder.status >= http.StatusBadRequest {
+		return errors.New(managedNodeResponseMessage(rollbackRecorder, fmt.Sprintf("回滚 HTTP %d", rollbackRecorder.status)))
+	}
+	if _, err := h.repo.DeleteNodesByInboundTag(context.Background(), serverName, tag); err != nil {
+		return fmt.Errorf("清理节点记录失败: %w", err)
+	}
+	return nil
+}
+
+type managedNodeResponseRecorder struct {
+	header http.Header
+	body   bytes.Buffer
+	status int
+}
+
+func (r *managedNodeResponseRecorder) Header() http.Header    { return r.header }
+func (r *managedNodeResponseRecorder) WriteHeader(status int) { r.status = status }
+func (r *managedNodeResponseRecorder) Write(body []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	return r.body.Write(body)
+}
+
+func copyHTTPResponse(w http.ResponseWriter, source *managedNodeResponseRecorder) {
+	for key, values := range source.header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	status := source.status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	w.WriteHeader(status)
+	_, _ = w.Write(source.body.Bytes())
+}
+
+func cloneURLWithQuery(r *http.Request, serverID int64) *url.URL {
+	next := *r.URL
+	query := next.Query()
+	query.Set("server_id", strconv.FormatInt(serverID, 10))
+	next.RawQuery = query.Encode()
+	return &next
+}
+
+func (h *RemoteManageHandler) findManagedNode(ctx context.Context, serverName, inboundTag string) (storage.Node, bool, error) {
+	nodes, err := h.repo.ListAllNodes(ctx)
+	if err != nil {
+		return storage.Node{}, false, err
+	}
+	for _, node := range nodes {
+		if node.OriginalServer == serverName && node.InboundTag == inboundTag {
+			return node, true, nil
+		}
+	}
+	return storage.Node{}, false, nil
 }
 
 // 过滤入站响应，移除空 tag 和 tag="api" 的入站
@@ -3691,6 +3927,7 @@ func (h *RemoteManageHandler) silentlyRemoveOrphanInbound(serverID int64, tag st
 // tunnelPort > 0 表示服务器使用隧道模式；将其用作节点的外部端口。
 func (h *RemoteManageHandler) inboundToClashProxy(inbound map[string]interface{}, serverHost, serverName string, tunnelPort int) (map[string]interface{}, error) {
 	protocol, _ := inbound["protocol"].(string)
+	protocol = canonicalManagedProtocol(protocol)
 	tag, _ := inbound["tag"].(string)
 	port, _ := inbound["port"].(float64)
 	settings, _ := inbound["settings"].(map[string]interface{})
@@ -3884,6 +4121,17 @@ func (h *RemoteManageHandler) inboundToClashProxy(inbound map[string]interface{}
 	}
 
 	return proxy, nil
+}
+
+func canonicalManagedProtocol(protocol string) string {
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case "ss":
+		return "shadowsocks"
+	case "hysteria2", "hy2":
+		return "hysteria"
+	default:
+		return strings.ToLower(strings.TrimSpace(protocol))
+	}
 }
 
 // 将流设置添加到 Clash 代理配置
