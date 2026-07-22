@@ -62,17 +62,18 @@ func (h *UserExtendHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	newEnd := base.AddDate(0, 0, req.Days)
 
-	// 续费只延长有效期,不改动按月重置:沿用用户当前重置日,否则每续一次费重置日就漂一次。
-	// is_reset 与绑定/TG 续期路径一致恒开启,顺带修好存量被写成 is_reset=0/reset_day=0 的用户。
+	// 续费只延长有效期,不改动用户的流量重置策略。特别是管理员显式
+	// 关闭按月重置后,快捷续期不能悄悄把它重新打开。
+	isReset := user.IsReset
 	resetDay := user.ResetDay
-	if resetDay < 1 || resetDay > 31 {
+	if isReset && (resetDay < 1 || resetDay > 31) {
 		resetDay = now.Day()
 		if resetDay > 28 {
 			resetDay = 28
 		}
 	}
 
-	warnings, perr := h.assign.AssignAndProvision(ctx, req.Username, user.PackageID, now, newEnd, true, resetDay)
+	warnings, perr := h.assign.AssignAndProvision(ctx, req.Username, user.PackageID, now, newEnd, isReset, resetDay)
 	if perr != nil {
 		writeJSONError(w, http.StatusInternalServerError, perr.Error())
 		return

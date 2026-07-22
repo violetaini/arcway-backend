@@ -8416,12 +8416,27 @@ UPDATE node_traffic       SET total_uplink = 0, total_downlink = 0, uplink = las
 // 返回新写入的行数。NOT EXISTS 保护:已有的不重复写。
 // BackfillUserResetFromPackage 一次性把「套餐开了按月重置、但用户行 is_reset=0」的存量用户按套餐刷回。
 // 历史 bug:web 绑定套餐只用请求体的 is_reset(前端恒发 false),导致套餐的按月重置对存量用户从未生效。
-// 只处理 is_reset=0 且套餐 is_reset=1 且 reset_day 合法的用户;不动用户已显式开启的重置设置。返回受影响行数。
-func (r *TrafficRepository) BackfillUserResetFromPackage(ctx context.Context) (int64, error) {
+// 新版允许管理员显式关闭用户级重置,因此必须用持久化 flag 保证 UPDATE 终身只执行一次。
+func (r *TrafficRepository) BackfillUserResetFromPackage(ctx context.Context) (n int64, alreadyDone bool, err error) {
 	if r == nil || r.db == nil {
-		return 0, errors.New("traffic repository not initialized")
+		return 0, false, errors.New("traffic repository not initialized")
 	}
-	res, err := r.db.ExecContext(ctx, `
+	const flagKey = "user_reset_from_package_v1_done"
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, false, fmt.Errorf("begin user reset backfill: %w", err)
+	}
+	defer tx.Rollback()
+
+	var flag string
+	if qerr := tx.QueryRowContext(ctx, "SELECT value FROM system_settings WHERE key = ?", flagKey).Scan(&flag); qerr != nil && qerr != sql.ErrNoRows {
+		return 0, false, fmt.Errorf("read user reset backfill flag: %w", qerr)
+	}
+	if flag == "1" {
+		return 0, true, nil
+	}
+
+	res, err := tx.ExecContext(ctx, `
 UPDATE users
 SET is_reset = 1,
     reset_day = (SELECT p.reset_day FROM packages p WHERE p.id = users.package_id)
@@ -8432,10 +8447,19 @@ WHERE package_id IS NOT NULL AND package_id > 0
       WHERE p.id = users.package_id AND p.is_reset = 1 AND p.reset_day BETWEEN 1 AND 31
   )`)
 	if err != nil {
-		return 0, fmt.Errorf("backfill user reset from package: %w", err)
+		return 0, false, fmt.Errorf("backfill user reset from package: %w", err)
 	}
-	n, _ := res.RowsAffected()
-	return n, nil
+	n, _ = res.RowsAffected()
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO system_settings (key, value, updated_at)
+VALUES (?, '1', CURRENT_TIMESTAMP)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP`, flagKey); err != nil {
+		return 0, false, fmt.Errorf("set user reset backfill flag: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, false, fmt.Errorf("commit user reset backfill: %w", err)
+	}
+	return n, false, nil
 }
 
 func (r *TrafficRepository) BackfillRoutedCreatorSubaccounts(ctx context.Context) (int64, error) {

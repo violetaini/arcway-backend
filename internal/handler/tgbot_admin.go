@@ -51,12 +51,35 @@ func (h *TGBotAPIHandler) SetPackageAssign(a *PackageAssignHandler) {
 }
 
 // assignPackage 绑定套餐:有下发器走完整下发(同 web),否则回退到仅写记录(兜底,不应发生)。
-func (h *TGBotAPIHandler) assignPackage(ctx context.Context, username string, packageID int64, start, end time.Time, isReset bool, resetDay int) error {
+func (h *TGBotAPIHandler) assignPackage(ctx context.Context, username string, packageID int64, start, end time.Time, isReset bool, resetDay int) ([]string, error) {
 	if h.assign != nil {
-		_, err := h.assign.AssignAndProvision(ctx, username, packageID, start, end, isReset, resetDay)
-		return err
+		return h.assign.AssignAndProvision(ctx, username, packageID, start, end, isReset, resetDay)
 	}
-	return h.repo.AssignPackageToUser(ctx, username, packageID, start, end, isReset, resetDay)
+	return nil, h.repo.AssignPackageToUser(ctx, username, packageID, start, end, isReset, resetDay)
+}
+
+func resolveTGResetPolicy(pkg *storage.Package, current *storage.User, now time.Time) (bool, int) {
+	isReset := pkg != nil && pkg.IsReset
+	resetDay := 1
+	if pkg != nil {
+		resetDay = pkg.ResetDay
+	}
+	// Redeeming the same package is a renewal, so preserve an administrator's
+	// user-level override. Switching packages starts from the target default.
+	if pkg != nil && current != nil && current.PackageID == pkg.ID {
+		isReset = current.IsReset
+		resetDay = current.ResetDay
+	}
+	if resetDay < 1 || resetDay > 31 {
+		resetDay = 1
+		if isReset {
+			resetDay = now.Day()
+			if resetDay > 28 {
+				resetDay = 28
+			}
+		}
+	}
+	return isReset, resetDay
 }
 
 // 向后兼容旧名字
@@ -397,6 +420,7 @@ func (h *TGBotAPIHandler) bindNew(ctx context.Context, w http.ResponseWriter,
 	_, _ = h.repo.GetOrCreateUserToken(ctx, requestedUsername)
 
 	pkgInfo := map[string]any{}
+	var warnings []string
 	if ic.PackageID != nil {
 		if pkg, perr := h.repo.GetPackage(ctx, *ic.PackageID); perr == nil && pkg != nil {
 			start := time.Now()
@@ -405,24 +429,23 @@ func (h *TGBotAPIHandler) bindNew(ctx context.Context, w http.ResponseWriter,
 			if ic.DurationMonths > 0 {
 				end = start.AddDate(0, ic.DurationMonths, 0)
 			}
-			// TG 绑定套餐一律开启按月重置:此后续费只需延长有效期,流量到 reset_day 自动归零。
-			// 重置日取注册当天(封顶 28,避开月末不存在的日期),顺带把各用户的重置日分散开。
-			// 注:旧逻辑是 isReset = ic.DurationMonths > 1,而实际签发的邀请码都是 1 个月,
-			// 于是恒为 false,再叠加 resetDay = pkg.ResetDay(0),TG 用户永远不会重置。
-			isReset := true
-			resetDay := start.Day()
-			if resetDay > 28 {
-				resetDay = 28
-			}
-			if aerr := h.assignPackage(ctx, requestedUsername, pkg.ID, start, end,
-				isReset, resetDay); aerr == nil {
+			// 新绑定遵循套餐默认策略,与 Web 分配入口保持一致。
+			isReset, resetDay := resolveTGResetPolicy(pkg, nil, start)
+			provisionWarnings, aerr := h.assignPackage(ctx, requestedUsername, pkg.ID, start, end,
+				isReset, resetDay)
+			if aerr == nil {
+				warnings = append(warnings, provisionWarnings...)
 				pkgInfo = map[string]any{
 					"package_name":     pkg.Name,
 					"traffic_limit_gb": pkg.TrafficLimitGB,
 					"cycle_days":       pkg.CycleDays,
 					"end_date":         end.Format("2006-01-02"),
 				}
+			} else {
+				warnings = append(warnings, "套餐分配失败,请联系管理员: "+aerr.Error())
 			}
+		} else {
+			warnings = append(warnings, "邀请码关联的套餐不存在,请联系管理员")
 		}
 	}
 
@@ -447,6 +470,7 @@ func (h *TGBotAPIHandler) bindNew(ctx context.Context, w http.ResponseWriter,
 		"kind":             "new",
 		"initial_password": respPw,
 		"package":          pkgInfo,
+		"warnings":         warnings,
 	})
 }
 
@@ -909,22 +933,15 @@ func (h *TGBotAPIHandler) redeem(w http.ResponseWriter, r *http.Request) {
 	} else {
 		end = base.AddDate(0, 0, pkg.CycleDays)
 	}
-	// 续费只延长有效期,不改动按月重置:沿用用户当前的重置日,否则每续一次费重置日就漂一次。
-	// is_reset 与绑定路径一致恒开启 —— 存量用户(历史上被写成 is_reset=0/reset_day=0)在续费时一并修好。
-	isReset := true
-	resetDay := user.ResetDay
-	if resetDay < 1 || resetDay > 31 {
-		resetDay = now.Day()
-		if resetDay > 28 {
-			resetDay = 28
-		}
-	}
+	// 同套餐续期保留用户级策略;兑换不同套餐时采用目标套餐默认策略。
+	isReset, resetDay := resolveTGResetPolicy(pkg, &user, now)
 
 	if err := h.repo.ConsumeInviteCode(ctx, ic.Code, existing, body.TelegramID); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "兑换失败: "+err.Error())
 		return
 	}
-	if err := h.assignPackage(ctx, existing, pkg.ID, now, end, isReset, resetDay); err != nil {
+	warnings, err := h.assignPackage(ctx, existing, pkg.ID, now, end, isReset, resetDay)
+	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "续期失败: "+err.Error())
 		return
 	}
@@ -933,7 +950,7 @@ func (h *TGBotAPIHandler) redeem(w http.ResponseWriter, r *http.Request) {
 	})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success": true, "kind": "renew", "username": existing,
-		"package_name": pkg.Name, "end_date": end.Format("2006-01-02"),
+		"package_name": pkg.Name, "end_date": end.Format("2006-01-02"), "warnings": warnings,
 	})
 }
 

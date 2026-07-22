@@ -1185,10 +1185,12 @@ func main() {
 		log.Printf("[Startup] BackfillRoutedCreatorSubaccounts: filled %d creator subaccount row(s) for legacy routed nodes", n)
 	}
 
-	// 一次性补:历史 bug 导致「套餐开了按月重置但用户行 is_reset=0」的存量用户从未重置。按套餐刷回。
-	// 幂等:只改 is_reset=0 且套餐要求重置的行;下次启动这些行已 is_reset=1,不再命中。
-	if n, err := repo.BackfillUserResetFromPackage(context.Background()); err != nil {
+	// 一次性补:历史 bug 导致「套餐开了按月重置但用户行 is_reset=0」的存量用户从未重置。
+	// system_settings flag 保证只跑一次,避免覆盖新版允许的用户级显式关闭。
+	if n, alreadyDone, err := repo.BackfillUserResetFromPackage(context.Background()); err != nil {
 		log.Printf("[Startup] BackfillUserResetFromPackage failed: %v", err)
+	} else if alreadyDone {
+		log.Printf("[Startup] BackfillUserResetFromPackage: already done, skip")
 	} else if n > 0 {
 		log.Printf("[Startup] BackfillUserResetFromPackage: enabled monthly reset for %d user(s) per their package", n)
 	}
