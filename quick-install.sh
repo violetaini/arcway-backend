@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-INSTALL_URL="https://raw.githubusercontent.com/violetaini/relaydock-backend/main/install.sh"
+INSTALL_URL="https://raw.githubusercontent.com/violetaini/relaydock/main/install.sh"
 TMP_DIR="$(mktemp -d /tmp/arcway-quick-install.XXXXXX)"
 chmod 0700 "$TMP_DIR"
 trap 'rm -rf "$TMP_DIR"' EXIT HUP INT TERM

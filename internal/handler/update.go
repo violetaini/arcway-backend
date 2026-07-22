@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	githubRepo   = "violetaini/relaydock-backend"
+	githubRepo   = "violetaini/relaydock"
 	githubAPIURL = "https://api.github.com/repos/%s/releases/latest"
 )
 

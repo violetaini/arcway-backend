@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   arcway:
-    image: ghcr.io/violetaini/relaydock-backend:latest
+    image: ghcr.io/violetaini/relaydock:latest
     container_name: arcway
     restart: unless-stopped
     # host 模式:RelayDock 要管 ACME 80/443、嵌入式 nginx/xray 多端口、agent 反向连接,

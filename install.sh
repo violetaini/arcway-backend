@@ -6,7 +6,7 @@
 set -e
 
 # 配置
-GITHUB_REPO="violetaini/relaydock-backend"
+GITHUB_REPO="violetaini/relaydock"
 VERSION=""  # 将自动获取最新版本
 BINARY_NAME=""  # 将根据架构自动设置
 INSTALL_DIR="${ARCWAY_INSTALL_DIR:-/usr/local/bin}"
