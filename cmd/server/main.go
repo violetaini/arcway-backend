@@ -506,6 +506,28 @@ func main() {
 	mux.Handle("/api/user/managed-nodes/{id}", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(managedNodesHandler.HandleUserManagedNode)))
 	mux.Handle("/api/user/managed-nodes/{id}/retry", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(managedNodesHandler.HandleUserManagedNodeRetry)))
 
+	// Forwarding management: admins define ordered server routes and grants;
+	// users can only create forwards against their own effective grants and
+	// managed-node access. Remote mutations go through the signed expiry guard.
+	forwardingHandler := handler.NewForwardingHandler(repo, handler.NewForwardingGuardDeployer(managedNodesHandler))
+	forwardingReconcileCtx, stopForwardingReconciler := context.WithCancel(context.Background())
+	forwardingHandler.StartReconciler(forwardingReconcileCtx)
+	mux.Handle("/api/admin/tunnel-templates", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(forwardingHandler.HandleAdminTunnelTemplates)))
+	mux.Handle("/api/admin/tunnel-templates/preflight", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(forwardingHandler.HandleAdminTunnelTemplatePreflight)))
+	mux.Handle("/api/admin/tunnel-templates/{id}", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(forwardingHandler.HandleAdminTunnelTemplate)))
+	mux.Handle("/api/admin/tunnel-templates/{id}/state", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(forwardingHandler.HandleAdminTunnelTemplateState)))
+	mux.Handle("/api/admin/users/{username}/tunnel-grants", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(forwardingHandler.HandleAdminUserTunnelGrants)))
+	mux.Handle("/api/admin/users/{username}/tunnel-grants/{id}", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(forwardingHandler.HandleAdminUserTunnelGrant)))
+	mux.Handle("/api/admin/users/{username}/tunnel-grants/{id}/{action}", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(forwardingHandler.HandleAdminUserTunnelGrantAction)))
+	mux.Handle("/api/admin/forwards", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(forwardingHandler.HandleAdminForwards)))
+	mux.Handle("/api/admin/forwards/{id}", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(forwardingHandler.HandleAdminForward)))
+	mux.Handle("/api/admin/forwards/{id}/{action}", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(forwardingHandler.HandleAdminForward)))
+	mux.Handle("/api/user/tunnel-grants", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(forwardingHandler.HandleUserTunnelGrants)))
+	mux.Handle("/api/user/forwards", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(forwardingHandler.HandleUserForwards)))
+	mux.Handle("/api/user/forwards/preflight", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(forwardingHandler.HandleUserForwardPreflight)))
+	mux.Handle("/api/user/forwards/{id}", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(forwardingHandler.HandleUserForward)))
+	mux.Handle("/api/user/forwards/{id}/{action}", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(forwardingHandler.HandleUserForward)))
+
 	// DDNS 管理器:agent 心跳触发 IPChanged 时同步 pull_address 域名的 A/AAAA 记录到新 IP。
 	// reconciler 跑后台 5min ticker 兜底失败重试(IPChanged 已消费 → 后续心跳 IP 不变就不会再触发,
 	// 没 reconciler 的话 DDNS 失败就永远卡住)。
@@ -1267,8 +1289,9 @@ func main() {
 		}
 	}()
 
-	waitForShutdown(srv, stopCollector, stopManagedReconciler)
+	waitForShutdown(srv, stopCollector, stopManagedReconciler, stopForwardingReconciler)
 	managedNodesHandler.WaitForReconciler()
+	forwardingHandler.WaitForReconciler()
 }
 
 func getAddr(config *ServerConfig, repo *storage.TrafficRepository) string {

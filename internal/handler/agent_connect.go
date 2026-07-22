@@ -1938,6 +1938,8 @@ cat > /etc/arcway-port-firewall.env << EOF
 ARCWAY_AGENT_PORT=${LISTEN_PORT}
 ARCWAY_GUARD_PORT=${GUARD_PORT}
 ARCWAY_PANEL_IPS='$PANEL_SOURCE_IPS'
+ARCWAY_FORWARD_PORT_START=39000
+ARCWAY_FORWARD_PORT_END=40000
 EOF
 chmod 0600 /etc/arcway-port-firewall.env
 cat > /usr/local/sbin/arcway-agent-firewall << 'EOF'
@@ -1951,6 +1953,14 @@ esac
 : "${ARCWAY_AGENT_PORT:?missing ARCWAY_AGENT_PORT}"
 : "${ARCWAY_GUARD_PORT:?missing ARCWAY_GUARD_PORT}"
 : "${ARCWAY_PANEL_IPS:?missing ARCWAY_PANEL_IPS}"
+: "${ARCWAY_FORWARD_PORT_START:?missing ARCWAY_FORWARD_PORT_START}"
+: "${ARCWAY_FORWARD_PORT_END:?missing ARCWAY_FORWARD_PORT_END}"
+case "$ARCWAY_FORWARD_PORT_START" in ''|*[!0-9]*) echo "ERROR: invalid Arcway forwarding port range" >&2; exit 1 ;; esac
+case "$ARCWAY_FORWARD_PORT_END" in ''|*[!0-9]*) echo "ERROR: invalid Arcway forwarding port range" >&2; exit 1 ;; esac
+if [ "$ARCWAY_FORWARD_PORT_START" -lt 1024 ] || [ "$ARCWAY_FORWARD_PORT_END" -gt 65535 ] || [ "$ARCWAY_FORWARD_PORT_START" -gt "$ARCWAY_FORWARD_PORT_END" ]; then
+    echo "ERROR: invalid Arcway forwarding port range" >&2
+    exit 1
+fi
 
 CONFIGURED_AGENT_PORT=$(awk -F: '/^[[:space:]]*listen_port[[:space:]]*:/ { value=$2; gsub(/["[:space:]]/, "", value); print value; exit }' /etc/mmw-agent/config.yaml 2>/dev/null || true)
 case "$CONFIGURED_AGENT_PORT" in
@@ -2073,6 +2083,9 @@ ensure_host_filter_chain() {
                 -m comment --comment "$HOST_FILTER_COMMENT" -j ACCEPT || return 1
         done
     done
+    "$HOST_FILTER_TOOL" -w 5 -t filter -A "$HOST_FILTER_CHAIN" \
+        -p tcp --dport "${ARCWAY_FORWARD_PORT_START}:${ARCWAY_FORWARD_PORT_END}" \
+        -m comment --comment "$HOST_FILTER_COMMENT" -j ACCEPT || return 1
     "$HOST_FILTER_TOOL" -w 5 -t filter -A "$HOST_FILTER_CHAIN" -m comment --comment "$HOST_FILTER_COMMENT" -j RETURN || return 1
     while "$HOST_FILTER_TOOL" -w 5 -t filter -C INPUT -m comment --comment "$HOST_FILTER_COMMENT" -j "$HOST_FILTER_CHAIN" >/dev/null 2>&1; do
         "$HOST_FILTER_TOOL" -w 5 -t filter -D INPUT -m comment --comment "$HOST_FILTER_COMMENT" -j "$HOST_FILTER_CHAIN" || return 1

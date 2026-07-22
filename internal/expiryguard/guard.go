@@ -20,7 +20,10 @@ import (
 	"miaomiaowux/internal/version"
 )
 
-const stateVersion = 1
+const (
+	stateVersion       = 2
+	legacyStateVersion = 1
+)
 
 var identityKeys = []string{"email", "id", "password", "user", "psk", "auth"}
 
@@ -35,21 +38,26 @@ type Schedule struct {
 }
 
 type stateFile struct {
-	Version    int        `json:"version"`
-	AgentToken string     `json:"agent_token,omitempty"`
-	Entries    []Schedule `json:"entries"`
+	Version    int              `json:"version"`
+	AgentToken string           `json:"agent_token,omitempty"`
+	Entries    []Schedule       `json:"entries"`
+	Tunnels    []TunnelResource `json:"tunnels,omitempty"`
 }
 
 type Guard struct {
-	mu         sync.Mutex
-	statePath  string
-	secret     string
-	agentToken string
-	agentURL   string
-	client     *http.Client
-	entries    map[string]Schedule
-	seenNonces map[string]time.Time
-	wake       chan struct{}
+	mu          sync.Mutex
+	tunnelOpsMu sync.Mutex
+	aclMu       sync.Mutex
+	statePath   string
+	secret      string
+	agentToken  string
+	agentURL    string
+	client      *http.Client
+	commands    CommandRunner
+	entries     map[string]Schedule
+	tunnels     map[string]TunnelResource
+	seenNonces  map[string]time.Time
+	wake        chan struct{}
 }
 
 func New(statePath, secret, agentToken, agentURL string, client *http.Client) (*Guard, error) {
@@ -69,7 +77,9 @@ func New(statePath, secret, agentToken, agentURL string, client *http.Client) (*
 		agentToken: agentToken,
 		agentURL:   agentURL,
 		client:     client,
+		commands:   OSCommandRunner{},
 		entries:    make(map[string]Schedule),
+		tunnels:    make(map[string]TunnelResource),
 		seenNonces: make(map[string]time.Time),
 		wake:       make(chan struct{}, 1),
 	}
@@ -107,7 +117,7 @@ func (g *Guard) load() error {
 	if err := json.Unmarshal(raw, &state); err != nil {
 		return fmt.Errorf("decode expiry state: %w", err)
 	}
-	if state.Version != stateVersion {
+	if state.Version != legacyStateVersion && state.Version != stateVersion {
 		return fmt.Errorf("unsupported expiry state version %d", state.Version)
 	}
 	if strings.TrimSpace(state.AgentToken) != "" {
@@ -120,6 +130,22 @@ func (g *Guard) load() error {
 		}
 		entry.NotAfter = entry.NotAfter.UTC()
 		g.entries[key] = entry
+	}
+	for _, resource := range state.Tunnels {
+		if err := validatePersistedTunnelResource(resource); err != nil {
+			return fmt.Errorf("expiry state contains an invalid tunnel resource: %w", err)
+		}
+		if _, exists := g.tunnels[resource.ResourceID]; exists {
+			return errors.New("expiry state contains duplicate tunnel resources")
+		}
+		resource.HardNotAfter = resource.HardNotAfter.UTC()
+		resource.LeaseUntil = resource.LeaseUntil.UTC()
+		resource.UpdatedAt = resource.UpdatedAt.UTC()
+		if resource.NextAttemptAt != nil {
+			next := resource.NextAttemptAt.UTC()
+			resource.NextAttemptAt = &next
+		}
+		g.tunnels[resource.ResourceID] = resource
 	}
 	return os.Chmod(g.statePath, 0600)
 }
@@ -134,6 +160,11 @@ func (g *Guard) persistLocked() (bool, error) {
 		entries = append(entries, entry)
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Key < entries[j].Key })
+	tunnels := make([]TunnelResource, 0, len(g.tunnels))
+	for _, resource := range g.tunnels {
+		tunnels = append(tunnels, resource)
+	}
+	sort.Slice(tunnels, func(i, j int) bool { return tunnels[i].ResourceID < tunnels[j].ResourceID })
 	temporary, err := os.CreateTemp(dir, ".expiry-state-*")
 	if err != nil {
 		return false, fmt.Errorf("create expiry state: %w", err)
@@ -146,7 +177,7 @@ func (g *Guard) persistLocked() (bool, error) {
 	}
 	encoder := json.NewEncoder(temporary)
 	encoder.SetEscapeHTML(false)
-	if err := encoder.Encode(stateFile{Version: stateVersion, AgentToken: g.agentToken, Entries: entries}); err != nil {
+	if err := encoder.Encode(stateFile{Version: stateVersion, AgentToken: g.agentToken, Entries: entries, Tunnels: tunnels}); err != nil {
 		temporary.Close()
 		return false, fmt.Errorf("encode expiry state: %w", err)
 	}
@@ -358,7 +389,7 @@ func (g *Guard) agentRequest(ctx context.Context, method, path string, payload i
 		return nil, err
 	}
 	defer response.Body.Close()
-	raw, readErr := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+	raw, readErr := io.ReadAll(io.LimitReader(response.Body, 4<<20))
 	if readErr != nil {
 		return nil, readErr
 	}
@@ -434,6 +465,10 @@ func (g *Guard) finishAttempt(entry Schedule, attemptErr error, now time.Time) {
 func (g *Guard) Run(ctx context.Context) {
 	timer := time.NewTimer(time.Hour)
 	defer timer.Stop()
+	// Recreate the guard-owned nftables table before processing deadlines. An
+	// apply request still performs the same rebuild synchronously, so a startup
+	// failure cannot silently grant a new tunnel without its requested ACL.
+	_ = g.InitializeTunnelSafety(ctx)
 	for {
 		now := time.Now().UTC()
 		due, next := g.due(now)
@@ -443,9 +478,18 @@ func (g *Guard) Run(ctx context.Context) {
 			cancel()
 			g.finishAttempt(entry, err, time.Now().UTC())
 		}
-		if len(due) > 0 {
+		dueTunnels, nextTunnel := g.dueTunnels(time.Now().UTC())
+		for _, resource := range dueTunnels {
+			attemptCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+			g.expireOrCleanupTunnel(attemptCtx, resource)
+			cancel()
+		}
+		if len(due) > 0 || len(dueTunnels) > 0 {
 			// Recompute after attempts so newly scheduled retries set the timer.
 			continue
+		}
+		if !nextTunnel.IsZero() && (next.IsZero() || nextTunnel.Before(next)) {
+			next = nextTunnel
 		}
 		wait := time.Hour
 		if !next.IsZero() {
@@ -528,11 +572,16 @@ func (g *Guard) Handler() http.Handler {
 			writeJSON(w, http.StatusUnauthorized, map[string]interface{}{"error": "unauthorized"})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"client_expiry": true,
-			"durable":       true,
-			"pending":       g.Pending(),
-		})
+		capabilities := map[string]interface{}{
+			"client_expiry":   true,
+			"durable":         true,
+			"pending":         g.Pending(),
+			"pending_tunnels": g.PendingTunnels(),
+		}
+		for key, value := range g.tunnelCapabilities(r.Context()) {
+			capabilities[key] = value
+		}
+		writeJSON(w, http.StatusOK, capabilities)
 	})
 	mux.HandleFunc("PUT /v1/schedules", func(w http.ResponseWriter, r *http.Request) {
 		raw, err := g.openRequest(r)
@@ -590,5 +639,6 @@ func (g *Guard) Handler() http.Handler {
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
 	})
+	g.registerTunnelRoutes(mux)
 	return mux
 }

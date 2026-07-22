@@ -577,6 +577,68 @@ func TestAcquireRemoteServerMutationLeaseIsReentrantAndReleaseIsIdempotent(t *te
 	}
 }
 
+func TestAcquireRemoteServerExclusiveMutationLeaseSerializesOrdinaryMutations(t *testing.T) {
+	repo, server := newRemoteInstallationTestServer(t)
+	ctx := context.Background()
+	leasedCtx, release, err := repo.AcquireRemoteServerExclusiveMutationLease(ctx, server.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	nestedCtx, nestedRelease, err := repo.AcquireRemoteServerMutationLease(leasedCtx, server.ID)
+	if err != nil || nestedCtx != leasedCtx {
+		t.Fatalf("nested ordinary lease under exclusive lease: ctx_same=%v err=%v", nestedCtx == leasedCtx, err)
+	}
+	nestedRelease()
+
+	ordinaryDone := make(chan error, 1)
+	go func() {
+		ordinaryCtx, ordinaryRelease, acquireErr := repo.AcquireRemoteServerMutationLease(ctx, server.ID)
+		if acquireErr == nil {
+			ordinaryRelease()
+			_ = ordinaryCtx
+		}
+		ordinaryDone <- acquireErr
+	}()
+	select {
+	case err := <-ordinaryDone:
+		t.Fatalf("ordinary mutation passed an active exclusive lease: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	release()
+	release()
+	select {
+	case err := <-ordinaryDone:
+		if err != nil {
+			t.Fatalf("ordinary mutation after exclusive release: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ordinary mutation remained blocked after exclusive release")
+	}
+}
+
+func TestAcquireRemoteServerExclusiveMutationLeaseRejectsUpgradeAndInstallation(t *testing.T) {
+	repo, server := newRemoteInstallationTestServer(t)
+	ctx := context.Background()
+	sharedCtx, release, err := repo.AcquireRemoteServerMutationLease(ctx, server.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repo.AcquireRemoteServerExclusiveMutationLease(sharedCtx, server.ID); err == nil {
+		t.Fatal("shared mutation lease was upgraded in place")
+	}
+	release()
+
+	if err := repo.BeginRemoteServerInstallation(ctx, server.ID, "exclusive-install", time.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repo.AcquireRemoteServerExclusiveMutationLease(ctx, server.ID); !errors.Is(err, ErrRemoteInstallationActive) {
+		t.Fatalf("exclusive lease during installation error=%v", err)
+	}
+}
+
 func TestRemoteServerAdminMutationsRejectActiveInstallation(t *testing.T) {
 	repo, server := newRemoteInstallationTestServer(t)
 	ctx := context.Background()

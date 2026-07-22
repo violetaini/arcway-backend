@@ -2819,6 +2819,9 @@ CREATE TABLE IF NOT EXISTS traffic_threshold_notified (
 	if err := r.migrateManagedNodes(); err != nil {
 		return err
 	}
+	if err := r.migrateForwarding(); err != nil {
+		return err
+	}
 
 	// 一次性数据修复:旧 ResolveUsernameByEmail 不识别 users.email 作为主账号 inbound 的 client.email,
 	// 把流量记到 username=email 的孤行(如 user_traffic.username='share@2ha.me' 而不是 'share')。
@@ -9752,6 +9755,75 @@ func (r *TrafficRepository) AcquireRemoteServerMutationLease(ctx context.Context
 	return leasedCtx, func() { releaseOnce.Do(unlock) }, nil
 }
 
+// AcquireRemoteServerExclusiveMutationLease serializes a multi-step operation
+// with every existing server mutation that uses AcquireRemoteServerMutationLease.
+// It is intended for operations such as forwarding-port reservation plus
+// remote inbound application, where two ordinary read-side leases would still
+// be able to race. A shared lease cannot be upgraded in place because doing so
+// would deadlock when another reader is present; callers must acquire the
+// exclusive lease before any nested server mutation.
+func (r *TrafficRepository) AcquireRemoteServerExclusiveMutationLease(ctx context.Context, serverID int64) (context.Context, func(), error) {
+	if r == nil || r.db == nil {
+		return nil, nil, errors.New("traffic repository not initialized")
+	}
+	if serverID <= 0 {
+		return nil, nil, errors.New("remote server id is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	state, _ := ctx.Value(remoteServerMutationLeaseContextKey{}).(remoteServerMutationLeaseContext)
+	if state.repo == r {
+		if _, exclusive := state.exclusiveServerIDs[serverID]; exclusive {
+			return ctx, func() {}, nil
+		}
+		if _, held := state.heldServerIDs[serverID]; held {
+			return nil, nil, errors.New("remote server mutation lease cannot be upgraded")
+		}
+	}
+
+	lease := r.remoteServerInstallationLease(serverID)
+	lease.Lock()
+	if err := ctx.Err(); err != nil {
+		lease.Unlock()
+		return nil, nil, err
+	}
+	active, err := r.IsRemoteServerInstallationActive(ctx, serverID)
+	if err != nil {
+		lease.Unlock()
+		return nil, nil, err
+	}
+	if active {
+		lease.Unlock()
+		return nil, nil, ErrRemoteInstallationActive
+	}
+
+	heldServerIDs := make(map[int64]struct{}, len(state.heldServerIDs)+1)
+	exclusiveServerIDs := make(map[int64]struct{}, len(state.exclusiveServerIDs)+1)
+	bypassServerIDs := make(map[int64]struct{}, len(state.bypassServerIDs))
+	if state.repo == r {
+		for heldID := range state.heldServerIDs {
+			heldServerIDs[heldID] = struct{}{}
+		}
+		for exclusiveID := range state.exclusiveServerIDs {
+			exclusiveServerIDs[exclusiveID] = struct{}{}
+		}
+		for bypassedID := range state.bypassServerIDs {
+			bypassServerIDs[bypassedID] = struct{}{}
+		}
+	}
+	heldServerIDs[serverID] = struct{}{}
+	exclusiveServerIDs[serverID] = struct{}{}
+	leasedCtx := context.WithValue(ctx, remoteServerMutationLeaseContextKey{}, remoteServerMutationLeaseContext{
+		repo:               r,
+		heldServerIDs:      heldServerIDs,
+		exclusiveServerIDs: exclusiveServerIDs,
+		bypassServerIDs:    bypassServerIDs,
+	})
+	var releaseOnce sync.Once
+	return leasedCtx, func() { releaseOnce.Do(lease.Unlock) }, nil
+}
+
 // WithRemoteServerMutationLease is the single-return convenience wrapper for
 // AcquireRemoteServerMutationLease. Multi-step handlers should acquire once and
 // defer release so reads, database writes, and cache updates share one lease.
@@ -11717,6 +11789,23 @@ func (r *TrafficRepository) DeleteRemoteServer(ctx context.Context, id int64) er
 		return fmt.Errorf("begin delete-server tx: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck // commit 成功后 rollback 为 no-op
+
+	// A forwarding route owns durable resources on the server. Deleting the
+	// server first would leave templates, allocations, and remote Guard
+	// resources orphaned, so require the operator to remove those references.
+	var forwardingReferenced int
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+    SELECT 1 FROM tunnel_template_hops WHERE server_id = ?
+    UNION ALL
+    SELECT 1 FROM user_forward_hops WHERE server_id = ?
+    UNION ALL
+    SELECT 1 FROM server_port_allocations WHERE server_id = ?
+)`, id, id, id).Scan(&forwardingReferenced); err != nil {
+		return fmt.Errorf("check forwarding server references: %w", err)
+	}
+	if forwardingReferenced != 0 {
+		return ErrForwardingConflict
+	}
 
 	// 1) 用户子账户:按 routed_node_id 关联,经 nodes.original_server 反查该服务器的(routed)节点。必须在删 nodes 之前。
 	if _, err := tx.ExecContext(ctx,

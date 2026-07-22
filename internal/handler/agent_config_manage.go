@@ -807,6 +807,10 @@ func (h *XrayServerHandler) DeleteRemoteServer(w stdhttp.ResponseWriter, r *stdh
 			msg = "服务器正在安装，暂不能删除"
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(stdhttp.StatusConflict)
+		} else if errors.Is(err, storage.ErrForwardingConflict) {
+			msg = "服务器仍被转发模板或转发规则使用，请先移除相关配置"
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(stdhttp.StatusConflict)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(RemoteServerResponse{

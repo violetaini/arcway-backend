@@ -18,6 +18,18 @@ import (
 
 const managedExpiryGuardPortOffset = 1
 
+type managedExpiryGuardHTTPError struct {
+	StatusCode int
+	Body       []byte
+}
+
+func (e *managedExpiryGuardHTTPError) Error() string {
+	if e == nil {
+		return "expiry guard request failed"
+	}
+	return fmt.Sprintf("expiry guard returned HTTP %d: %s", e.StatusCode, strings.TrimSpace(string(e.Body)))
+}
+
 type managedExpiryGuardCapabilities struct {
 	ClientExpiry bool `json:"client_expiry"`
 	Durable      bool `json:"durable"`
@@ -128,8 +140,10 @@ func (h *ManagedNodesHandler) callManagedExpiryGuard(ctx context.Context, server
 			continue
 		}
 		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-			lastErr = fmt.Errorf("expiry guard returned HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(responseBody)))
-			continue
+			// A completed HTTP response came from the intended Guard. Retrying the
+			// same application-level rejection through another address can mask its
+			// structured code with a later transport error.
+			return nil, &managedExpiryGuardHTTPError{StatusCode: response.StatusCode, Body: append([]byte(nil), responseBody...)}
 		}
 		return responseBody, nil
 	}

@@ -1,6 +1,6 @@
 package version
 
 // 版本是当前应用程序版本
-const Version = "0.3.29"
+const Version = "0.4.0"
 
 const AgentUserAgent = "miaomiaowux/0.1"

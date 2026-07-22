@@ -231,6 +231,9 @@ SET suspend_reason = ?, updated_at = ? WHERE username = ? AND suspend_reason != 
 WHERE grant_id IN (SELECT id FROM user_server_grants WHERE username = ?)`, now, username); err != nil {
 		return nil, fmt.Errorf("disable user managed selections: %w", err)
 	}
+	if err := prepareUserForwardDeletionTx(ctx, tx, username, actor, now); err != nil {
+		return nil, err
+	}
 	if err := appendManagedAccessAuditTx(ctx, tx, ManagedAccessAudit{
 		Actor: actor, Action: "user.deletion_prepared", EntityType: "user",
 		Username: username, Details: map[string]any{"desired_state": ManagedDesiredInactive},
@@ -298,6 +301,13 @@ WHERE username = ? AND (
 		return false, err
 	}
 	if pendingSources != 0 {
+		return false, nil
+	}
+	forwardingReady, err := userForwardDeletionReadyTx(ctx, tx, username)
+	if err != nil {
+		return false, err
+	}
+	if !forwardingReady {
 		return false, nil
 	}
 
@@ -376,6 +386,9 @@ func (r *TrafficRepository) FinalizeUserDeletion(ctx context.Context, username, 
 	}
 	if !ready {
 		return ErrUserDeletionPending
+	}
+	if err := finalizeUserForwardDeletionTx(ctx, tx, username); err != nil {
+		return err
 	}
 
 	steps := []struct {

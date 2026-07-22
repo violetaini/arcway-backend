@@ -194,6 +194,8 @@ func TestRemoteInstallScriptInstallsExpiryGuard(t *testing.T) {
 		"chmod 0600 /var/lib/arcway-expiry-guard/state.json",
 		"PANEL_SOURCE_IPS='203.0.113.10 2001:db8::10'",
 		"ARCWAY_PANEL_IPS='$PANEL_SOURCE_IPS'",
+		"ARCWAY_FORWARD_PORT_START=39000",
+		"ARCWAY_FORWARD_PORT_END=40000",
 		"ufw allow proto tcp from \"$PANEL_IP\" to any port \"$MANAGEMENT_PORT\"",
 		"comment 'arcway-managed'",
 		"/etc/arcway-port-firewall.env",
@@ -509,7 +511,7 @@ func TestRemoteInstallFirewallHelperReconcilesHostInputChain(t *testing.T) {
 	harness := `set -eu
 iptables -w 5 -t filter -P INPUT DROP
 ip6tables -w 5 -t filter -P INPUT DROP
-export ARCWAY_AGENT_PORT=23889 ARCWAY_GUARD_PORT=23890 ARCWAY_PANEL_IPS=203.0.113.10
+export ARCWAY_AGENT_PORT=23889 ARCWAY_GUARD_PORT=23890 ARCWAY_PANEL_IPS=203.0.113.10 ARCWAY_FORWARD_PORT_START=39000 ARCWAY_FORWARD_PORT_END=40000
 if PATH=` + shellSingleQuote(mockBin) + `:/usr/sbin:/usr/bin:/bin ` + shellSingleQuote(helperPath) + ` >` + shellSingleQuote(failureLog) + ` 2>&1; then
     exit 1
 fi
@@ -522,6 +524,7 @@ CHAIN_RULES=$(iptables -w 5 -t filter -S ARCWAY_PANEL_IN)
 [ "$(printf '%s\n' "$INPUT_RULES" | awk '/arcway-managed/ && /ARCWAY_PANEL_IN/ { count++ } END { print count+0 }')" -eq 1 ]
 [ "$(printf '%s\n' "$CHAIN_RULES" | awk '/203[.]0[.]113[.]10/ && /--dport 23889/ && /-j ACCEPT/ { count++ } END { print count+0 }')" -eq 1 ]
 [ "$(printf '%s\n' "$CHAIN_RULES" | awk '/203[.]0[.]113[.]10/ && /--dport 23890/ && /-j ACCEPT/ { count++ } END { print count+0 }')" -eq 1 ]
+[ "$(printf '%s\n' "$CHAIN_RULES" | awk '/--dport 39000:40000/ && /-j ACCEPT/ { count++ } END { print count+0 }')" -eq 1 ]
 ARCWAY_PANEL_IPS=198.51.100.20 ` + shellSingleQuote(helperPath) + `
 CHAIN_RULES=$(iptables -w 5 -t filter -S ARCWAY_PANEL_IN)
 ! printf '%s\n' "$CHAIN_RULES" | grep -F -- '203.0.113.10' >/dev/null

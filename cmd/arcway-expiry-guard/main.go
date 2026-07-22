@@ -36,6 +36,11 @@ func main() {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	startupCtx, startupCancel := context.WithTimeout(ctx, 30*time.Second)
+	if err := guard.InitializeTunnelSafety(startupCtx); err != nil {
+		log.Printf("Tunnel safety initialization: %v", err)
+	}
+	startupCancel()
 	go guard.Run(ctx)
 
 	server := &http.Server{
