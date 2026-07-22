@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"testing"
 
@@ -38,7 +39,7 @@ func TestPrepareImportedNodeOrdinaryUserCannotClaimManagedInbound(t *testing.T) 
 
 func TestApplyUserCredentialsFailsClosed(t *testing.T) {
 	managed := storage.Node{Protocol: "vless", OriginalServer: "edge-1", InboundTag: "vless-in"}
-	adminProxy := map[string]any{"uuid": "admin-uuid"}
+	adminProxy := map[string]any{"uuid": "admin-uuid", "flow": "xtls-rprx-vision"}
 
 	if applyUserCredentials(adminProxy, managed, nil) {
 		t.Fatal("managed node without a credential unexpectedly passed")
@@ -59,6 +60,18 @@ func TestApplyUserCredentialsFailsClosed(t *testing.T) {
 	if got := adminProxy["uuid"]; got != "user-uuid" {
 		t.Fatalf("uuid was not replaced, got %v", got)
 	}
+	if _, exists := adminProxy["flow"]; exists {
+		t.Fatalf("flow from the owner template was not removed: %#v", adminProxy)
+	}
+
+	visionProxy := map[string]any{"uuid": "admin-uuid"}
+	vision := map[credKey]string{{"edge-1", "vless-in"}: `{"id":"vision-user","flow":"xtls-rprx-vision"}`}
+	if !applyUserCredentials(visionProxy, managed, vision) {
+		t.Fatal("VLESS Vision credential was rejected")
+	}
+	if got := visionProxy["flow"]; got != "xtls-rprx-vision" {
+		t.Fatalf("VLESS Vision flow was not applied, got %v", got)
+	}
 
 	personal := storage.Node{Protocol: "vless"}
 	if !applyUserCredentials(map[string]any{"uuid": "personal"}, personal, nil) {
@@ -70,6 +83,47 @@ func TestApplyUserCredentialsFailsClosed(t *testing.T) {
 	socksCred := map[credKey]string{{"edge-1", "socks-in"}: `{"user":"alice","pass":"user-pass"}`}
 	if !applyUserCredentials(socksProxy, socksNode, socksCred) || socksProxy["username"] != "alice" || socksProxy["password"] != "user-pass" {
 		t.Fatalf("socks credential was not safely replaced: %#v", socksProxy)
+	}
+}
+
+func TestCloneClashWithCredentialSynchronizesVLESSFlow(t *testing.T) {
+	tests := []struct {
+		name       string
+		parent     string
+		credential map[string]interface{}
+		wantFlow   string
+	}{
+		{
+			name:       "adds Vision selected by the routed credential",
+			parent:     `{"name":"parent","type":"vless","uuid":"owner"}`,
+			credential: map[string]interface{}{"id": "vision-user", "flow": "xtls-rprx-vision"},
+			wantFlow:   "xtls-rprx-vision",
+		},
+		{
+			name:       "removes owner Vision for a no-flow credential",
+			parent:     `{"name":"parent","type":"vless","uuid":"owner","flow":"xtls-rprx-vision"}`,
+			credential: map[string]interface{}{"id": "standard-user"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cloned := cloneClashWithCredential(tt.parent, "vless", tt.credential, "routed")
+			var proxy map[string]interface{}
+			if err := json.Unmarshal([]byte(cloned), &proxy); err != nil {
+				t.Fatalf("parse cloned Clash config: %v", err)
+			}
+			if proxy["uuid"] != tt.credential["id"] || proxy["name"] != "routed" {
+				t.Fatalf("credential or name was not replaced: %#v", proxy)
+			}
+			if tt.wantFlow == "" {
+				if _, exists := proxy["flow"]; exists {
+					t.Fatalf("owner flow leaked into no-flow credential: %#v", proxy)
+				}
+			} else if proxy["flow"] != tt.wantFlow {
+				t.Fatalf("flow = %#v, want %q", proxy["flow"], tt.wantFlow)
+			}
+		})
 	}
 }
 

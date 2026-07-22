@@ -1509,7 +1509,12 @@ func cloneClashWithCredential(parentClash, protocol string, newCred map[string]i
 	}
 	// 凭据字段替换
 	switch strings.ToLower(protocol) {
-	case "vless", "vmess":
+	case "vless":
+		if id, ok := newCred["id"].(string); ok && id != "" {
+			pc["uuid"] = id
+			syncVLESSFlow(pc, newCred)
+		}
+	case "vmess":
 		if id, ok := newCred["id"].(string); ok && id != "" {
 			pc["uuid"] = id
 		}

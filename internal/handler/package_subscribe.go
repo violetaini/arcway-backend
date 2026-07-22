@@ -612,7 +612,13 @@ func applyCredToProxy(proxy map[string]any, protocol string, cred map[string]any
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(protocol)) {
-	case "vless", "vmess":
+	case "vless":
+		if id, ok := cred["id"].(string); ok && id != "" {
+			proxy["uuid"] = id
+			syncVLESSFlow(proxy, cred)
+			return true
+		}
+	case "vmess":
 		if id, ok := cred["id"].(string); ok && id != "" {
 			proxy["uuid"] = id
 			return true
@@ -662,6 +668,15 @@ func applyCredToProxy(proxy map[string]any, protocol string, cred map[string]any
 		}
 	}
 	return false
+}
+
+func syncVLESSFlow(proxy map[string]any, cred map[string]any) {
+	flow, _ := cred["flow"].(string)
+	if flow = strings.TrimSpace(flow); flow != "" {
+		proxy["flow"] = flow
+		return
+	}
+	delete(proxy, "flow")
 }
 
 // buildRoutedProxyForUser 为某用户 + 某 routed 节点生成订阅条目:
