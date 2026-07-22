@@ -1,12 +1,12 @@
 #!/bin/bash
 
-# Arcway - Xray shared-node control plane installer
+# RelayDock - Xray shared-node control plane installer
 # 适用于 Debian/Ubuntu Linux 系统
 
 set -e
 
 # 配置
-GITHUB_REPO="violetaini/arcway-backend"
+GITHUB_REPO="violetaini/relaydock-backend"
 VERSION=""  # 将自动获取最新版本
 BINARY_NAME=""  # 将根据架构自动设置
 INSTALL_DIR="${ARCWAY_INSTALL_DIR:-/usr/local/bin}"
@@ -62,7 +62,7 @@ acquire_install_lock() {
         return 1
     fi
     if ! flock -n 9; then
-        echo_error "另一个 Arcway 安装或更新进程正在运行"
+        echo_error "另一个 RelayDock 安装或更新进程正在运行"
         return 1
     fi
 }
@@ -515,18 +515,39 @@ create_systemd_service() {
         PANEL_SOURCE_IPS=$(sed -n 's/^Environment="ARCWAY_PANEL_IPS=\(.*\)"$/\1/p' "$SERVICE_FILE" | head -n 1)
     fi
 
+    # 覆盖安装时沿用当前端口；显式 PORT 始终优先。
+    CURRENT_SERVICE_PORT=""
+    if [ -f "$SERVICE_FILE" ]; then
+        CURRENT_SERVICE_PORT=$(sed -n 's/^Environment="PORT=\([0-9]*\)"$/\1/p' "$SERVICE_FILE" | head -n 1)
+    fi
+    DEFAULT_PORT=${CURRENT_SERVICE_PORT:-12889}
+
     # 询问端口号（支持非交互式环境）
     echo ""
-    if [ -t 0 ]; then
+    if [ -n "${PORT:-}" ]; then
+        PORT_INPUT=$PORT
+        echo_info "使用环境变量指定的端口: $PORT_INPUT"
+    elif [ -t 0 ]; then
         # 交互式环境，可以读取用户输入
-        read -r -p "请输入端口号（默认 12889，直接回车使用默认值）: " PORT_INPUT
+        read -r -p "请输入端口号（默认 $DEFAULT_PORT，直接回车使用默认值）: " PORT_INPUT
         if [ -z "$PORT_INPUT" ]; then
-            PORT_INPUT=12889
+            PORT_INPUT=$DEFAULT_PORT
         fi
     else
         # 非交互式环境（如管道），使用默认值
-        PORT_INPUT=${PORT:-12889}
+        PORT_INPUT=$DEFAULT_PORT
         echo_info "使用端口: $PORT_INPUT"
+    fi
+
+    case "$PORT_INPUT" in
+        ''|*[!0-9]*)
+            echo_error "端口必须是 1 到 65535 之间的整数"
+            return 1
+            ;;
+    esac
+    if [ "$PORT_INPUT" -lt 1 ] || [ "$PORT_INPUT" -gt 65535 ]; then
+        echo_error "端口必须是 1 到 65535 之间的整数"
+        return 1
     fi
 
     mkdir -p "$(dirname "$SERVICE_FILE")"
@@ -534,7 +555,7 @@ create_systemd_service() {
     staged_unit=$ATOMIC_STAGE_PATH
     cat > "$staged_unit" <<EOF
 [Unit]
-Description=Arcway shared-node control plane
+Description=RelayDock shared-node control plane
 After=network.target
 Wants=network-online.target
 
@@ -641,7 +662,7 @@ show_status() {
 
     echo ""
     echo "======================================"
-    echo_info "Arcway 安装完成！"
+    echo_info "RelayDock 安装完成！"
     echo "======================================"
     echo ""
     echo "📦 安装位置: $INSTALL_DIR/$SERVICE_NAME"
@@ -654,9 +675,8 @@ show_status() {
     echo "  重启服务: systemctl restart $SERVICE_NAME"
     echo "  查看状态: systemctl status $SERVICE_NAME"
     echo "  查看日志: journalctl -u $SERVICE_NAME -f"
-    echo "  更新版本: curl -sL https://raw.githubusercontent.com/${GITHUB_REPO}/main/install.sh | sudo bash -s update"
-    echo "  覆盖安装: curl -sL https://raw.githubusercontent.com/${GITHUB_REPO}/main/install.sh | sudo bash -s reinstall"
-    echo "  卸载服务: curl -sL https://raw.githubusercontent.com/${GITHUB_REPO}/main/install.sh | sudo bash -s uninstall"
+    echo "  更新、重装与卸载: 请按项目 README 下载脚本后执行对应操作"
+    echo "  使用说明: https://github.com/${GITHUB_REPO}#更新重装与卸载"
     echo ""
     echo "⚠️  首次访问需要完成初始化配置"
     echo ""
@@ -664,7 +684,7 @@ show_status() {
 
 # 更新服务
 update_service() {
-    echo_info "开始更新 Arcway..."
+    echo_info "开始更新 RelayDock..."
     echo ""
 
     # 检查服务是否已安装
@@ -739,7 +759,7 @@ update_service() {
 
 # 卸载服务
 uninstall_service() {
-    echo_info "开始卸载 Arcway..."
+    echo_info "开始卸载 RelayDock..."
     echo ""
 
     # 检查服务是否已安装
@@ -763,7 +783,7 @@ uninstall_service() {
     echo ""
 
     # 询问是否保留配置和数据
-    KEEP_DATA=false
+    KEEP_DATA=${ARCWAY_KEEP_DATA:-true}
     if [ -t 0 ]; then
         # 交互式环境
         echo "是否保留配置和数据？"
@@ -777,13 +797,11 @@ uninstall_service() {
             KEEP_DATA=true
         fi
     else
-        # 非交互式环境，检查环境变量
-        if [ "$KEEP_DATA" != "false" ]; then
-            KEEP_DATA=true
-        fi
+        # 非交互式环境默认保留数据；仅显式 ARCWAY_KEEP_DATA=false 时删除。
         if [ "$KEEP_DATA" = "true" ]; then
             echo_info "保留数据模式"
         else
+            echo_warn "ARCWAY_KEEP_DATA=false：将删除全部配置和数据"
             echo_info "完全删除模式"
         fi
     fi
@@ -822,14 +840,14 @@ uninstall_service() {
         echo "======================================"
         echo ""
         echo "如需重新安装:"
-        echo "  curl -sL https://raw.githubusercontent.com/${GITHUB_REPO}/main/install.sh | sudo bash"
+        echo "  请查看 https://github.com/${GITHUB_REPO}#快速安装"
     fi
     echo ""
 }
 
 # 覆盖安装（全量重装，保留数据）
 reinstall_service() {
-    echo_info "开始覆盖安装 Arcway..."
+    echo_info "开始覆盖安装 RelayDock..."
     echo ""
 
     # 下载和校验必须先完成，网络失败时保持当前服务运行。
@@ -888,7 +906,7 @@ main() {
         echo_info "进入卸载模式..."
         uninstall_service
     else
-        echo_info "开始安装 Arcway..."
+        echo_info "开始安装 RelayDock..."
         echo ""
 
         check_architecture

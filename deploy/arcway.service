@@ -1,5 +1,5 @@
 [Unit]
-Description=Arcway control plane
+Description=RelayDock control plane
 After=network-online.target
 Wants=network-online.target
 

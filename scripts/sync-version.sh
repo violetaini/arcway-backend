@@ -19,4 +19,4 @@ sed -i "s/const Version = \".*\"/const Version = \"$VERSION\"/" \
 sed -i "s/VERSION=\"v.*\"/VERSION=\"v$VERSION\"/" \
     "$PROJECT_ROOT/quick-install.sh"
 
-echo "Arcway Backend version synchronized: $VERSION"
+echo "RelayDock Backend version synchronized: $VERSION"

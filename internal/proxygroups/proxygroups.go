@@ -11,7 +11,7 @@ import (
 
 const (
 	// DefaultSourceURL 默认的远程配置地址
-	DefaultSourceURL = "https://raw.githubusercontent.com/violetaini/arcway-backend/main/configs/proxy-groups.json"
+	DefaultSourceURL = "https://raw.githubusercontent.com/violetaini/relaydock-backend/main/configs/proxy-groups.json"
 )
 
 var (

@@ -157,7 +157,7 @@ func installNginxLocal() error {
 	if isDocker() {
 		return nil
 	}
-	cmd := exec.Command("bash", "-c", "curl -fsSL https://raw.githubusercontent.com/violetaini/arcway-backend/main/install-nginx.sh | bash")
+	cmd := exec.Command("bash", "-c", "curl -fsSL https://raw.githubusercontent.com/violetaini/relaydock-backend/main/install-nginx.sh | bash")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()

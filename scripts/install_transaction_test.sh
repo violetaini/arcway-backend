@@ -185,6 +185,7 @@ make_old_installation() {
     case_root=$1
     enable_state=$2
     active_state=$3
+    panel_port=${4:-12889}
     install_dir="$case_root/bin"
     data_dir="$case_root/data"
     config_dir="$case_root/config"
@@ -209,7 +210,7 @@ $(if [ "$enable_state" = static ]; then printf '%s\n' '# MOCK_STATIC=1'; fi)
 [Service]
 Type=simple
 ExecStart=$install_dir/arcway
-Environment="PORT=12889"
+Environment="PORT=$panel_port"
 Environment="DATABASE_PATH=$data_dir/arcway.db"
 Environment="ARCWAY_GUARD_ASSET_DIR=$guard_dir"
 Environment="ARCWAY_PANEL_IPS=192.0.2.1"
@@ -352,7 +353,7 @@ PATH="$MOCK_BIN:/usr/bin:/bin" \
     ARCWAY_GUARD_ASSET_DIR="$SUCCESS_ROOT/lib/guard-assets" \
     ARCWAY_SYSTEMD_UNIT_DIR="$SUCCESS_ROOT/systemd" \
     ARCWAY_INSTALL_LOCK_FILE="$SUCCESS_ROOT/install.lock" \
-    PORT=12889 \
+    PORT=19090 \
     bash "$INSTALL_SCRIPT" reinstall >"$SUCCESS_ROOT/output.log" 2>&1
 grep -q '^new-arcway-linux-amd64$' "$SUCCESS_ROOT/bin/arcway" || fail "successful reinstall did not replace binary"
 grep -q '^old-binary$' "$SUCCESS_ROOT/bin/arcway.bak" || fail "successful reinstall did not atomically retain prior binary"
@@ -362,6 +363,40 @@ grep -q '^v-test$' "$SUCCESS_ROOT/data/.version" || fail "successful reinstall d
 [ "$(cat "$SUCCESS_ROOT/state/enabled")" = enabled ] || fail "successful reinstall is not enabled"
 [ "$(cat "$SUCCESS_ROOT/state/active")" = active ] || fail "successful reinstall is not active"
 [ -s "$SUCCESS_ROOT/verify.log" ] || fail "successful reinstall did not verify staged unit"
+grep -q '^Environment="PORT=19090"$' "$SUCCESS_ROOT/systemd/arcway.service" || fail "explicit PORT did not override the existing port"
+
+# A non-interactive reinstall keeps the current port when PORT is not provided.
+INHERIT_PORT_ROOT="$TEST_ROOT/inherit-port"
+make_old_installation "$INHERIT_PORT_ROOT" enabled active 18080
+PATH="$MOCK_BIN:/usr/bin:/bin" \
+    MOCK_APT_MARKER="$INHERIT_PORT_ROOT/apt-called" \
+    MOCK_VERIFY_LOG="$INHERIT_PORT_ROOT/verify.log" \
+    MOCK_STATE_DIR="$INHERIT_PORT_ROOT/state" \
+    ARCWAY_INSTALL_DIR="$INHERIT_PORT_ROOT/bin" \
+    ARCWAY_DATA_DIR="$INHERIT_PORT_ROOT/data" \
+    ARCWAY_CONFIG_DIR="$INHERIT_PORT_ROOT/config" \
+    ARCWAY_GUARD_ASSET_DIR="$INHERIT_PORT_ROOT/lib/guard-assets" \
+    ARCWAY_SYSTEMD_UNIT_DIR="$INHERIT_PORT_ROOT/systemd" \
+    ARCWAY_INSTALL_LOCK_FILE="$INHERIT_PORT_ROOT/install.lock" \
+    bash "$INSTALL_SCRIPT" reinstall >"$INHERIT_PORT_ROOT/output.log" 2>&1
+grep -q '^Environment="PORT=18080"$' "$INHERIT_PORT_ROOT/systemd/arcway.service" || fail "reinstall did not inherit the existing port"
+
+# A non-interactive uninstall preserves data unless deletion is explicitly requested.
+UNINSTALL_ROOT="$TEST_ROOT/uninstall-default"
+make_old_installation "$UNINSTALL_ROOT" enabled active
+PATH="$MOCK_BIN:/usr/bin:/bin" \
+    MOCK_STATE_DIR="$UNINSTALL_ROOT/state" \
+    ARCWAY_INSTALL_DIR="$UNINSTALL_ROOT/bin" \
+    ARCWAY_DATA_DIR="$UNINSTALL_ROOT/data" \
+    ARCWAY_CONFIG_DIR="$UNINSTALL_ROOT/config" \
+    ARCWAY_GUARD_ASSET_DIR="$UNINSTALL_ROOT/lib/guard-assets" \
+    ARCWAY_SYSTEMD_UNIT_DIR="$UNINSTALL_ROOT/systemd" \
+    ARCWAY_INSTALL_LOCK_FILE="$UNINSTALL_ROOT/install.lock" \
+    bash "$INSTALL_SCRIPT" uninstall >"$UNINSTALL_ROOT/output.log" 2>&1
+[ -f "$UNINSTALL_ROOT/data/arcway.db" ] || fail "non-interactive uninstall deleted data by default"
+[ ! -e "$UNINSTALL_ROOT/bin/arcway" ] || fail "uninstall did not remove the binary"
+[ ! -e "$UNINSTALL_ROOT/systemd/arcway.service" ] || fail "uninstall did not remove the systemd unit"
+grep -q '保留数据模式' "$UNINSTALL_ROOT/output.log" || fail "uninstall did not report preserved data"
 
 # flock is a hard prerequisite and is checked before apt/download activity.
 NO_FLOCK_BIN="$TEST_ROOT/no-flock-bin"

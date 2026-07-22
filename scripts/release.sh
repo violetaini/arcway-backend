@@ -23,5 +23,5 @@ git tag "v$NEW_VERSION"
 git push origin main
 git push origin "v$NEW_VERSION"
 
-echo "Arcway Backend v$NEW_VERSION tagged. GitHub Actions will publish binaries and GHCR."
-echo "Release: https://github.com/violetaini/arcway-backend/releases/tag/v$NEW_VERSION"
+echo "RelayDock Backend v$NEW_VERSION tagged. GitHub Actions will publish binaries and GHCR."
+echo "Release: https://github.com/violetaini/relaydock-backend/releases/tag/v$NEW_VERSION"

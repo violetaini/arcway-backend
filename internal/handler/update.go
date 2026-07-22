@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	githubRepo   = "violetaini/arcway-backend"
+	githubRepo   = "violetaini/relaydock-backend"
 	githubAPIURL = "https://api.github.com/repos/%s/releases/latest"
 )
 
