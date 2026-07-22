@@ -52,6 +52,60 @@ echo_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+# Preserve locations from installations created before the /usr/local layout.
+detect_existing_installation_paths() {
+    [ -f "$SERVICE_FILE" ] || return 0
+
+    local existing_exec=""
+    local existing_working_dir=""
+    local existing_database=""
+    local existing_guard_dir=""
+    local existing_env_file=""
+
+    existing_exec=$(sed -n 's/^ExecStart=\([^[:space:]]*\).*$/\1/p' "$SERVICE_FILE" | head -n 1)
+    existing_working_dir=$(sed -n 's/^WorkingDirectory=\([^[:space:]]*\).*$/\1/p' "$SERVICE_FILE" | head -n 1)
+    existing_database=$(sed -n 's/^Environment="DATABASE_PATH=\(.*\)"$/\1/p' "$SERVICE_FILE" | head -n 1)
+    existing_guard_dir=$(sed -n 's/^Environment="ARCWAY_GUARD_ASSET_DIR=\(.*\)"$/\1/p' "$SERVICE_FILE" | head -n 1)
+    existing_env_file=$(sed -n 's/^EnvironmentFile=-\{0,1\}\([^[:space:]]*\).*$/\1/p' "$SERVICE_FILE" | head -n 1)
+
+    if [ -n "$existing_env_file" ] && [ -f "$existing_env_file" ]; then
+        if [ -z "$existing_database" ]; then
+            existing_database=$(sed -n 's/^DATABASE_PATH=\(.*\)$/\1/p' "$existing_env_file" | head -n 1)
+        fi
+        if [ -z "$existing_guard_dir" ]; then
+            existing_guard_dir=$(sed -n 's/^ARCWAY_GUARD_ASSET_DIR=\(.*\)$/\1/p' "$existing_env_file" | head -n 1)
+        fi
+    fi
+
+    existing_database=${existing_database#\"}
+    existing_database=${existing_database%\"}
+    existing_guard_dir=${existing_guard_dir#\"}
+    existing_guard_dir=${existing_guard_dir%\"}
+
+    if [ "${ARCWAY_INSTALL_DIR+x}" != "x" ] && [ -n "$existing_exec" ] && [ "$(basename "$existing_exec")" = "$SERVICE_NAME" ]; then
+        INSTALL_DIR=$(dirname "$existing_exec")
+    fi
+    if [ "${ARCWAY_DATA_DIR+x}" != "x" ]; then
+        if [ -n "$existing_database" ]; then
+            DATA_DIR=$(dirname "$existing_database")
+        elif [ -n "$existing_working_dir" ] && [ -d "$existing_working_dir/data" ]; then
+            DATA_DIR="$existing_working_dir/data"
+        elif [ -n "$existing_working_dir" ] && [ -f "$existing_working_dir/.version" ]; then
+            DATA_DIR="$existing_working_dir"
+        fi
+    fi
+    if [ "${ARCWAY_CONFIG_DIR+x}" != "x" ] && [ -n "$existing_env_file" ]; then
+        CONFIG_DIR=$(dirname "$existing_env_file")
+    fi
+    if [ "${ARCWAY_GUARD_ASSET_DIR+x}" != "x" ] && [ -n "$existing_guard_dir" ]; then
+        GUARD_ASSET_DIR="$existing_guard_dir"
+    fi
+
+    if [ -n "$existing_exec" ]; then
+        echo_info "检测到现有安装布局: $INSTALL_DIR（数据目录: $DATA_DIR）"
+    fi
+}
+
 acquire_install_lock() {
     if ! command -v flock >/dev/null 2>&1; then
         echo_error "系统缺少 flock，无法安全执行安装事务"
@@ -888,6 +942,7 @@ reinstall_service() {
 main() {
     check_root
     acquire_install_lock
+    detect_existing_installation_paths
 
     # 检查命令行参数
     if [ "$1" = "update" ]; then

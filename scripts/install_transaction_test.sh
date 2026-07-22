@@ -381,6 +381,25 @@ PATH="$MOCK_BIN:/usr/bin:/bin" \
     bash "$INSTALL_SCRIPT" reinstall >"$INHERIT_PORT_ROOT/output.log" 2>&1
 grep -q '^Environment="PORT=18080"$' "$INHERIT_PORT_ROOT/systemd/arcway.service" || fail "reinstall did not inherit the existing port"
 
+# Update mode discovers legacy paths from the installed unit and its environment file.
+LEGACY_UPDATE_ROOT="$TEST_ROOT/legacy-update"
+make_old_installation "$LEGACY_UPDATE_ROOT" enabled active
+sed -i '/^Environment="ARCWAY_GUARD_ASSET_DIR=/d' "$LEGACY_UPDATE_ROOT/systemd/arcway.service"
+sed -i "/^\[Service\]/a EnvironmentFile=$LEGACY_UPDATE_ROOT/config/arcway.env" "$LEGACY_UPDATE_ROOT/systemd/arcway.service"
+printf '%s\n' "ARCWAY_GUARD_ASSET_DIR=$LEGACY_UPDATE_ROOT/lib/guard-assets" > "$LEGACY_UPDATE_ROOT/config/arcway.env"
+PATH="$MOCK_BIN:/usr/bin:/bin" \
+    MOCK_APT_MARKER="$LEGACY_UPDATE_ROOT/apt-called" \
+    MOCK_VERIFY_LOG="$LEGACY_UPDATE_ROOT/verify.log" \
+    MOCK_STATE_DIR="$LEGACY_UPDATE_ROOT/state" \
+    ARCWAY_SYSTEMD_UNIT_DIR="$LEGACY_UPDATE_ROOT/systemd" \
+    ARCWAY_INSTALL_LOCK_FILE="$LEGACY_UPDATE_ROOT/install.lock" \
+    bash "$INSTALL_SCRIPT" update >"$LEGACY_UPDATE_ROOT/output.log" 2>&1
+grep -q '^new-arcway-linux-amd64$' "$LEGACY_UPDATE_ROOT/bin/arcway" || fail "legacy update did not preserve the binary directory"
+grep -q '^new-arcway-expiry-guard-linux-amd64$' "$LEGACY_UPDATE_ROOT/lib/guard-assets/arcway-expiry-guard-linux-amd64" || fail "legacy update did not preserve the guard directory"
+grep -q '^v-test$' "$LEGACY_UPDATE_ROOT/data/.version" || fail "legacy update did not preserve the data directory"
+[ "$(cat "$LEGACY_UPDATE_ROOT/state/active")" = active ] || fail "legacy update did not restart the service"
+grep -q '检测到现有安装布局' "$LEGACY_UPDATE_ROOT/output.log" || fail "legacy update did not report layout detection"
+
 # A non-interactive uninstall preserves data unless deletion is explicitly requested.
 UNINSTALL_ROOT="$TEST_ROOT/uninstall-default"
 make_old_installation "$UNINSTALL_ROOT" enabled active
